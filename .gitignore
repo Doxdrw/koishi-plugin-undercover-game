@@ -1,0 +1,17 @@
+# 依赖
+node_modules/
+
+# 构建产物（由 tsc / 构建流程生成，不纳入版本控制）
+lib/
+dist/
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+*.log
+
+# 临时文件
+*.tmp
+release.local.json

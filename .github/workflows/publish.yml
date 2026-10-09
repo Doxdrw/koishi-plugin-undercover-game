@@ -1,0 +1,43 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Check release version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: node -e "const fs=require('fs'); const tag=process.env.RELEASE_TAG||''; const pkg=JSON.parse(fs.readFileSync('package.json','utf8')); if(tag !== 'v'+pkg.version) throw new Error('Release tag '+tag+' does not match package version '+pkg.version)"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Verify package
+        run: |
+          npm run typecheck
+          npm test
+          npm run build
+          npm run public:check
+          npm run package:audit
+
+      - name: Publish to npm
+        run: npm publish --access public

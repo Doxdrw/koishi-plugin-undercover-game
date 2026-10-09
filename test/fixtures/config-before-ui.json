@@ -1,0 +1,586 @@
+{
+  "schema": {
+    "type": "object",
+    "dict": {
+      "allowLateJoinByDefault": {
+        "type": "boolean",
+        "meta": {
+          "default": true
+        }
+      },
+      "boomAdjudicationTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 300,
+          "min": 10,
+          "step": 1
+        }
+      },
+      "dealMessageInterval": {
+        "type": "number",
+        "meta": {
+          "default": 1,
+          "min": 0
+        }
+      },
+      "dealMessageTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 30,
+          "min": 1,
+          "step": 1
+        }
+      },
+      "debug": {
+        "type": "object",
+        "dict": {
+          "enabled": {
+            "type": "boolean",
+            "meta": {
+              "default": false
+            }
+          },
+          "entryBytes": {
+            "type": "number",
+            "meta": {
+              "default": 16384,
+              "min": 512,
+              "step": 1
+            }
+          },
+          "fileBytes": {
+            "type": "number",
+            "meta": {
+              "default": 10485760,
+              "min": 16384,
+              "step": 1
+            }
+          },
+          "guilds": {
+            "type": "array",
+            "meta": {
+              "default": []
+            },
+            "inner": {
+              "type": "string"
+            }
+          },
+          "privateBodies": {
+            "type": "boolean",
+            "meta": {
+              "default": false
+            }
+          },
+          "queueLimit": {
+            "type": "number",
+            "meta": {
+              "default": 1000,
+              "min": 1,
+              "step": 1
+            }
+          },
+          "retentionDays": {
+            "type": "number",
+            "meta": {
+              "default": 7,
+              "min": 1,
+              "step": 1
+            }
+          },
+          "totalBytes": {
+            "type": "number",
+            "meta": {
+              "default": 209715200,
+              "min": 16384,
+              "step": 1
+            }
+          }
+        }
+      },
+      "deerHostReviewTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 300,
+          "min": 30,
+          "step": 1
+        }
+      },
+      "deerProgressDelay": {
+        "type": "number",
+        "meta": {
+          "default": 300,
+          "min": 0,
+          "step": 1
+        }
+      },
+      "deerSelectionTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 900,
+          "min": 30,
+          "step": 1
+        }
+      },
+      "enabledHeroes": {
+        "type": "array",
+        "meta": {
+          "default": [
+            "张献忠",
+            "李自成",
+            "朱由检",
+            "吴三桂",
+            "皇太极",
+            "袁崇焕",
+            "林丹汗",
+            "史可法",
+            "毛文龙",
+            "多尔衮"
+          ]
+        },
+        "inner": {
+          "type": "union",
+          "list": [
+            {
+              "type": "const",
+              "value": "张献忠"
+            },
+            {
+              "type": "const",
+              "value": "李自成"
+            },
+            {
+              "type": "const",
+              "value": "朱由检"
+            },
+            {
+              "type": "const",
+              "value": "吴三桂"
+            },
+            {
+              "type": "const",
+              "value": "皇太极"
+            },
+            {
+              "type": "const",
+              "value": "袁崇焕"
+            },
+            {
+              "type": "const",
+              "value": "林丹汗"
+            },
+            {
+              "type": "const",
+              "value": "史可法"
+            },
+            {
+              "type": "const",
+              "value": "毛文龙"
+            },
+            {
+              "type": "const",
+              "value": "多尔衮"
+            }
+          ]
+        }
+      },
+      "enabledSpecialModes": {
+        "type": "array",
+        "meta": {
+          "default": [
+            "deer",
+            "turtle"
+          ]
+        },
+        "inner": {
+          "type": "union",
+          "list": [
+            {
+              "type": "const",
+              "value": "deer"
+            },
+            {
+              "type": "const",
+              "value": "turtle"
+            }
+          ]
+        }
+      },
+      "enablePersistentScoring": {
+        "type": "boolean",
+        "meta": {
+          "default": true
+        }
+      },
+      "gatherTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 3600,
+          "min": 0,
+          "step": 1
+        }
+      },
+      "heroCardDownloadTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 30,
+          "min": 1,
+          "step": 1
+        }
+      },
+      "heroCardInteractionTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 300,
+          "min": 30,
+          "step": 1
+        }
+      },
+      "heroCardMaxBytes": {
+        "type": "number",
+        "meta": {
+          "default": 20971520,
+          "min": 1024,
+          "step": 1
+        }
+      },
+      "heroCardMaxPixels": {
+        "type": "number",
+        "meta": {
+          "default": 40000000,
+          "min": 1,
+          "step": 1
+        }
+      },
+      "heroesByDefault": {
+        "type": "boolean",
+        "meta": {
+          "default": true
+        }
+      },
+      "history": {
+        "type": "object",
+        "dict": {
+          "enabled": {
+            "type": "boolean",
+            "meta": {
+              "default": true
+            }
+          },
+          "mediaRetention": {
+            "type": "union",
+            "meta": {
+              "default": "next-game"
+            },
+            "list": [
+              {
+                "type": "const",
+                "value": "next-game"
+              },
+              {
+                "type": "const",
+                "value": "permanent"
+              },
+              {
+                "type": "const",
+                "value": "days"
+              }
+            ]
+          },
+          "mediaRetentionDays": {
+            "type": "number",
+            "meta": {
+              "default": 30,
+              "min": 0,
+              "step": 1
+            }
+          },
+          "retentionDays": {
+            "type": "number",
+            "meta": {
+              "default": 0,
+              "min": 0,
+              "step": 1
+            }
+          },
+          "sandbox": {
+            "type": "boolean",
+            "meta": {
+              "default": false
+            }
+          }
+        }
+      },
+      "hurryTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 120,
+          "min": 0,
+          "step": 1
+        }
+      },
+      "minPlayers": {
+        "type": "number",
+        "meta": {
+          "default": 6,
+          "min": 0,
+          "step": 1
+        }
+      },
+      "notifications": {
+        "type": "object",
+        "dict": {
+          "turtleAnswerPrivate": {
+            "type": "boolean",
+            "meta": {
+              "default": false
+            }
+          },
+          "turtleHostHalfReminder": {
+            "type": "boolean",
+            "meta": {
+              "default": true
+            }
+          },
+          "voteFirstSuccessReceipt": {
+            "type": "boolean",
+            "meta": {
+              "default": false
+            }
+          },
+          "voteHurryGroup": {
+            "type": "boolean",
+            "meta": {
+              "default": true
+            }
+          },
+          "voteHurryPrivate": {
+            "type": "boolean",
+            "meta": {
+              "default": true
+            }
+          },
+          "voteStartPrivate": {
+            "type": "boolean",
+            "meta": {
+              "default": true
+            }
+          }
+        }
+      },
+      "realtimeVoteNoticeDefault": {
+        "type": "boolean",
+        "meta": {
+          "default": false
+        }
+      },
+      "replacementTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 180,
+          "min": 10,
+          "step": 1
+        }
+      },
+      "scoreGoodBoomNoWin": {
+        "type": "number",
+        "meta": {
+          "default": 1
+        }
+      },
+      "scoreGoodWin": {
+        "type": "number",
+        "meta": {
+          "default": 1
+        }
+      },
+      "scoreGoodWinSpeedrun": {
+        "type": "number",
+        "meta": {
+          "default": 0.5
+        }
+      },
+      "scoreSystemKey": {
+        "type": "string",
+        "meta": {
+          "default": "undercover"
+        }
+      },
+      "scoreUndercoverBoomBonus": {
+        "type": "number",
+        "meta": {
+          "default": 0.5
+        }
+      },
+      "scoreUndercoverWin": {
+        "type": "number",
+        "meta": {
+          "default": 2
+        }
+      },
+      "scoreWhiteBoomWin": {
+        "type": "number",
+        "meta": {
+          "default": 3
+        }
+      },
+      "scoreWhiteWin": {
+        "type": "number",
+        "meta": {
+          "default": 2
+        }
+      },
+      "setupTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 900,
+          "min": 30,
+          "step": 1
+        }
+      },
+      "skillTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 120,
+          "min": 0,
+          "step": 1
+        }
+      },
+      "speakTimeoutMode1": {
+        "type": "number",
+        "meta": {
+          "default": 900,
+          "min": 0,
+          "step": 1
+        }
+      },
+      "speakTimeoutMode2": {
+        "type": "number",
+        "meta": {
+          "default": 1800,
+          "min": 0,
+          "step": 1
+        }
+      },
+      "speakTimeoutMode3PerPlayer": {
+        "type": "number",
+        "meta": {
+          "default": 180,
+          "min": 0,
+          "step": 1
+        }
+      },
+      "turtleAnswerTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 300,
+          "min": 10,
+          "step": 1
+        }
+      },
+      "undercoverDivisor": {
+        "type": "number",
+        "meta": {
+          "default": 3,
+          "min": 2
+        }
+      },
+      "voteTimeout": {
+        "type": "number",
+        "meta": {
+          "default": 300,
+          "min": 0,
+          "step": 1
+        }
+      },
+      "whiteMinPlayers": {
+        "type": "number",
+        "meta": {
+          "default": 7,
+          "min": 0,
+          "step": 1
+        }
+      }
+    }
+  },
+  "defaults": {
+    "debug": {
+      "enabled": false,
+      "privateBodies": false,
+      "guilds": [],
+      "retentionDays": 7,
+      "fileBytes": 10485760,
+      "totalBytes": 209715200,
+      "queueLimit": 1000,
+      "entryBytes": 16384
+    },
+    "history": {
+      "enabled": true,
+      "sandbox": false,
+      "retentionDays": 0,
+      "mediaRetention": "next-game",
+      "mediaRetentionDays": 30
+    },
+    "scoreSystemKey": "undercover",
+    "enablePersistentScoring": true,
+    "minPlayers": 6,
+    "undercoverDivisor": 3,
+    "whiteMinPlayers": 7,
+    "enabledHeroes": [
+      "张献忠",
+      "李自成",
+      "朱由检",
+      "吴三桂",
+      "皇太极",
+      "袁崇焕",
+      "林丹汗",
+      "史可法",
+      "毛文龙",
+      "多尔衮"
+    ],
+    "heroesByDefault": true,
+    "enabledSpecialModes": [
+      "deer",
+      "turtle"
+    ],
+    "allowLateJoinByDefault": true,
+    "realtimeVoteNoticeDefault": false,
+    "notifications": {
+      "voteStartPrivate": true,
+      "voteFirstSuccessReceipt": false,
+      "voteHurryPrivate": true,
+      "voteHurryGroup": true,
+      "turtleAnswerPrivate": false,
+      "turtleHostHalfReminder": true
+    },
+    "gatherTimeout": 3600,
+    "setupTimeout": 900,
+    "dealMessageInterval": 1,
+    "dealMessageTimeout": 30,
+    "speakTimeoutMode1": 900,
+    "speakTimeoutMode2": 1800,
+    "speakTimeoutMode3PerPlayer": 180,
+    "voteTimeout": 300,
+    "hurryTimeout": 120,
+    "skillTimeout": 120,
+    "replacementTimeout": 180,
+    "boomAdjudicationTimeout": 300,
+    "deerSelectionTimeout": 900,
+    "deerHostReviewTimeout": 300,
+    "deerProgressDelay": 300,
+    "turtleAnswerTimeout": 300,
+    "heroCardMaxBytes": 20971520,
+    "heroCardMaxPixels": 40000000,
+    "heroCardInteractionTimeout": 300,
+    "heroCardDownloadTimeout": 30,
+    "scoreGoodWin": 1,
+    "scoreGoodWinSpeedrun": 0.5,
+    "scoreUndercoverWin": 2,
+    "scoreUndercoverBoomBonus": 0.5,
+    "scoreWhiteWin": 2,
+    "scoreWhiteBoomWin": 3,
+    "scoreGoodBoomNoWin": 1
+  },
+  "emptySimplified": {
+    "debug": {}
+  }
+}

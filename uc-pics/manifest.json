@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "setId": "default-heroes-v1",
+  "status": "final",
+  "width": 941,
+  "height": 1672,
+  "cards": [
+    {
+      "heroId": 0,
+      "heroKey": "zhang-xian-zhong",
+      "heroName": "张献忠",
+      "fileName": "张献忠卡面.png",
+      "sha256": "b1589d2afd751e8814b4c09a52575bf65200edcd48bf92e7280266f1c1679f01"
+    },
+    {
+      "heroId": 1,
+      "heroKey": "li-zi-cheng",
+      "heroName": "李自成",
+      "fileName": "李自成卡面.png",
+      "sha256": "bbc41064dfbf03f39aaf6609e1f2fec35238d8176d687ea8a9199e0a084db553"
+    },
+    {
+      "heroId": 2,
+      "heroKey": "zhu-you-jian",
+      "heroName": "朱由检",
+      "fileName": "朱由检卡面.png",
+      "sha256": "f8faf45bf39df45b1bc69756282ca57da3a18c93f04b07139b00de078b90d721"
+    },
+    {
+      "heroId": 3,
+      "heroKey": "wu-san-gui",
+      "heroName": "吴三桂",
+      "fileName": "吴三桂卡面.png",
+      "sha256": "9e04042680435d3166305e557dcf2377b4ca296da97aa562f2ad3e8a1155043b"
+    },
+    {
+      "heroId": 4,
+      "heroKey": "huang-tai-ji",
+      "heroName": "皇太极",
+      "fileName": "皇太极卡面.png",
+      "sha256": "0e2c56afa8de9545f8b335e50cf1b18a88ee21fe3d021f450376bcc0c73a3538"
+    },
+    {
+      "heroId": 5,
+      "heroKey": "yuan-chong-huan",
+      "heroName": "袁崇焕",
+      "fileName": "袁崇焕卡面.png",
+      "sha256": "243e144988b50c3c5b57ae5cd193fe68a7fe47781a6610ce1754391a1e6dce56"
+    },
+    {
+      "heroId": 6,
+      "heroKey": "lin-dan-han",
+      "heroName": "林丹汗",
+      "fileName": "林丹汗卡面.png",
+      "sha256": "d2ed9d5c3c68ca814b6ed661e0c578eee3f88182ec9354b1c5f139baad401b37"
+    },
+    {
+      "heroId": 7,
+      "heroKey": "shi-ke-fa",
+      "heroName": "史可法",
+      "fileName": "史可法卡面.png",
+      "sha256": "ec4bf6a9ef168d2f4ed981b4d81d199401591c145a306d06ed10a4b2fd1da46f"
+    },
+    {
+      "heroId": 8,
+      "heroKey": "mao-wen-long",
+      "heroName": "毛文龙",
+      "fileName": "毛文龙卡面.png",
+      "sha256": "91bd7e5b229738bbcb55f4079d5233de9c2c7064930b33d3875d67f2157b9ab8"
+    },
+    {
+      "heroId": 9,
+      "heroKey": "duo-er-gun",
+      "heroName": "多尔衮",
+      "fileName": "多尔衮卡面.png",
+      "sha256": "0030f27d54bf14ae7143c3cb3780f69c638678ffda53eee8892cf9dcbb3753a8"
+    }
+  ]
+}

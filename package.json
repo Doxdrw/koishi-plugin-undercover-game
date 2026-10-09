@@ -1,0 +1,74 @@
+{
+  "name": "koishi-plugin-undercover-game",
+  "description": "支持经典、群雄逐鹿、海龟汤与十名武将机制的 Koishi 谁是卧底插件",
+  "version": "0.3.1",
+  "author": "Doxdrw <272593690@qq.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Doxdrw/koishi-plugin-undercover-game.git"
+  },
+  "homepage": "https://github.com/Doxdrw/koishi-plugin-undercover-game#readme",
+  "bugs": {
+    "url": "https://github.com/Doxdrw/koishi-plugin-undercover-game/issues"
+  },
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "dist",
+    "uc-pics",
+    "GAME_GUIDE.md",
+    "CHANGELOG.md",
+    "LICENSE.md",
+    "LICENSES",
+    "NOTICE.md"
+  ],
+  "scripts": {
+    "test": "node scripts/run-tests.mjs",
+    "test:game": "node --import tsx test/game-automation.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json && node scripts/build.mjs",
+    "public:check": "node scripts/export-public.mjs --check",
+    "package:audit": "node scripts/package-audit.mjs"
+  },
+  "devDependencies": {
+    "@koishijs/plugin-database-sqlite": "4.6.0",
+    "@types/node": "^20.14.13",
+    "dumble": "0.2.0",
+    "esbuild": "^0.18.20",
+    "koishi": "4.18.9",
+    "tsx": "^4.16.3",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "SEE LICENSE IN LICENSE.md",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin",
+    "game",
+    "undercover",
+    "qq"
+  ],
+  "peerDependencies": {
+    "koishi": "^4.18.9"
+  },
+  "koishi": {
+    "description": {
+      "zh": "支持经典、群雄逐鹿、海龟汤与十名武将机制的谁是卧底游戏；含固定座位、踢人补位及可选统一积分。"
+    },
+    "service": {
+      "required": [
+        "database"
+      ],
+      "optional": [
+        "xpPoints"
+      ]
+    }
+  }
+}

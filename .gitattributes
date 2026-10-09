@@ -1,0 +1,2 @@
+# 统一文本文件使用 LF 换行，避免跨平台/CRLF 噪声
+* text=auto eol=lf

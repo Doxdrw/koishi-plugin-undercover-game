@@ -1,0 +1,54 @@
+{
+  "publicEntries": [
+    ".github",
+    ".gitattributes",
+    ".gitignore",
+    ".npmignore",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "GAME_GUIDE.md",
+    "LICENSE.md",
+    "LICENSES",
+    "NOTICE.md",
+    "package.json",
+    "README.md",
+    "release.config.json",
+    "scripts",
+    "SECURITY.md",
+    "src",
+    "test",
+    "tsconfig.json",
+    "uc-pics"
+  ],
+  "privateEntries": [
+    ".git",
+    "data",
+    "lib",
+    "node_modules",
+    "skills",
+    "tsconfig.tsbuildinfo"
+  ],
+  "publicExcludedPaths": [],
+  "packageRequired": [
+    "lib/index.js",
+    "lib/index.d.ts",
+    "lib/game/image-validation.d.ts",
+    "lib/game/safe-image-download.d.ts",
+    "lib/game/subscription-service.d.ts",
+    "uc-pics/manifest.json",
+    "GAME_GUIDE.md",
+    "CHANGELOG.md",
+    "LICENSE.md",
+    "LICENSES/MPL-2.0.txt",
+    "NOTICE.md"
+  ],
+  "packageForbiddenPrefixes": [
+    "src/",
+    "test/",
+    "skills/",
+    "data/",
+    ".github/",
+    "release.config.json"
+  ]
+}
