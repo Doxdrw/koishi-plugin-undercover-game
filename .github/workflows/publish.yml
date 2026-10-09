@@ -1,8 +1,12 @@
 name: publish
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish, e.g. v0.3.1
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -11,11 +15,16 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: npm
+    concurrency:
+      group: npm-${{ inputs.tag }}
+      cancel-in-progress: false
     steps:
       - name: Check out the release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -23,13 +32,31 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
-      - name: Check release version
+      - name: Check release tag and commit
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: node -e "const fs=require('fs'); const tag=process.env.RELEASE_TAG||''; const pkg=JSON.parse(fs.readFileSync('package.json','utf8')); if(tag !== 'v'+pkg.version) throw new Error('Release tag '+tag+' does not match package version '+pkg.version)"
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs'
+          import { execFileSync } from 'node:child_process'
+          const tag = process.env.RELEASE_TAG ?? ''
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
+          if (tag !== 'v' + pkg.version) throw new Error('Tag does not match package version')
+          const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim()
+          if (git('rev-parse', 'HEAD') !== git('rev-parse', '--verify', 'refs/tags/' + tag + '^{commit}')) {
+            throw new Error('Checked-out commit does not match the release tag')
+          }
+          git('merge-base', '--is-ancestor', 'HEAD', 'origin/main')
+          const version = execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim()
+          const [major, minor, patch] = version.split('.').map(Number)
+          if (major < 11 || (major === 11 && (minor < 5 || (minor === 5 && patch < 1)))) {
+            throw new Error('Trusted publishing requires npm 11.5.1 or newer')
+          }
+          console.log('Verified ' + pkg.name + '@' + pkg.version + ' at ' + git('rev-parse', 'HEAD'))
+          NODE
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Verify package
         run: |

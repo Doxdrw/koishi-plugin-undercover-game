@@ -8,7 +8,6 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const config = loadReleaseConfig(root)
 const mode = process.argv[2] ?? 'default'
 const nodeMajor = Number(process.versions.node.split('.')[0])
-const offline = new Set(config.offlineTests ?? [])
 const local = new Set(config.localTests ?? [])
 const workspace = new Set(config.workspaceTests ?? [])
 const all = readdirSync(join(root, 'test'))
@@ -17,11 +16,7 @@ const all = readdirSync(join(root, 'test'))
   .sort()
 
 let tests
-if (mode === '--offline') {
-  if (nodeMajor < 22) throw new Error('离线 SQLite 维护测试要求 Node.js 22。')
-  tests = all.filter(file => offline.has(file))
-}
-else if (mode === '--local') {
+if (mode === '--local') {
   if (nodeMajor < 22) throw new Error('本地维护测试要求 Node.js 22。')
   tests = all.filter(file => local.has(file))
 }
@@ -29,7 +24,7 @@ else if (mode === '--workspace') {
   tests = all.filter(file => workspace.has(file))
 }
 else {
-  tests = all.filter(file => !workspace.has(file) && !local.has(file) && (nodeMajor >= 22 || !offline.has(file)))
+  tests = all.filter(file => !workspace.has(file) && !local.has(file))
 }
 if (!tests.length) {
   console.log('No matching tests for ' + mode + '.')

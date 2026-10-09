@@ -51,7 +51,7 @@ export function loadReleaseConfig(root) {
   const localPath = join(root, 'release.local.json')
   if (!existsSync(localPath)) return config
   const local = JSON.parse(readFileSync(localPath, 'utf8'))
-  for (const key of ['publicExcludedPaths', 'localTests', 'offlineTests', 'workspaceTests']) {
+  for (const key of ['publicExcludedPaths', 'localTests', 'workspaceTests']) {
     const entries = local[key] ?? []
     if (!Array.isArray(entries)) throw new Error('本地维护清单必须是路径数组：' + key)
     config[key] = [...new Set([...(config[key] ?? []), ...entries.map(safeEntry)])]

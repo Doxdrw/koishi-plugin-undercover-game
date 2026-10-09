@@ -3,7 +3,7 @@
 测试覆盖游戏流程、武将结算、固定座位、补位、历史、订阅、积分服务边界和配置行为。
 
 ```bash
-npm install
+npm ci
 npm test
 npm run test:game
 npm run typecheck

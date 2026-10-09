@@ -12,6 +12,7 @@
     "LICENSES",
     "NOTICE.md",
     "package.json",
+    "package-lock.json",
     "README.md",
     "release.config.json",
     "scripts",

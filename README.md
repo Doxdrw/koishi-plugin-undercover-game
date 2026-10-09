@@ -71,7 +71,7 @@ npm install koishi-plugin-undercover-game
 ## 开发
 
 ```bash
-npm install
+npm ci
 npm run typecheck
 npm test
 npm run build

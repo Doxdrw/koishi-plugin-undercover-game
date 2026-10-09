@@ -14,7 +14,7 @@ it('presents one first public release without local database history', () => {
   assert.deepEqual(changelog.match(/^## .+$/gm), [`## ${pkg.version}`])
   for (const path of ['README.md', 'CHANGELOG.md', 'GAME_GUIDE.md', 'test/README.md']) {
     const text = readFileSync(join(root, path), 'utf8')
-    assert.doesNotMatch(text, /迁移|legacy|旧版|旧(?:表|库|数据|日志|实例)|账号存储切换|停机备份并/, path)
+    assert.doesNotMatch(text, /迁移|legacy|旧版|旧(?:表|库|数据|日志|实例)|账号存储切换|停机备份并|沿原流程|沿用原有|原有格式/, path)
   }
 })
 
