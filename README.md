@@ -4,11 +4,13 @@ Koishi 的多人「谁是卧底」游戏插件。支持经典、群雄逐鹿（�
 
 ## 安装
 
+在 Koishi 控制台的插件市场搜索 `undercover-game` 并安装；也可以在 Koishi 项目目录执行：
+
 ```bash
 npm install koishi-plugin-undercover-game
 ```
 
-运行环境：Node.js 20 及以上、Koishi 4.18.9 及以上，并启用 `database` 服务。安装后在 Koishi 控制台启用插件，在群里发送 `卧底` 开始一局。
+运行环境：Node.js 20 及以上、Koishi 4.18.9 及以上，并启用 `database` 服务。完整开局还需要当前适配器支持向主持人和玩家发送私聊；具体能力以所用适配器为准。安装后在 Koishi 控制台启用插件，在群里发送 `卧底` 开始一局。
 
 插件可以独立运行。启用 [koishi-plugin-xp-points](https://github.com/Doxdrw/koishi-plugin-xp-points) 后，可使用统一管理昵称、共享或独立积分主体和周期积分榜；没有该服务时仍可正常游戏。
 
@@ -20,6 +22,12 @@ npm install koishi-plugin-undercover-game
 4. 游戏结束后，在原群发送 `总结` 或 `复盘` 查看结果。
 
 主持人可以在发题开始前发送 `经典模式`、`鹿模式`、`龟模式`，也可以使用 `开始鹿模式`、`开始龟模式`。新局是否使用武将由 `heroesByDefault` 决定，主持人可用 `普通局` 或 `武将局` 覆盖。
+
+## 文档导航
+
+- [完整游戏指南](GAME_GUIDE.md)：模式、配置阶段、投票、武将、历史和常用指令。
+- [贡献指南](CONTRIBUTING.md)：本地检查、Pull Request 和 Issue 信息。
+- [安全策略](SECURITY.md)：隐私数据和安全问题报告方式。
 
 ## 模式
 
@@ -78,3 +86,7 @@ npm run build
 ```
 
 源码和文档采用 MPL-2.0，默认卡面使用单独的素材许可，详见 [LICENSE.md](LICENSE.md)、[NOTICE.md](NOTICE.md) 和 `uc-pics/ASSET-LICENSE.md`。
+
+## 支持
+
+使用中遇到可复现的问题，请先查阅[完整游戏指南](GAME_GUIDE.md)，再在 [GitHub Issues](https://github.com/Doxdrw/koishi-plugin-undercover-game/issues) 提供插件版本、Koishi/Node.js 版本、最小复现步骤和期望结果。安全问题请按 [安全策略](SECURITY.md) 私下报告，不要公开发布账号、群组或私聊内容。
