@@ -32,6 +32,9 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
+      - name: Use the npm version verified in CI
+        run: npm install --global npm@12.2.0
+
       - name: Check release tag and commit
         env:
           RELEASE_TAG: ${{ inputs.tag }}

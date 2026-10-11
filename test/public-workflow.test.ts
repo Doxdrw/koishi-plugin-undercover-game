@@ -24,7 +24,10 @@ it('exports a dependency lock matching the public package', () => {
 it('keeps CI locked and npm publishing separate from push, PR and GitHub Release', () => {
   const ci = read('.github/workflows/ci.yml')
   const publish = read('.github/workflows/publish.yml')
-  assert.match(ci, /node: \[20, 22\]/)
+  assert.match(ci, /node: \[20, 22, 24\]/)
+  assert.match(ci, /if: matrix\.node == 24\s*\n\s*run: npm install --global npm@12\.2\.0/)
+  assert.match(ci, /if: matrix\.node != 20\s*\n\s*run: npm run package:audit/)
+  assert.match(publish, /npm install --global npm@12\.2\.0/)
   assert.match(ci, /run: npm ci/)
   assert.doesNotMatch(ci, /npm publish|id-token: write/)
   assert.match(publish, /^on:\s*\n  workflow_dispatch:/m)

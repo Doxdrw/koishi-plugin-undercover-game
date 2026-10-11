@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { auditPublicFiles } from './public-release.mjs'
+import { parseNpmPackResult } from './npm-pack-result.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const config = JSON.parse(readFileSync(join(root, 'release.config.json'), 'utf8'))
@@ -24,14 +25,14 @@ function runNpm(args, cwd) {
   }
   return spawnSync('npm', args, { cwd, encoding: 'utf8' })
 }
-const pack = runNpm(['pack', '--json'], root)
-if (pack.error) throw pack.error
-if (pack.status !== 0) throw new Error(pack.stderr || 'npm pack failed')
-const result = JSON.parse(pack.stdout)[0]
-const names = new Set(result.files.map(file => file.path.replaceAll('\\', '/')))
-const tarball = join(root, result.filename)
 const smoke = mkdtempSync(join(tmpdir(), 'koishi-plugin-smoke-'))
 try {
+  const pack = runNpm(['pack', '--json', '--pack-destination', smoke], root)
+  if (pack.error) throw pack.error
+  if (pack.status !== 0) throw new Error(pack.stderr || 'npm pack failed')
+  const result = parseNpmPackResult(pack.stdout, pkg)
+  const names = new Set(result.files.map(file => file.path.replaceAll('\\', '/')))
+  const tarball = join(smoke, result.filename)
   writeFileSync(join(smoke, 'package.json'), JSON.stringify({ name: 'local-package-smoke', version: '0.0.0', private: true }))
   for (const required of config.packageRequired) {
     if (!names.has(required)) throw new Error('npm 包缺少必需文件：' + required)
@@ -62,5 +63,4 @@ try {
 }
 finally {
   rmSync(smoke, { recursive: true, force: true })
-  rmSync(tarball, { force: true })
 }
