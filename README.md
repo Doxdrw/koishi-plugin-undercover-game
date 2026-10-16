@@ -2,6 +2,8 @@
 
 Koishi 的多人「谁是卧底」游戏插件。支持经典、群雄逐鹿（鹿）和海龟汤（龟）三种模式，包含固定座位、发言、投票、加时、武将、踢人补位和可选积分结算。
 
+武将可按局启用，主持人可自定义阵营与武将分配；管理员可替换、查看或恢复默认卡面。支持图文发言、分轮历史回放，以及发题和待处理提示的重新获取。
+
 ## 安装
 
 在 Koishi 控制台的插件市场搜索 `undercover-game` 并安装；也可以在 Koishi 项目目录执行：
@@ -26,8 +28,8 @@ npm install koishi-plugin-undercover-game
 ## 文档导航
 
 - [完整游戏指南](GAME_GUIDE.md)：模式、配置阶段、投票、武将、历史和常用指令。
-- [贡献指南](CONTRIBUTING.md)：本地检查、Pull Request 和 Issue 信息。
-- [安全策略](SECURITY.md)：隐私数据和安全问题报告方式。
+- [贡献指南](https://github.com/Doxdrw/koishi-plugin-undercover-game/blob/main/CONTRIBUTING.md)：本地检查、Pull Request 和 Issue 信息。
+- [安全策略](https://github.com/Doxdrw/koishi-plugin-undercover-game/blob/main/SECURITY.md)：隐私数据和安全问题报告方式。
 
 ## 模式
 
@@ -54,6 +56,8 @@ npm install koishi-plugin-undercover-game
 | `history.mediaRetention` | 多媒体保留到下一局、永久保留或按天清理 |
 
 时限、通知、白板、积分分值和卡面限制也可以在配置页面调整；实际数值以当前配置为准。
+
+开启积分并接入 xp-points 后，默认的 `undercover` 群积分系统会自动创建；使用自定义 `scoreSystemKey` 时，先在 xp-points 中创建对应系统。累计榜可用 `积分.排行 undercover` 查询，月榜可用 `积分.排行 undercover 月`；自定义 key 时相应替换。
 
 ## 历史与隐私
 
@@ -89,4 +93,4 @@ npm run build
 
 ## 支持
 
-使用中遇到可复现的问题，请先查阅[完整游戏指南](GAME_GUIDE.md)，再在 [GitHub Issues](https://github.com/Doxdrw/koishi-plugin-undercover-game/issues) 提供插件版本、Koishi/Node.js 版本、最小复现步骤和期望结果。安全问题请按 [安全策略](SECURITY.md) 私下报告，不要公开发布账号、群组或私聊内容。
+使用中遇到可复现的问题，请先查阅[完整游戏指南](GAME_GUIDE.md)，再在 [GitHub Issues](https://github.com/Doxdrw/koishi-plugin-undercover-game/issues) 提供插件版本、Koishi/Node.js 版本、最小复现步骤和期望结果。安全问题请按[安全策略](https://github.com/Doxdrw/koishi-plugin-undercover-game/blob/main/SECURITY.md)私下报告，不要公开发布账号、群组或私聊内容。

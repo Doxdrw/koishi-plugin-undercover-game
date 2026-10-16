@@ -185,6 +185,54 @@ async function voteOut(game: UndercoverGameHarness, targetSeat: number, activeSe
   }
 }
 
+describe('documented unlock and speedrun boundaries', () => {
+  it('keeps the equal-round boundary locked while earlier game eliminations can unlock it', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, {})
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      await voteOut(game, 5, [1, 2, 3, 4, 5, 6])
+      await game.sendGroup('alice', '1自爆未匹配')
+      assert.match(latestGroupOutput(game), /未到轮次，无法自爆/)
+      await finishSpeech(game, [1, 2, 3, 4, 6])
+      await voteOut(game, 2, [1, 2, 3, 4, 6])
+      assert.match(groupTranscript(game), /开始第3轮发言/)
+      await game.sendGroup('alice', '盘3')
+      assert.match(latestGroupOutput(game), /3号|Carol/)
+    })
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.ZHU_YOU_JIAN]: 1, [HERO.ZHANG_XIAN_ZHONG]: 5 })
+      await game.sendGroup('alice', '处决5')
+      await game.sendGroup('eve', '2')
+      assert.match(groupTranscript(game), /从现在起.*可以自爆/s)
+      await finishSpeech(game, [1, 3, 4, 6])
+      await voteOut(game, 6, [1, 3, 4, 6])
+      assert.match(groupTranscript(game), /好人胜利/)
+      assert.match(groupTranscript(game), /加2分/)
+      assert.doesNotMatch(groupTranscript(game), /加9分/)
+    }, { scoreGoodWin: 2, scoreGoodWinSpeedrun: 9 })
+  })
+
+  for (const white of [false, true]) it(`uses the regular good score after a failed ${white ? 'white' : 'undercover'} explosion`, async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, white ? { [HERO.ZHU_YOU_JIAN]: 1 }
+        : { [HERO.ZHU_YOU_JIAN]: 1, [HERO.ZHANG_XIAN_ZHONG]: 5 }, true, '5', true, white ? 4 : 0)
+      if (white) {
+        await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+        await voteOut(game, 5, [1, 2, 3, 4, 5, 6])
+        await game.sendGroup('alice', '处决6')
+      } else {
+        await game.sendGroup('alice', '处决5')
+        await game.sendGroup('eve', '2')
+      }
+      await game.sendGroup(white ? 'dave' : 'frank', (white ? '4' : '6') + '自爆未匹配')
+      await game.sendGroup('host', '否')
+      assert.match(groupTranscript(game), /好人胜利/)
+      assert.match(groupTranscript(game), /加2分/)
+      assert.doesNotMatch(groupTranscript(game), /加9分/)
+    }, { scoreGoodWin: 2, scoreGoodWinSpeedrun: 9 })
+  })
+})
+
 describe('A13 white survival boundaries', () => {
   it('keeps speech-stage departures and Zhu backlash from ending a four-player white window early', async () => {
     await withGame(async game => {

@@ -8,10 +8,12 @@ import { loadReleaseConfig, publicFiles } from '../scripts/public-release.mjs'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 
-it('presents one first public release without local database history', () => {
+it('keeps published release history separate from unreleased changes', () => {
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
   const changelog = readFileSync(join(root, 'CHANGELOG.md'), 'utf8')
-  assert.deepEqual(changelog.match(/^## .+$/gm), [`## ${pkg.version}`])
+  const headings = changelog.match(/^## .+$/gm) ?? []
+  assert.equal(headings[0], '## Unreleased')
+  assert.ok(headings.includes(`## ${pkg.version}`))
   for (const path of ['README.md', 'CHANGELOG.md', 'GAME_GUIDE.md', 'test/README.md']) {
     const text = readFileSync(join(root, path), 'utf8')
     assert.doesNotMatch(text, /迁移|legacy|旧版|旧(?:表|库|数据|日志|实例)|账号存储切换|停机备份并|沿原流程|沿用原有|原有格式/, path)

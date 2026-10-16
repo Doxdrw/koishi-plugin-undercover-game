@@ -266,7 +266,7 @@ export const Config: Schema<Config> = Schema.intersect([
     enablePersistentScoring: Schema.boolean().default(true).description("接入 xp-points 并保存结算积分；关闭后不读写积分或发送积分服务告警。"),
     scoreSystemKey: Schema.string().default("undercover").description("结算使用的 xp-points 系统 key；同 key 接入同一积分系统。"),
     scoreGoodWin: Schema.number().default(1).description("好人常规胜利得分。"),
-    scoreGoodWinSpeedrun: Schema.number().default(0.5).description("好人速通得分（总轮次≤非好人阵营人数）。"),
+    scoreGoodWinSpeedrun: Schema.number().default(0.5).description("普通清场好人速通得分；总轮次和实际出局人数均不超过本局初始非好人数量。"),
     scoreUndercoverWin: Schema.number().default(2).description("卧底胜利得分。"),
     scoreUndercoverBoomBonus: Schema.number().default(0.5).description("卧底自爆获胜时，自爆者的额外得分。"),
     scoreWhiteWin: Schema.number().default(2).description("白板苟赢得分；招安后按所加入阵营结算。"),
