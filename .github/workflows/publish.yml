@@ -51,9 +51,9 @@ jobs:
           }
           git('merge-base', '--is-ancestor', 'HEAD', 'origin/main')
           const version = execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim()
-          const [major, minor, patch] = version.split('.').map(Number)
-          if (major < 11 || (major === 11 && (minor < 5 || (minor === 5 && patch < 1)))) {
-            throw new Error('Trusted publishing requires npm 11.5.1 or newer')
+          const [major, minor] = version.split('.').map(Number)
+          if (major < 11 || (major === 11 && minor < 15)) {
+            throw new Error('Staged publishing requires npm 11.15.0 or newer')
           }
           console.log('Verified ' + pkg.name + '@' + pkg.version + ' at ' + git('rev-parse', 'HEAD'))
           NODE
@@ -69,5 +69,5 @@ jobs:
           npm run public:check
           npm run package:audit
 
-      - name: Publish to npm
-        run: npm publish --access public
+      - name: Stage package on npm
+        run: npm stage publish --access public --tag latest --registry=https://registry.npmjs.org

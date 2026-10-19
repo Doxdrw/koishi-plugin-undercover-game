@@ -39,9 +39,15 @@ it('keeps CI locked and npm publishing separate from push, PR and GitHub Release
   assert.match(publish, /merge-base', '--is-ancestor', 'HEAD', 'origin\/main'/)
   assert.match(publish, /id-token: write/)
   assert.match(publish, /run: npm ci/)
-  assert.match(publish, /npm 11\.5\.1/)
   assert.doesNotMatch(publish, /NODE_AUTH_TOKEN|secrets\.NPM_/)
   for (const command of ['npm run typecheck', 'npm test', 'npm run build', 'npm run public:check', 'npm run package:audit']) {
     assert.ok(publish.includes(command), command)
   }
+})
+
+it('uploads npm candidates to staging and leaves publication to maintainer approval', () => {
+  const publish = read('.github/workflows/publish.yml')
+  assert.match(publish, /npm 11\.15\.0/)
+  assert.match(publish, /run: npm stage publish --access public --tag latest --registry=https:\/\/registry\.npmjs\.org/)
+  assert.doesNotMatch(publish, /^\s*(?:run:\s*)?npm publish(?:\s|$)/m)
 })
