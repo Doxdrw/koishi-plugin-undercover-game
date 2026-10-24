@@ -90,3 +90,14 @@ it('refuses unqualified or unknown authors and records initial versus final camp
   const result = r.finish({ kind: 'completed', reason: 'elimination', winner: 'undercover' }, 50)
   assert.equal(result.participants[0].initialCamp, 'white'); assert.equal(result.participants[0].finalCamp, 'undercover')
 })
+
+it('keeps an unresolved explosion separate from the final normal speech in an archived phase', () => {
+  const r = recorder()
+  const tenure = r.join(1, identity('one'), 'undercover', null, 10)
+  r.beginPhase('one', 1, 'regular', [1])
+  r.speech(1, '原发言<face id="14"/>')
+  r.explosion(1, '1自爆未匹配')
+  const result = r.finish({ kind: 'aborted', reason: 'host-stop' }, 20)
+  assert.equal(result.phases[0].speeches[0].text, '原发言<face id="14"/>')
+  assert.deepEqual(result.phases[0].events, [{ kind: 'self-explosion', tenureId: tenure, text: '1自爆未匹配' }])
+})

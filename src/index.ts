@@ -34,6 +34,8 @@ import { removeArrayIndicesInPlace } from './game/sparse-array'
 import { SpeechPhaseCoordinator } from './game/speech-phase'
 import { SpeechHistory } from './game/speech-history'
 import { PublicHeroRevealState } from './game/hero-reveal'
+import { projectPublicGameState, PublicGameTimelineStore, publicMessageText, type PublicGameEvent, type PublicGameStateQuery } from './game/public-game-state'
+import { installChatLunaGameTools } from './game/chatluna-game-tools'
 import { postEliminationHero } from './game/post-elimination'
 import { classifyEliminationVictory } from './game/elimination-outcome'
 import { isStalemateEligible, StalemateTracker } from './game/stalemate'
@@ -50,6 +52,7 @@ import {
   ResolutionCursor,
   VOTE_ELIMINATION_PIPELINE,
   VOTE_RESOLUTION_TAIL,
+  VOTE_RESOLUTION_TAIL_AFTER_HUANG_TAI_JI,
   continueResolution,
   endResolution,
   pauseResolution,
@@ -161,6 +164,7 @@ export const inject = { required: ["database"], optional: ["xpPoints"] }
 
 export interface Config {
   debug?: DiagnosticConfig
+  aiTools?: { enabled: boolean }
   history?: {
     enabled: boolean
     sandbox: boolean
@@ -292,6 +296,11 @@ export const Config: Schema<Config> = Schema.intersect([
     heroCardInteractionTimeout: Schema.natural().min(30).default(300).description("武将查询及卡面管理分步交互的时限（秒）。"),
     heroCardDownloadTimeout: Schema.natural().min(1).default(30).description("远程卡面下载全过程的时限（秒）。"),
   }).description("武将卡面"),
+  Schema.object({
+    aiTools: Schema.object({
+      enabled: Schema.boolean().default(false).description("向 ChatLuna 提供按需规则查询和当前群公开状态工具。由 AI 在需要时调用；接入说明见 ChatLuna 协作指南。"),
+    }),
+  }).description("AI 工具"),
   Schema.object({
     debug: Schema.object({
       enabled: Schema.boolean().default(false).description("记录本插件处理的消息与发送状态，写入实例本地诊断日志。"),
@@ -483,6 +492,7 @@ export function apply(ctx: Context, config: Config) {
   var hostid: string
   var hostname: string
   var boomname: string
+  let boomSeat = 0
   var gameInstanceId = ''
   var gameStartedAt = 0
   let historyRecorder: HistoryRecorder | undefined
@@ -630,6 +640,15 @@ export function apply(ctx: Context, config: Config) {
   var vote_off = true
   var disp_off = true
   const gameRoute = new GameRouteCoordinator<Session["bot"]>()
+  const publicTimeline = new PublicGameTimelineStore()
+  const currentPublicPhase = (): PublicGameEvent['phase'] =>
+    !wait_off ? 'gathering' : flag_start ? (flag_fati ? 'dealing' : 'setup')
+      : boom_pending ? 'adjudication' : !ann_off ? 'speech' : !vote_off ? 'voting' : 'resolving'
+  const recordPublicEvent = (content: h.Fragment): void => {
+    if (game_off || !gameRoute.guildId) return
+    publicTimeline.record({ round: Math.max(0, Math.floor(round || 0)), phase: currentPublicPhase(),
+      overtime: !!add_flag, text: publicMessageText(content) })
+  }
   const matchesActiveSession = (session: Session): boolean => session.guildId
     ? gameRoute.matchesSession(session.platform, session.guildId, session.selfId)
     : gameRoute.matchesBot(session.platform, session.selfId)
@@ -638,7 +657,10 @@ export function apply(ctx: Context, config: Config) {
     content: h.Fragment,
     label: string,
     guildId = gameRoute.guildId,
-  ): Promise<boolean> => messages.state(label, () => session.bot.sendMessage(guildId, content))
+  ): Promise<boolean> => {
+    recordPublicEvent(content)
+    return messages.state(label, () => session.bot.sendMessage(guildId, content))
+  }
   const sendPrivateNotice = (
     session: Session,
     userId: string,
@@ -650,7 +672,10 @@ export function apply(ctx: Context, config: Config) {
     content: h.Fragment,
     label: string,
     guildId = gameRoute.guildId,
-  ): void => messages.bestEffort(label, () => session.bot.sendMessage(guildId, content))
+  ): void => {
+    recordPublicEvent(content)
+    messages.bestEffort(label, () => session.bot.sendMessage(guildId, content))
+  }
   const notifyPrivate = (
     session: Session,
     userId: string,
@@ -661,7 +686,10 @@ export function apply(ctx: Context, config: Config) {
     session: Session,
     content: h.Fragment,
     label = "会话通知",
-  ): void => messages.bestEffort(label, () => session.send(content))
+  ): void => {
+    if (!session.isDirect && session.guildId && gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) recordPublicEvent(content)
+    messages.bestEffort(label, () => session.send(content))
+  }
   const notifyBotGroup = (
     bot: Session["bot"] | undefined,
     guildId: string,
@@ -669,6 +697,7 @@ export function apply(ctx: Context, config: Config) {
     label: string,
   ): void => {
     if (!bot || !guildId) return
+    if (!game_off && guildId === gameRoute.guildId) recordPublicEvent(content)
     messages.bestEffort(label, () => bot.sendMessage(guildId, content))
   }
   const modeInteraction = new ModeInteractionCoordinator()
@@ -799,13 +828,9 @@ export function apply(ctx: Context, config: Config) {
         action.kind === prompt.kind && action.gameEpoch === recorded.gameEpoch,
       )
       if (!stillActive) return
-      messages.bestEffort(
-        `${prompt.kind}群内补救提示`,
-        () => session.bot.sendMessage(
-          gameRoute.guildId,
-          `${actionSeatLabel(prompt.kind)}的私聊操作提示发送失败；流程仍在等待，请相关玩家发送“我的待处理”重新获取。`,
-          ),
-        )
+      notifyGroup(session,
+        `${actionSeatLabel(prompt.kind)}的私聊操作提示发送失败；流程仍在等待，请相关玩家发送“我的待处理”重新获取。`,
+        `${prompt.kind}群内补救提示`)
     }).catch(error => ctx.logger.error("可恢复私聊提示后处理失败：%s", safeErrorSummary(error)))
   }
   const actionSeatLabel = (kind: import('./game/pending-action').PendingActionKind): string => {
@@ -830,6 +855,30 @@ export function apply(ctx: Context, config: Config) {
   const speechPhases = new SpeechPhaseCoordinator()
   const speechHistory = new SpeechHistory()
   const publicHeroReveals = new PublicHeroRevealState()
+  installChatLunaGameTools(ctx, config.aiTools?.enabled === true, (session, query?: PublicGameStateQuery) => {
+    if (game_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return
+    return projectPublicGameState({
+      route: { platform: gameRoute.platform, selfId: gameRoute.bot!.selfId, guildId: gameRoute.guildId },
+      mode: modeInteraction.mode, heroesEnabled,
+      phase: !wait_off ? 'gathering' : flag_start ? (flag_fati ? 'dealing' : 'setup')
+        : boom_pending ? 'adjudication' : !ann_off ? 'speech' : !vote_off ? 'voting' : 'resolving',
+      round: round ?? 0, overtime: add_flag, hostNickname: hostname,
+      players: player_copy.map((nickname, index) => {
+        const seat = index + 1, hero = heros?.indexOf(seat) ?? -1
+        return { seat, nickname,
+          status: !wait_off || order.includes(seat) ? '在场' : kickout.includes(seat) ? '待补位' : '出局',
+          ...(hero !== -1 && publicHeroReveals.isRevealed(seat) ? { revealedHero: hero_name[hero] } : {}),
+        }
+      }),
+      publicEvents: publicTimeline.snapshot(),
+    }, session, query)
+  }, undefined, () => [
+    `好人常规胜利：${config.scoreGoodWin}分；速通：${config.scoreGoodWinSpeedrun}分。`,
+    `卧底胜利：${config.scoreUndercoverWin}分；自爆成功者额外${config.scoreUndercoverBoomBonus}分。`,
+    `白板苟赢：${config.scoreWhiteWin}分；自爆成功：${config.scoreWhiteBoomWin}分。`,
+    `好人误自爆时非好人阵营：${config.scoreGoodBoomNoWin}分；白板存活安慰积分固定为1分。`,
+    `积分写入：${config.enablePersistentScoring ? '开启，仍需有效积分系统及账号；沙盒不写分' : '关闭'}。`,
+  ].join('\n'))
   const setGameTimeout = gameTimers.schedule.bind(gameTimers)
   const armSetupTimeout = (session: Session) => {
     gameTimers.cancel(timer_setup)
@@ -1287,10 +1336,22 @@ export function apply(ctx: Context, config: Config) {
       text: plainText,
       segments,
     })
+    const nickname = player_copy[seat - 1] || (order.indexOf(seat) === -1 ? "" : player_name[order.indexOf(seat)])
+    const publicSpeech = question === undefined
+      ? `${seat}号玩家${nickname}：${plainText}`
+      : `${seat}号玩家${nickname}提问：${plainSpeechSegments(extractSpeechSegments(question))}\n回答：${plainSpeechSegments(extractSpeechSegments(answer ?? ''))}`
+    if (!game_off) publicTimeline.record({ round: Math.max(0, Math.floor(round || 0)), phase: 'speech', overtime: !!add_flag, text: publicSpeech })
     capture(r => r.speech(seat, plainText,
       question === undefined ? undefined : plainSpeechSegments(extractSpeechSegments(question)),
       answer === undefined ? undefined : plainSpeechSegments(extractSpeechSegments(answer)),
       persistentSpeechSegments(segments)))
+  }
+  const recordSelfExplosion = (seat: number, text: string) => {
+    boomSeat = seat
+    capture(r => r.explosion(seat, plainSpeechSegments(extractSpeechSegments(text))))
+  }
+  const recordExplosionOutcome = (outcome: Parameters<HistoryRecorder['resolveExplosion']>[1], adjudicated = false) => {
+    capture(r => r.resolveExplosion(boomSeat, outcome, adjudicated))
   }
   const speechOverviewText = () => {
     const phases = speechHistory.phases()
@@ -1543,13 +1604,9 @@ export function apply(ctx: Context, config: Config) {
     const onboarding = round === 1 && !add_flag
       ? "应发言玩家请发送座位号加问题，例如3他是否……。主持人可引用问题直接回答或驳回，也可发送座位号加答案。"
       : ""
-    messages.bestEffort(
-      '龟模式问答开始通知',
-      () => session.bot.sendMessage(
-        gameRoute.guildId,
-        (add_flag ? "龟模式加时问答开始。" : `龟模式问答开始（第${round}轮）。`) + onboarding + timing,
-      ),
-    )
+    notifyGroup(session,
+      (add_flag ? "龟模式加时问答开始。" : `龟模式问答开始（第${round}轮）。`) + onboarding + timing,
+      '龟模式问答开始通知')
     return true
   }
   const deerSeatDisplay = (seat: number, mention = false): string => {
@@ -1586,7 +1643,7 @@ export function apply(ctx: Context, config: Config) {
       && now - deerLastSelectionReminderAt < 30_000) return
     deerLastSelectionReminderAt = now
     deerLastGroupProgressSignature = signature
-    messages.bestEffort('鹿模式自动选人进度', () => session.bot.sendMessage(gameRoute.guildId, deerProgressText()))
+    notifyGroup(session, deerProgressText(), '鹿模式自动选人进度')
   }
   const cancelDeerSelectionClock = (seat: number) => {
     gameTimers.cancel(deerSelectionTimers.get(seat))
@@ -1746,7 +1803,7 @@ export function apply(ctx: Context, config: Config) {
     const prefix = firstRound
       ? "鹿模式易混：" + instr3 + "\n鹿模式第1轮发言已开放：已获得发言资格的玩家可以发言，其他玩家请继续完成私聊选人流程。"
       : "鹿模式第" + round + "轮发言开始。"
-    messages.bestEffort('鹿模式发言开始通知', () => session.bot.sendMessage(gameRoute.guildId, prefix + timing))
+    notifyGroup(session, prefix + timing, '鹿模式发言开始通知')
     return true
   }
   const timeoutSettingsPrompt = "请输入本局游戏发言限时模式（输入选项对应的序号）：\n"
@@ -2500,6 +2557,7 @@ export function apply(ctx: Context, config: Config) {
       const isSandbox = session.platform.startsWith("sandbox:")
       score_enabled = (config.enablePersistentScoring ?? true) && !isSandbox
       gameRoute.bind(session.platform, session.guildId, session.bot)
+      publicTimeline.clear()
       gameTimers.advanceEpoch()
       preDealRevision += 1
       modeInteraction.reset("classic")
@@ -2962,13 +3020,9 @@ export function apply(ctx: Context, config: Config) {
       modeInteraction.recordDeerRequestMessage(submitted.selection.seat, requestIds, request)
     }
     else {
-      await messages.state(
-        `鹿模式${submitted.selection.seat}号审核群内补救提示`,
-        () => session.bot.sendMessage(
-          gameRoute.guildId,
-          `鹿模式${submitted.selection.seat}号玩家的主持审核私聊发送失败；流程仍在等待，主持人请私聊发送“待处理操作”补取。`,
-        ),
-      )
+      await sendGroupNotice(session,
+        `鹿模式${submitted.selection.seat}号玩家的主持审核私聊发送失败；流程仍在等待，主持人请私聊发送“待处理操作”补取。`,
+        `鹿模式${submitted.selection.seat}号审核群内补救提示`)
     }
     return ("已提交“" + submitted.selection.candidate + "”，请等待主持人审核。")
   })
@@ -3379,6 +3433,7 @@ export function apply(ctx: Context, config: Config) {
     releaseAccountLeases()
     gameInstanceId = ''
     gameRoute.clear()
+    publicTimeline.clear()
   }
   ctx.on("dispose", async () => { end_game({ kind: 'aborted', reason: 'restart' }); await Promise.allSettled([...pendingHistoryWrites]) })
   const canSettleWhiteSurvival = (settled: boolean): boolean => settled
@@ -3788,6 +3843,7 @@ export function apply(ctx: Context, config: Config) {
     quanStr: string
     skipDuoErGunSwap?: boolean
     skipHuangTaiJiPrompt?: boolean
+    recheckDuoErGunAfterHuangTaiJi?: boolean
   }
   interface FinalVoteResolutionInput {
     session: Session
@@ -3810,11 +3866,14 @@ export function apply(ctx: Context, config: Config) {
       requiredInfluence: quan_diff,
     })
   }
-  const runVoteResolutionTail = async (input: Omit<VoteResolutionTailContext, "vote">) => {
+  const runVoteResolutionTail = async (
+    input: Omit<VoteResolutionTailContext, "vote">,
+    order: readonly ResolutionCursor[] = VOTE_RESOLUTION_TAIL,
+  ) => {
     const context: VoteResolutionTailContext = { ...input, vote: liveVoteContext(input) }
     return runResolutionPipeline({
       context,
-      order: VOTE_RESOLUTION_TAIL,
+      order,
       trace: traceResolution("vote-tail"),
       handlers: {
         [ResolutionCursor.DuoErGunSwap]: (current) => {
@@ -3839,6 +3898,17 @@ export function apply(ctx: Context, config: Config) {
           }
           return continueResolution()
         },
+        [ResolutionCursor.DuoErGunSwapAfterHuangTaiJi]: (current) => {
+          if (current.recheckDuoErGunAfterHuangTaiJi) {
+            current.quanStr = tryDuoergunSwap(
+              current.session,
+              current.idx,
+              current.max,
+              current.quanStr,
+            )
+          }
+          return continueResolution()
+        },
         [ResolutionCursor.FinalizeVote]: async (current) => {
           return resolveFinalVote({
             session: current.session,
@@ -3851,6 +3921,7 @@ export function apply(ctx: Context, config: Config) {
   const resumeHuangTaiJiQuan = async (
     session: Session,
     completion: "input" | "timeout",
+    recheckDuoErGunAfterHuangTaiJi = false,
   ) => {
     const huangSeat = heros[HERO.HUANG_TAI_JI]
     huangTaiJiQuanMode = null
@@ -3870,7 +3941,10 @@ export function apply(ctx: Context, config: Config) {
       quanStr: leaders.leaderDescription,
       skipDuoErGunSwap: true,
       skipHuangTaiJiPrompt: true,
-    })
+      recheckDuoErGunAfterHuangTaiJi,
+    }, recheckDuoErGunAfterHuangTaiJi
+      ? VOTE_RESOLUTION_TAIL_AFTER_HUANG_TAI_JI
+      : VOTE_RESOLUTION_TAIL)
   }
   interface MaoWenLongLateVoteContext {
     session: Session
@@ -4965,7 +5039,7 @@ export function apply(ctx: Context, config: Config) {
           if (round <= uc_num && player_copy.length - player.length - kickout.length < uc_num) return ("未到轮次，无法自爆。")
           if (boom_pending) return ("已有玩家自爆了哦，无法再次自爆。")
           boomname = resolvePlayerNickname(session)
-          recordSpeech(session, n, str_ann)
+          recordSelfExplosion(n, str_ann)
           sumup += n + "号玩家" + boomname + "自爆，发言为：" + str_ann + "\n"
           if (uc.indexOf(n) === -1) {
             if (n === white) {
@@ -4979,6 +5053,7 @@ export function apply(ctx: Context, config: Config) {
               }
               else {
                 sumup += "白板自爆成功，游戏结束，白板胜利"
+                recordExplosionOutcome('white-win')
                 notifySession(session, "白板自爆成功，游戏结束，白板胜利")
                 increment = config.scoreWhiteBoomWin
                 await addScore(boomname, increment, 'adjudicated-white-boom-win')
@@ -4988,6 +5063,7 @@ export function apply(ctx: Context, config: Config) {
             }
             else {
               increment = config.scoreGoodBoomNoWin
+              recordExplosionOutcome('no-winner')
               sumup += "游戏结束，好人自爆，无人胜利。非好人阵营均加" + increment + "分。"
               notifySession(session, "游戏结束，好人自爆，无人胜利。非好人阵营均加" + increment + "分。")
               for (let i = 0; i < player_copy.length; i++) {
@@ -5008,6 +5084,7 @@ export function apply(ctx: Context, config: Config) {
             else {
               notifySession(session, "卧底自爆成功，卧底胜利")
               sumup += "卧底自爆成功，卧底胜利"
+              recordExplosionOutcome('undercover-win')
               increment = config.scoreUndercoverWin
               for (let i = 0; i < player_copy.length; i++) {
                 if (uc_copy.indexOf(i + 1) !== -1 && !isEmpty(player_copy[i])) {
@@ -5050,7 +5127,7 @@ export function apply(ctx: Context, config: Config) {
         if (round <= uc_num && player_copy.length - player.length - kickout.length < uc_num) return ("未到轮次，无法自爆。")
         if (boom_pending) return ("已有玩家自爆了哦，无法再次自爆。")
         boomname = resolvePlayerNickname(session)
-        recordSpeech(session, n, str_ann)
+        recordSelfExplosion(n, str_ann)
         sumup += "第" + round + "轮" + n + "号玩家" + boomname + "自爆，发言为：" + str_ann + "\n"
         if (uc.indexOf(n) === -1) {
           if (n === white) {
@@ -5064,6 +5141,7 @@ export function apply(ctx: Context, config: Config) {
             }
             else {
               sumup += "白板自爆成功，游戏结束，白板胜利"
+              recordExplosionOutcome('white-win')
               notifySession(session, "白板自爆成功，游戏结束，白板胜利")
               increment = config.scoreWhiteBoomWin
               await addScore(boomname, increment, 'direct-white-boom-win')
@@ -5073,6 +5151,7 @@ export function apply(ctx: Context, config: Config) {
           }
           else {
             increment = config.scoreGoodBoomNoWin
+            recordExplosionOutcome('no-winner')
             sumup += "游戏结束，好人自爆，无人胜利。非好人阵营均加" + increment + "分。"
             notifySession(session, "游戏结束，好人自爆，无人胜利。非好人阵营均加" + increment + "分。")
             for (let i = 0; i < player_copy.length; i++) {
@@ -5092,6 +5171,7 @@ export function apply(ctx: Context, config: Config) {
           }
           else {
             sumup += "卧底自爆成功，游戏结束，卧底胜利"
+            recordExplosionOutcome('undercover-win')
             notifySession(session, "卧底自爆成功，游戏结束，卧底胜利")
             increment = config.scoreUndercoverWin
             for (let i = 0; i < player_copy.length; i++) {
@@ -5126,6 +5206,7 @@ export function apply(ctx: Context, config: Config) {
         switch (boom_state) {
           case 1:
             sumup += "卧底自爆成功，游戏结束，卧底胜利"
+            recordExplosionOutcome('undercover-win', true)
             notifySession(session, "卧底自爆成功，游戏结束，卧底胜利")
             increment = config.scoreUndercoverWin
             for (let i = 0; i < player_copy.length; i++) {
@@ -5142,6 +5223,7 @@ export function apply(ctx: Context, config: Config) {
             break
           case 2:
             sumup += "白板自爆成功，游戏结束，白板胜利"
+            recordExplosionOutcome('white-win', true)
             notifySession(session, "白板自爆成功，游戏结束，白板胜利")
             increment = config.scoreWhiteBoomWin
             await addScore(boomname, increment, 'confirmed-white-boom-win-two')
@@ -5150,6 +5232,7 @@ export function apply(ctx: Context, config: Config) {
             break
           case 3:
             sumup += "白板自爆成功，游戏结束，白板胜利"
+            recordExplosionOutcome('white-win', true)
             notifySession(session, "白板自爆成功，游戏结束，白板胜利")
             increment = config.scoreWhiteBoomWin
             await addScore(boomname, increment, 'confirmed-white-boom-win-three')
@@ -5165,6 +5248,7 @@ export function apply(ctx: Context, config: Config) {
         switch (boom_state) {
           case 1:
             sumup += "卧底自爆失败，游戏结束，好人胜利。"
+            recordExplosionOutcome('good-win', true)
             notifySession(session, "卧底自爆失败，游戏结束，好人胜利。")
             increment = config.scoreGoodWin
             for (let i = 0; i < player_copy.length; i++) {
@@ -5179,6 +5263,7 @@ export function apply(ctx: Context, config: Config) {
             break
           case 2:
             let w = order.indexOf(white)
+            recordExplosionOutcome('white-departure', true)
             const whiteEliminationText = publicHeroEliminationText(
               white,
               "白板自爆失败，场上仍有卧底在场，白板" + white + "号玩家" + player_name[w],
@@ -5244,6 +5329,7 @@ export function apply(ctx: Context, config: Config) {
             return
           case 3:
             sumup += "白板自爆失败，场上已无卧底在场，游戏结束，好人胜利。"
+            recordExplosionOutcome('good-win', true)
             notifySession(session, "白板自爆失败，场上已无卧底在场，游戏结束，好人胜利。")
             increment = config.scoreGoodWin
             for (let i = 0; i < player_copy.length; i++) {
@@ -6210,7 +6296,7 @@ export function apply(ctx: Context, config: Config) {
           sumup += huangSeat + "号玩家" + player_copy[huangSeat - 1] + "使用" + choice.cost + "个权，为" + choice.targetSeat + "号玩家" + player_name[targetIndex] + "减少" + choice.reduction + "票。\n"
           recordSkill(HERO.HUANG_TAI_JI, '消耗' + choice.cost + '个权，减票' + choice.reduction, [choice.targetSeat])
         }
-        await resumeHuangTaiJiQuan(session, "input")
+        await resumeHuangTaiJiQuan(session, "input", choice.kind === "apply")
         return
       }
       else if(mao_continue){

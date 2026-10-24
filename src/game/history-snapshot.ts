@@ -1,6 +1,7 @@
 /** Staged archive contract. Not yet connected to live game settlement. */
 export type HistoryMode = 'classic' | 'deer' | 'turtle'
 export type HistoryCamp = 'good' | 'undercover' | 'white'
+export type HistoryExplosionOutcome = 'undercover-win' | 'white-win' | 'good-win' | 'no-winner' | 'white-departure'
 export type HistoryEnding =
   | { kind: 'completed'; reason: 'elimination' | 'stalemate' | 'white-survival' | 'rule-no-winner' | 'self-explosion' | 'recruitment'; winner: HistoryCamp | 'none' }
   | { kind: 'aborted'; reason: 'host-stop' | 'host-timeout' | 'setup-timeout' | 'system-error' | 'restart' }
@@ -61,6 +62,7 @@ export interface HistoryPhase {
   events: Array<
     | { kind: 'hero-reveal'; tenureId: string; heroId: number }
     | { kind: 'skill'; tenureId: string; heroId: number; effect: string; targetSeats: number[] }
+    | { kind: 'self-explosion'; tenureId: string; text: string; outcome?: HistoryExplosionOutcome; adjudicated?: boolean }
     | { kind: 'replacement'; tenureId: string }
     | { kind: 'departure'; tenureId: string; reason: 'vote' | 'skill' | 'kick' | 'self-exit' | 'timeout' }
   >
@@ -170,6 +172,9 @@ export function captureHistory(input: HistorySnapshot): Readonly<HistorySnapshot
       invariant(tenures.has(e.tenureId), '事件作者')
       if (e.kind === 'departure') invariant(['vote', 'skill', 'kick', 'self-exit', 'timeout'].includes(e.reason), '出局原因')
       else if (e.kind === 'replacement') invariant(input.participants.some(p => p.tenureId === e.tenureId && p.replacedTenureId), '补位记录')
+      else if (e.kind === 'self-explosion') invariant(typeof e.text === 'string'
+        && (e.outcome === undefined || ['undercover-win', 'white-win', 'good-win', 'no-winner', 'white-departure'].includes(e.outcome))
+        && (e.adjudicated === undefined || typeof e.adjudicated === 'boolean'), '自爆记录')
       else {
         invariant(['skill', 'hero-reveal'].includes(e.kind) && Number.isSafeInteger(e.heroId) && e.heroId >= 0, '技能/亮将')
         if (e.kind === 'skill') invariant(typeof e.effect === 'string' && e.targetSeats.every(s => seats.has(s)), '技能结果')

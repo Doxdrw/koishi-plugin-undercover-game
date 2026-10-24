@@ -5,6 +5,7 @@ import {
   VOTE_ELIMINATION_PIPELINE,
   VOTE_ELIMINATION_ORDER,
   VOTE_RESOLUTION_TAIL,
+  VOTE_RESOLUTION_TAIL_AFTER_HUANG_TAI_JI,
   ResolutionCursor,
   continueResolution,
   endResolution,
@@ -70,6 +71,33 @@ describe("runtime resolution pipeline", () => {
     })
     assert.equal(result.control.kind, "continue")
     assert.deepEqual(trace, VOTE_RESOLUTION_TAIL)
+  })
+
+  it("keeps a dedicated post-Huang Taiji tail for Dorgon rechecking", async () => {
+    const trace: string[] = []
+    const effects: string[] = []
+    const handlers = continuingHandlers(effects)
+    handlers[ResolutionCursor.DuoErGunSwapAfterHuangTaiJi] = () => {
+      effects.push(ResolutionCursor.DuoErGunSwapAfterHuangTaiJi)
+      return continueResolution()
+    }
+    const result = await runResolutionPipeline({
+      context: {},
+      handlers,
+      order: VOTE_RESOLUTION_TAIL_AFTER_HUANG_TAI_JI,
+      trace: cursor => trace.push(cursor),
+    })
+    assert.equal(result.control.kind, "continue")
+    assert.deepEqual(effects, [
+      ResolutionCursor.LinDanHanAwaken,
+      ResolutionCursor.DuoErGunSwapAfterHuangTaiJi,
+      ResolutionCursor.FinalizeVote,
+    ])
+    assert.deepEqual(trace, [
+      ResolutionCursor.LinDanHanAwaken,
+      ResolutionCursor.DuoErGunSwapAfterHuangTaiJi,
+      ResolutionCursor.FinalizeVote,
+    ])
   })
 
   it("pauses Huang Taiji at the Lin Dan Han recheck cursor", async () => {

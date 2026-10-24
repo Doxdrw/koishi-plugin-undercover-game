@@ -126,6 +126,51 @@ it('matches a readable golden recap for ballots, replacements and natural hero e
   ].join('\n'))
 })
 
+for (const mode of ['classic', 'turtle'] as const) it(`orders ${mode} replay speech by seat and occupant in both renderers`, async () => {
+  const { app, store, queries } = await fixture(), snapshot = input()
+  snapshot.mode = mode; snapshot.deerChoices = []
+  const first = snapshot.participants[0]
+  first.leftAt = 140
+  snapshot.participants.push(
+    { ...first, tenureId: 'b', seat: 2, leftAt: undefined, identity: { platform: 'onebot', userId: 'b', nickname: '明月' } },
+    { ...first, tenureId: 'next', joinedAt: 141, leftAt: undefined, replacedTenureId: 'a', identity: { platform: 'onebot', userId: 'next', nickname: '松风' } },
+  )
+  snapshot.phases[0].eligibleTenures = ['a', 'b', 'next']
+  snapshot.phases[0].speeches = ['b', 'next', 'a'].map(tenureId => ({ tenureId, text: tenureId + '公开发言',
+    question: tenureId + '问题', answer: '是', segments: mode === 'classic' ? [
+      { kind: 'text' as const, text: tenureId + '公开发言' }, { kind: 'face' as const, id: '14' },
+    ] : undefined }))
+  const saved = await store.save(snapshot); assert.equal(saved.kind, 'saved')
+  const replay = await queries.replay(group); assert.ok(replay)
+  for (const output of [replay.phases[0].text, replay.phases[0].content!.toString()]) {
+    assert.ok(output.indexOf('1号玩家清风') < output.indexOf('1号玩家松风'))
+    assert.ok(output.indexOf('1号玩家松风') < output.indexOf('2号玩家明月'))
+  }
+  if (mode === 'classic') assert.equal((replay.phases[0].content!.toString().match(/<face id="14"/g) ?? []).length, 3)
+  const stored = await app.database.get('undercover_history_phase', { gameId: snapshot.gameId })
+  assert.deepEqual(JSON.parse(stored[0].payload).speeches.map((s: any) => s.tenureId), ['b', 'next', 'a'])
+})
+
+it('renders a failed white explosion once with its public reveal and redacts authored explosion text', async () => {
+  const { store, queries } = await fixture(), snapshot = input()
+  snapshot.mode = 'classic'; snapshot.deerChoices = []
+  snapshot.participants[0].initialCamp = snapshot.participants[0].finalCamp = 'white'
+  snapshot.phases[0].events = [
+    { kind: 'self-explosion', tenureId: 'a', text: '1自爆公开猜词', outcome: 'white-departure', adjudicated: true },
+    { kind: 'hero-reveal', tenureId: 'a', heroId: HERO.YUAN_CHONG_HUAN },
+    { kind: 'departure', tenureId: 'a', reason: 'skill' },
+  ]
+  await store.save(snapshot)
+  const replay = await queries.replay(group); assert.ok(replay)
+  assert.match(replay.phases[0].text, /清风自爆，发言为：1自爆公开猜词\n主持人判定自爆失败/)
+  assert.match(replay.phases[0].text, /白板1号玩家清风出局，游戏继续，亮出武将牌：袁崇焕/)
+  assert.equal((replay.phases[0].text.match(/出局/g) ?? []).length, 1)
+  assert.doesNotMatch(replay.phases[0].text, /因武将技能出局/)
+  const redacted = redactHistory(snapshot, historyIdentityKeys(snapshot.participants[0].identity).map(key => ({ key, cutoff: 999 })))
+  assert.doesNotMatch(JSON.stringify(redacted), /公开猜词|清风/)
+  assert.match(JSON.stringify(redacted), /自爆发言已匿名化删除/)
+})
+
 it('keeps a standalone public hero reveal in the replay when no departure follows it', async () => {
   const { store, queries } = await fixture()
   const snapshot = input()

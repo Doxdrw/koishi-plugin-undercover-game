@@ -109,6 +109,7 @@ export class HistoryQueries {
     }
     const reveals = new Map<string, string>()
     const departureTenures = new Set<string>()
+    const explosionDepartures = new Set(phase.events.filter(e => e.kind === 'self-explosion' && e.outcome === 'white-departure').map(e => e.tenureId))
     type SkillEvent = Extract<HistoryPhase['events'][number], { kind: 'skill' }>
     const departureCauses = new Map<string, SkillEvent>()
     const consumedSkillEvents = new Set<SkillEvent>()
@@ -135,6 +136,19 @@ export class HistoryQueries {
     const sentence = (text: string) => /[。！？!?…]$/u.test(text) ? text : text + '。'
     const eventLines: string[] = []
     for (const event of phase.events) {
+      if (event.kind === 'self-explosion') {
+        eventLines.push(`${who(event.tenureId)}自爆，发言为：${event.text}`)
+        if (event.adjudicated) eventLines.push(`主持人判定自爆${event.outcome === 'undercover-win' || event.outcome === 'white-win' ? '成功' : '失败'}。`)
+        if (event.outcome === 'undercover-win') eventLines.push('卧底自爆成功，游戏结束，卧底胜利。')
+        else if (event.outcome === 'white-win') eventLines.push('白板自爆成功，游戏结束，白板胜利。')
+        else if (event.outcome === 'no-winner') eventLines.push('游戏结束，好人自爆，无人胜利。')
+        else if (event.outcome === 'good-win') eventLines.push(header.participants.find(p => p.tenureId === event.tenureId)?.finalCamp === 'white'
+          ? '白板自爆失败，场上已无卧底在场，游戏结束，好人胜利。'
+          : '卧底自爆失败，游戏结束，好人胜利。')
+        else if (event.outcome === 'white-departure') eventLines.push(sentence(`白板自爆失败，场上仍有卧底在场，白板${who(event.tenureId)}出局，游戏继续${reveals.has(event.tenureId) ? `，亮出武将牌：${reveals.get(event.tenureId)}` : ''}`))
+        else eventLines.push('自爆判定尚未完成。')
+        continue
+      }
       if (event.kind === 'hero-reveal') {
         // A reveal is normally attached to the departure sentence below, but
         // some skills reveal a hero without eliminating anyone.  Keep those
@@ -148,6 +162,7 @@ export class HistoryQueries {
         eventLines.push(`${who(event.tenureId)}补位加入游戏。`)
       }
       else if (event.kind === 'departure') {
+        if (explosionDepartures.has(event.tenureId)) continue
         const reveal = reveals.get(event.tenureId)
         const cause = departureCauses.get(event.tenureId)
         if (cause) {
@@ -224,7 +239,7 @@ export class HistoryQueries {
       }
     }
     const nonZeroVotes = phase.effectiveVotes.filter(v => v.count > 0)
-    const speechLines = phase.speeches.flatMap(s => header.mode === 'turtle'
+    const speechLines = this.orderedSpeeches(header, phase).flatMap(s => header.mode === 'turtle'
       ? [`${who(s.tenureId)}：问：${s.question}`, `答：${s.answer}`]
       : [`${who(s.tenureId)}：${s.text}`])
     const tailLines = [
@@ -238,6 +253,13 @@ export class HistoryQueries {
     const lines = this.phaseLines(header, phase)
     return [lines.headerLine, ...lines.speechLines, ...lines.tailLines].join('\n')
   }
+  private orderedSpeeches(header: Header, phase: HistoryPhase) {
+    const order = new Map(header.participants.map((p, index) => [p.tenureId, { seat: p.seat, joinedAt: p.joinedAt, index }]))
+    return [...phase.speeches].sort((a, b) => {
+      const left = order.get(a.tenureId)!, right = order.get(b.tenureId)!
+      return left.seat - right.seat || left.joinedAt - right.joinedAt || left.index - right.index
+    })
+  }
   private speechSegments(segments: HistorySpeechSegment[] | undefined): h.Fragment | undefined {
     if (!segments?.length) return undefined
     return segments.map(segment => {
@@ -250,7 +272,7 @@ export class HistoryQueries {
   private phaseContent(header: Header, phase: HistoryPhase): h.Fragment {
     const lines = this.phaseLines(header, phase)
     const nodes: any[] = [h.text(lines.headerLine + '\n')]
-    for (const speech of phase.speeches) {
+    for (const speech of this.orderedSpeeches(header, phase)) {
       const who = header.participants.find(p => p.tenureId === speech.tenureId)
       const prefix = `${who?.seat ?? ''}号玩家${who?.identity.nickname ?? '已移除玩家'}：`
       if (speech.segments?.some(s => s.kind === 'media')) nodes.push(h.text(prefix), h('template', {}, this.speechSegments(speech.segments)!), h.text('\n'))
@@ -266,7 +288,8 @@ export class HistoryQueries {
     // undercover_history_choice here, even for unhidden choices.
     return [header.host.nickname, ...header.participants.map(p => p.identity.nickname),
       header.topics?.publicText, header.topics?.good, header.topics?.undercover,
-      ...phases.flatMap(p => p.speeches.flatMap(s => [s.text, s.question, s.answer]))].filter(Boolean).join('\n')
+      ...phases.flatMap(p => p.speeches.flatMap(s => [s.text, s.question, s.answer])),
+      ...phases.flatMap(p => p.events.flatMap(e => e.kind === 'self-explosion' ? [e.text] : []))].filter(Boolean).join('\n')
   }
   async list(viewer: HistoryViewer, filter: HistoryFilter = {}) {
     this.validate(viewer)
@@ -334,7 +357,7 @@ export class HistoryQueries {
       if (a.status === 'failed') return `${nickname}应得${a.amount}分，但积分未写入，请管理员核对。`
       if (a.status === 'disabled') return `${nickname}应得${a.amount}分，本局未启用积分。`
       if (a.status === 'zero') return `${nickname}本局未获得积分。`
-      return `${nickname}获得${a.amount}分。`
+      return /undercover-boom-bonus$/.test(a.reason) ? `${nickname}自爆获胜，额外加${a.amount}分。` : `${nickname}获得${a.amount}分。`
     })
     const introduction = [`对局 #${row.id}｜${modes[header.mode]}模式｜${summary.result}`,
       `主持人：${header.host.nickname}`,

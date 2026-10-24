@@ -1,4 +1,4 @@
-import { captureHistory, type HistorySnapshot, type HistoryParticipant, type HistoryIdentity, type HistoryCamp, type HistoryPhase, type HistoryEnding, type HistorySpeechSegment } from './history-snapshot'
+import { captureHistory, type HistorySnapshot, type HistoryParticipant, type HistoryIdentity, type HistoryCamp, type HistoryPhase, type HistoryEnding, type HistorySpeechSegment, type HistoryExplosionOutcome } from './history-snapshot'
 import type { ScoreReceipt } from './score-service'
 
 export type HistoryStart = Pick<HistorySnapshot, 'gameId' | 'platform' | 'selfId' | 'guildId' | 'sandbox' | 'mode' | 'startedAt' | 'host' | 'ruleVersion' | 'rules'>
@@ -75,6 +75,19 @@ export class HistoryRecorder {
     if (!text.trim()) throw new Error('阶段结果不能为空。')
     this.current.outcomes ??= []
     this.current.outcomes.push(text)
+  }
+  explosion(seat: number, text: string) {
+    this.live()
+    const row = this.participant(seat)
+    if (!this.current) throw new Error('尚未开始历史阶段。')
+    this.current.events.push({ kind: 'self-explosion', tenureId: row.tenureId, text })
+  }
+  resolveExplosion(seat: number, outcome: HistoryExplosionOutcome, adjudicated: boolean) {
+    this.live()
+    const row = this.participant(seat)
+    const event = this.current && [...this.current.events].reverse().find(e => e.kind === 'self-explosion' && e.tenureId === row.tenureId && !e.outcome)
+    if (!event || event.kind !== 'self-explosion') throw new Error('缺少待判定的自爆记录。')
+    event.outcome = outcome; event.adjudicated = adjudicated
   }
   /** Only final ballots, after all vote skills; null denotes no valid target. */
   vote(ballots: Array<{

@@ -48,6 +48,10 @@ export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, d
     if (!result) return '没有可访问的历史对局；请在原群查询，私聊仅限主持人或参赛玩家。'
     const pages = historyTextPages([result.introduction, ...result.phases.map(p => p.text)].join('\n\n'))
     const page = options.page ?? 1
+    const sendHistoryMessage = async (content: h.Fragment): Promise<void> => {
+      const messageIds = await session.send(content)
+      if (!messageIds?.length) throw new Error('history message was not delivered')
+    }
     if (forward) {
       const nodes = [h.text(result.introduction), ...result.phases.map(p => p.content ?? h.text(p.text))]
         .flatMap(content => historyContentPages(content))
@@ -55,25 +59,47 @@ export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, d
       const chunks = Math.max(1, Math.ceil(nodes.length / 10))
       if (page > chunks) return `合并转发共有${chunks}批。`
       try {
-        await session.send(h('message', { forward: true }, nodes.slice((page - 1) * 10, page * 10).map(content =>
+        await sendHistoryMessage(h('message', { forward: true }, nodes.slice((page - 1) * 10, page * 10).map(content =>
           h('message', { userId: session.selfId, nickname: '对局复盘' }, content))))
         return chunks > page ? `下一批：回放 ${result.id} --page ${page + 1}` : undefined
       } catch {
-        return pages[page - 1] + `\n合并转发不可用，已改为文本。第${page}/${pages.length}页。`
+        const fallback = pages[page - 1] === undefined ? `当前只有${pages.length}页。`
+          : pages[page - 1] + `\n合并转发不可用，已改为文本。第${page}/${pages.length}页。`
           + (page < pages.length ? `后续：复盘 ${result.id}`
             + (options.round ? ' --round ' + options.round : '')
             + (options.phase ? ' --phase ' + options.phase : '')
             + ` --page ${page + 1}。` : '')
+        try { await sendHistoryMessage(h.text(fallback)); return undefined }
+        catch { return fallback }
       }
     }
-    const media = result.phases.some(p => p.content?.toString().includes('<img')
+    const media = result.phases.some(p => p.content?.toString().includes('<face')
+      || p.content?.toString().includes('<img')
       || p.content?.toString().includes('<audio') || p.content?.toString().includes('<video') || p.content?.toString().includes('<file'))
     if (media) {
       const structured = historyContentPages(h('template', {}, h.text(result.introduction + '\n\n'),
         ...result.phases.flatMap(p => [p.content ?? h.text(p.text), h.text('\n\n')])))
       if (page > structured.length) return `当前只有${structured.length}页。`
-      await session.send(structured[page - 1])
-      return `第${page}/${structured.length}页` + (page < structured.length ? `；下一页：复盘 ${result.id} --page ${page + 1}` : '')
+      try {
+        await sendHistoryMessage(structured[page - 1])
+        return structured.length > page ? `下一页：复盘 ${result.id}`
+          + (options.round ? ' --round ' + options.round : '')
+          + (options.phase ? ' --phase ' + options.phase : '')
+          + ` --page ${page + 1}` : undefined
+      }
+      catch (error) {
+        ctx.logger.warn('复盘媒体消息发送失败，已回退为文本：%s', safeErrorSummary(error))
+        if (page > pages.length) return `当前只有${pages.length}页。`
+        const fallback = pages[page - 1] + (page < pages.length ? `\n后续：复盘 ${result.id}`
+          + (options.round ? ' --round ' + options.round : '')
+          + (options.phase ? ' --phase ' + options.phase : '')
+          + ` --page ${page + 1}。` : '')
+        try { await sendHistoryMessage(h.text(fallback)); return undefined }
+        catch (fallbackError) {
+          ctx.logger.warn('复盘文本回退发送失败：%s', safeErrorSummary(fallbackError))
+          return fallback
+        }
+      }
     }
     if (page > pages.length) return `当前只有${pages.length}页。`
     return pages[page - 1] + `\n第${page}/${pages.length}页` + (page < pages.length ? `；下一页：复盘 ${result.id}${options.round ? ' --round ' + options.round : ''}${options.phase ? ' --phase ' + options.phase : ''} --page ${page + 1}` : '')

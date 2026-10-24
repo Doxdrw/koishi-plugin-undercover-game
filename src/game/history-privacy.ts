@@ -34,7 +34,10 @@ export function redactHistory(input: HistorySnapshot, markers: readonly HistoryR
       if (s.question !== undefined) s.question = '已删除'
       if (s.answer !== undefined) s.answer = '已删除'
     }
-    for (const e of phase.events) if (authors.has(e.tenureId) && e.kind === 'skill') e.effect = '技能描述已匿名化删除'
+    for (const e of phase.events) if (authors.has(e.tenureId)) {
+      if (e.kind === 'skill') e.effect = '技能描述已匿名化删除'
+      if (e.kind === 'self-explosion') e.text = '自爆发言已匿名化删除'
+    }
   }
   snapshot.awards = snapshot.awards.filter(a => !authors.has(a.tenureId))
   snapshot.deerChoices = snapshot.deerChoices.filter(c => !authors.has(c.tenureId))

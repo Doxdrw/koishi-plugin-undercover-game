@@ -8,9 +8,12 @@ import { HERO, HERO_NUM, HERO_NAMES } from "../src/heroes"
 import { ResolutionCursor } from "../src/game/resolution-pipeline"
 import { UndercoverGameHarness } from "./game-harness"
 import { png as createPng } from "./image-fixtures"
+import { HistoryQueries } from '../src/game/history-query'
 
 const PLAYER_IDS = ["alice", "bob", "carol", "dave", "eve", "frank"] as const
 const PLAYER_NAMES = ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"] as const
+const SEVEN_PLAYER_IDS = ["alice", "bob", "carol", "dave", "eve", "frank", "gina"] as const
+const SEVEN_PLAYER_NAMES = ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Gina"] as const
 const DEFAULT_NOTIFICATIONS: Config["notifications"] = {
   voteStartPrivate: true,
   voteFirstSuccessReceipt: false,
@@ -448,7 +451,7 @@ describe('A13 face history', () => {
       await game.sendGroup('alice', '1发言<face id="14" name="微笑" platform="onebot"><img src="https://cdn.example/face.png"/></face>')
       await game.sendGroup('bob', '2<face id="66"/>')
       await game.sendGroup('carol', '3<face name="未知" payload="private-token"/>')
-      await game.sendGroup('dave', '4混合<face id="14"/><face id="66"/><img src="https://cdn.example/speech.png"/>')
+      await game.sendGroup('dave', '4混合<face id="14"/><face id="66"/>')
       await game.sendGroup('eve', '5发言')
       await game.sendGroup('frank', '6发言')
       await game.sendGroup('host', '发言总览')
@@ -555,6 +558,68 @@ describe('A13 white consolation awards', () => {
       assert.match(latestGroupOutput(game), /开始凑人/)
     }, {}, { platform: 'onebot', xpPoints: scoring(calls, fail) })
   })
+})
+
+describe('self-explosion recap narrative', () => {
+  const identities = {
+    ensureManagedIdentity: async (_platform: string, userId: string, suggested?: string) => ({
+      profileId: userId === 'host' ? 1 : PLAYER_IDS.indexOf(userId as any) + 2,
+      accountId: 'account-' + userId, nickname: suggested ?? userId, automatic: false,
+    }),
+  }
+  for (const variant of ['direct', 'confirmed', 'rejected', 'overtime', 'overtime-confirmed', 'white-success', 'white-confirmed', 'white-failure', 'white-no-undercover', 'good'] as const) {
+    it(`keeps the original speech and complete explosion outcome (${variant})`, async () => {
+      const writes: Array<{ accountId: string, amount: number, reason: string }> = []
+      await withGame(async game => {
+        const hasWhite = variant.startsWith('white')
+        await startCustomSixPlayerGame(game, {}, true, '5', true, hasWhite ? 4 : 0)
+        await finishSpeech(game, [1, 2, 3, 4, 5, 6]); await voteOut(game, 5, [1, 2, 3, 4, 5, 6])
+        await finishSpeech(game, [1, 2, 3, 4, 6]); await voteOut(game, variant === 'white-no-undercover' ? 6 : 3, [1, 2, 3, 4, 6])
+        if (variant.startsWith('overtime')) {
+          await finishSpeech(game, [1, 2, 4, 6])
+          for (const [id, target] of [['alice', '6'], ['bob', '1'], ['dave', '6'], ['frank', '1']]) await game.sendPrivate(id, target)
+          assert.match(groupTranscript(game), /进入第3轮加时/)
+        }
+        const seat = hasWhite ? 4 : variant === 'good' ? 2 : 6
+        const actor = PLAYER_IDS[seat - 1]
+        await game.sendGroup(actor, `${seat}原有发言<face id="14"/>`)
+        const content = `${seat}自爆${variant === 'direct' || variant === 'overtime' ? '苹果' : variant === 'white-success' ? '苹果梨' : '未匹配'}`
+        await game.sendGroup(actor, content)
+        if (['confirmed', 'overtime-confirmed', 'white-confirmed'].includes(variant)) await game.sendGroup('host', '是')
+        if (['rejected', 'white-failure', 'white-no-undercover'].includes(variant)) await game.sendGroup('host', '否')
+        if (variant === 'white-failure') await game.sendGroup('host', '停止卧底')
+        await game.sendGroup('host', '历史对局')
+        const rows = await game.app.database.get('undercover_history_game', {})
+        const replay = await new HistoryQueries(game.app.database).replay({
+          platform: 'onebot', selfId: 'koishi', guildId: game.guildId, userId: 'host', isDirect: false,
+        }, rows[0]?.id)
+        assert.ok(replay)
+        const phase = replay.phases.at(-1)!
+        assert.match(phase.text, new RegExp(`${seat}号玩家${PLAYER_NAMES[seat - 1]}自爆，发言为：${content}`))
+        assert.match(phase.text, /原有发言/)
+        assert.match(phase.content!.toString(), /<face id="14"/)
+        if (['confirmed', 'rejected', 'white-failure', 'overtime-confirmed', 'white-confirmed', 'white-no-undercover'].includes(variant)) assert.match(phase.text, /主持人判定自爆(成功|失败)/)
+        if (['direct', 'confirmed', 'overtime', 'overtime-confirmed'].includes(variant)) {
+          assert.match(phase.text, /卧底自爆成功.*卧底胜利/)
+          assert.match(replay.introduction, /Frank自爆获胜，额外加0.5分/)
+          assert.deepEqual(writes.filter(w => w.accountId === 'account-frank').map(w => w.amount), [2, 0.5])
+        } else if (variant === 'white-success' || variant === 'white-confirmed') assert.match(phase.text, /白板自爆成功.*白板胜利/)
+        else if (variant === 'white-no-undercover') assert.match(phase.text, /白板自爆失败，场上已无卧底在场.*好人胜利/)
+        else if (variant === 'rejected') assert.match(phase.text, /卧底自爆失败.*好人胜利/)
+        else if (variant === 'good') assert.match(phase.text, /好人自爆，无人胜利/)
+        else {
+          assert.match(phase.text, /白板自爆失败.*白板4号玩家Dave出局，游戏继续/)
+          assert.doesNotMatch(phase.text, /Dave因武将技能出局/)
+        }
+      }, { history: { enabled: true, sandbox: true, retentionDays: 0 } }, { platform: 'onebot', xpPoints: {
+        ...identities, registerScoreConsumer: () => ({ systemKey: 'undercover', dispose() {},
+          addAccount: async (target: { accountId: string }, amount: number, context: { reason: string }) => {
+            writes.push({ accountId: target.accountId, amount, reason: context.reason }); return { after: amount }
+          },
+        }),
+      } })
+    })
+  }
 })
 
 async function reachWuSanGuiChoice(game: UndercoverGameHarness): Promise<void> {
@@ -671,6 +736,68 @@ async function reachDuoErGunRegency(game: UndercoverGameHarness): Promise<void> 
 
   assert.match(groupTranscript(game), /多尔衮.*入关，获得技能“摄政”/)
   assert.match(privateTranscript(game, "alice"), /获得摄政大权/)
+}
+
+async function startCustomSevenPlayerDuoErGunHuangTaiJiGame(game: UndercoverGameHarness): Promise<void> {
+  await game.addUser("host", "主持人", 4)
+  for (let index = 0; index < SEVEN_PLAYER_IDS.length; index++) {
+    await game.addUser(SEVEN_PLAYER_IDS[index], SEVEN_PLAYER_NAMES[index])
+  }
+
+  await game.sendGroup("host", "卧底")
+  for (const playerId of SEVEN_PLAYER_IDS) await game.sendGroup(playerId, "1")
+  await game.sendGroup("host", "开始")
+  await game.sendGroup("host", "自定义")
+
+  await game.sendPrivate("host", "2")
+  await game.sendPrivate("host", "否")
+  await game.sendPrivate("host", "6")
+  await game.sendPrivate("host", "7")
+  await game.sendPrivate("host", "是")
+  for (let hero = 0; hero < HERO_NUM; hero++) {
+    const seat = hero === HERO.DUO_ER_GUN ? 1 : hero === HERO.HUANG_TAI_JI ? 2 : 0
+    await game.sendPrivate("host", String(seat))
+  }
+
+  await game.sendPrivate("host", "苹果")
+  await game.sendPrivate("host", "无")
+  await game.sendPrivate("host", "梨")
+  await game.sendPrivate("host", "无")
+  await advanceUntilSettled(game.sendPrivate("host", "5"))
+  assert.match(groupTranscript(game), /发题完毕，开始第1轮/)
+}
+
+async function finishSevenPlayerSpeech(game: UndercoverGameHarness, activeSeats: readonly number[]): Promise<void> {
+  for (const seat of activeSeats) {
+    await game.sendGroup(SEVEN_PLAYER_IDS[seat - 1], seat + "号测试发言")
+  }
+  assert.match(groupTranscript(game), /现在开始投票/)
+}
+
+async function reachSevenPlayerDuoErGunHuangTaiJiChoice(game: UndercoverGameHarness): Promise<void> {
+  await startCustomSevenPlayerDuoErGunHuangTaiJiGame(game)
+
+  await finishSevenPlayerSpeech(game, [1, 2, 3, 4, 5, 6, 7])
+  await game.sendPrivate("alice", "立2")
+  for (const [seat, target] of [[1, 5], [2, 5], [3, 5], [4, 5], [5, 1], [6, 5], [7, 5]] as const) {
+    await game.sendPrivate(SEVEN_PLAYER_IDS[seat - 1], String(target))
+  }
+  assert.match(groupTranscript(game), /本轮5号玩家Eve出局/)
+
+  await finishSevenPlayerSpeech(game, [1, 2, 3, 4, 6, 7])
+  await game.sendPrivate("alice", "立3")
+  await game.sendPrivate("alice", "立2")
+  for (const [seat, target] of [[1, 4], [2, 4], [3, 4], [4, 1], [6, 4], [7, 4]] as const) {
+    await game.sendPrivate(SEVEN_PLAYER_IDS[seat - 1], String(target))
+  }
+  assert.match(groupTranscript(game), /本轮4号玩家Dave出局/)
+
+  await finishSevenPlayerSpeech(game, [1, 2, 3, 6, 7])
+  await game.sendPrivate("alice", "保1弃2")
+  for (const [seat, target] of [[1, 2], [2, 1], [3, 1], [6, 2], [7, 2]] as const) {
+    await game.sendPrivate(SEVEN_PLAYER_IDS[seat - 1], String(target))
+  }
+  assert.match(groupTranscript(game), /投票结束，等待皇太极发动技能/)
 }
 
 async function startCustomDeerGame(
@@ -1422,6 +1549,12 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       const beforeRecap = groupTranscript(game).length
       await game.sendGroup("host", "总结")
       assert.match(groupTranscript(game).slice(beforeRecap), /<img src="https:\/\/cdn.example\/photo.png\?signature=needed"/)
+      const beforeFallback = groupTranscript(game).length
+      game.failNextGroupMessages(1)
+      await game.sendGroup("host", "总结")
+      const fallback = groupTranscript(game).slice(beforeFallback)
+      assert.match(fallback, /图文发言/)
+      assert.doesNotMatch(fallback, /第1\/1页/)
       await game.sendGroup("host", "回放")
       assert.match(latestGroupOutput(game), /<img src="https:\/\/cdn.example\/photo.png\?signature=needed"/)
       assert.doesNotMatch(latestGroupOutput(game), /&lt;img/)
@@ -1431,7 +1564,6 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       assert.match(JSON.stringify(phases), /图文发言/)
     }, { history: { enabled: true, sandbox: true, retentionDays: 0, mediaRetention: 'next-game', mediaRetentionDays: 30 } })
   })
-
   it("continues dealing after one private failure and lets that player retrieve information", async () => {
     await withGame(async game => {
       await game.addUser("host", "主持人", 4)
@@ -2531,6 +2663,41 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       await game.sendPrivate("alice", "保3弃6")
       assert.match(privateTranscript(game, "alice"), /已发动过“摄政”，无法再发动/)
     })
+  })
+
+  it("rechecks Dorgon after Huang Taiji changes the vote distribution", async () => {
+    await withGame(async (game) => {
+      await reachSevenPlayerDuoErGunHuangTaiJiChoice(game)
+      await game.sendPrivate("bob", "2")
+
+      const transcript = groupTranscript(game)
+      const dorgonNotice = transcript.indexOf("多尔衮）发动技能，使1号玩家Alice和2号玩家Bob的得票数互换")
+      assert.notEqual(dorgonNotice, -1, "皇太极减票后应重新触发多尔衮摄政")
+      assert.match(transcript, /1号玩家Alice：1票/)
+      assert.match(transcript, /2号玩家Bob：2票/)
+      assert.match(transcript, /本轮2号玩家Bob出局/)
+    }, { whiteMinPlayers: 8 })
+  })
+
+  it("does not recheck Dorgon when Huang Taiji abandons", async () => {
+    await withGame(async (game) => {
+      await reachSevenPlayerDuoErGunHuangTaiJiChoice(game)
+      await game.sendPrivate("bob", "弃")
+      const transcript = groupTranscript(game)
+      assert.equal((transcript.match(/多尔衮）发动技能，使/g) ?? []).length, 0)
+      assert.match(transcript, /本轮2号玩家Bob出局/)
+    }, { whiteMinPlayers: 8 })
+  })
+
+  it("does not recheck Dorgon when Huang Taiji times out", async () => {
+    await withGame(async (game) => {
+      await reachSevenPlayerDuoErGunHuangTaiJiChoice(game)
+      await tickGameClock(1_000)
+      const transcript = groupTranscript(game)
+      assert.match(transcript, /皇太极技能发动超时，自动取消/)
+      assert.equal((transcript.match(/多尔衮）发动技能，使/g) ?? []).length, 0)
+      assert.match(transcript, /本轮2号玩家Bob出局/)
+    }, { whiteMinPlayers: 8, skillTimeout: 1 })
   })
 
   it("rejects invalid Dorgon regency pairs and prevents reconfiguration while the marked player remains active", async () => {

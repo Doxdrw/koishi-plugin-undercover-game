@@ -5,15 +5,18 @@ import { Config } from '../src'
 import { assertGroups, fields, semanticSchema } from './config-contract'
 
 const before = JSON.parse(readFileSync(new URL('./fixtures/config-before-ui.json', import.meta.url), 'utf8'))
+const originalDefaults = (values: any) => { const { aiTools, ...original } = values; return original }
 
 it('preserves every configuration key, type, default, constraint and enum value', () => {
-  assert.deepEqual(semanticSchema(Config), before.schema)
-  assert.deepEqual(Config({}), before.defaults)
-  assert.deepEqual(Config(), before.defaults)
+  const originalSchema = semanticSchema(Config)
+  delete originalSchema.dict.aiTools
+  assert.deepEqual(originalSchema, before.schema)
+  assert.deepEqual(originalDefaults(Config({})), before.defaults)
+  assert.deepEqual(originalDefaults(Config()), before.defaults)
   // Schemastery's intersect simplifier omits the old empty debug placeholder.
   // Both serializations must resolve to exactly the frozen old defaults.
-  assert.deepEqual(Config(before.emptySimplified), before.defaults)
-  assert.deepEqual(Config(Config.simplify(Config({}))), before.defaults)
+  assert.deepEqual(originalDefaults(Config(before.emptySimplified)), before.defaults)
+  assert.deepEqual(originalDefaults(Config(Config.simplify(Config({})))), before.defaults)
 })
 
 it('preserves legacy explicit false, zero, empty lists and nested configuration', () => {
@@ -22,7 +25,7 @@ it('preserves legacy explicit false, zero, empty lists and nested configuration'
     history: { enabled: false, sandbox: true, retentionDays: 0, mediaRetention: 'days', mediaRetentionDays: 0 },
     notifications: { voteStartPrivate: false, voteHurryGroup: false },
     debug: { enabled: false, privateBodies: true, guilds: ['test-guild'], fileBytes: 16384, entryBytes: 32768 } }
-  const expected = { ...before.defaults, ...input,
+  const expected = { ...before.defaults, aiTools: { enabled: false }, ...input,
     debug: { ...before.defaults.debug, ...input.debug },
     notifications: { ...before.defaults.notifications, ...input.notifications } }
   assert.deepEqual(Config(structuredClone(input)), expected)
@@ -30,7 +33,7 @@ it('preserves legacy explicit false, zero, empty lists and nested configuration'
 })
 
 it('puts short business groups first and one compatible collapsed debug object last', () => {
-  assertGroups(Config, ['游戏设置', '开局与发题', '发言、投票与技能时限', '消息提醒', '积分结算', '对局历史', '武将卡面', '高级诊断'])
+  assertGroups(Config, ['游戏设置', '开局与发题', '发言、投票与技能时限', '消息提醒', '积分结算', '对局历史', '武将卡面', 'AI 工具', '高级诊断'])
   const all = fields(Config)
   assert.equal(Object.keys(Config.list.at(-1).dict).join(), 'debug')
   assert.equal(all.debug.type, 'object')

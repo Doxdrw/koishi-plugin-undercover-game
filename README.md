@@ -28,6 +28,7 @@ npm install koishi-plugin-undercover-game
 ## 文档导航
 
 - [完整游戏指南](GAME_GUIDE.md)：模式、配置阶段、投票、武将、历史和常用指令。
+- [ChatLuna 工具接入](CHATLUNA.md)：按需规则／状态工具与公开信息边界说明。
 - [贡献指南](https://github.com/Doxdrw/koishi-plugin-undercover-game/blob/main/CONTRIBUTING.md)：本地检查、Pull Request 和 Issue 信息。
 - [安全策略](https://github.com/Doxdrw/koishi-plugin-undercover-game/blob/main/SECURITY.md)：隐私数据和安全问题报告方式。
 
@@ -54,6 +55,7 @@ npm install koishi-plugin-undercover-game
 | `history.enabled` | 是否保存正式局历史 |
 | `history.sandbox` | 是否保存沙盒局历史，默认关闭 |
 | `history.mediaRetention` | 多媒体保留到下一局、永久保留或按天清理 |
+| `aiTools.enabled` | 提供 ChatLuna 只读规则与当前群状态工具，默认关闭 |
 
 时限、通知、白板、积分分值和卡面限制也可以在配置页面调整；实际数值以当前配置为准。
 
@@ -79,6 +81,10 @@ npm install koishi-plugin-undercover-game
 ## 订阅叫人
 
 `订阅`（或 `叫我`）保存长期召唤意愿，`取订` 删除订阅。`叫人` 每次都会读取当前群成员，只 @ 仍在群内、未被管理员暂停、不是调用者且尚未入局的订阅者；成员读取失败时不会发送不可靠的 @。
+
+## AI 工具接入
+
+开启 `aiTools.enabled` 后，支持工具调用的 ChatLuna 会话可按需查阅本插件规则和当前群公开状态。规则直接读取随包指南；工具只返回已公开的游戏信息，接入与使用边界见[工具接入说明](CHATLUNA.md)。
 
 ## 开发
 
