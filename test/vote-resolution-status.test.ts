@@ -27,6 +27,14 @@ function scenario(overrides: Partial<VoteResolutionStatusInput> = {}): VoteResol
 }
 
 describe("vote resolution status after roster changes", () => {
+  it('keeps a pending owner free to invalidate an existing heavy ballot through delegation', () => {
+    const pending = scenario({ ballots: [undefined, 1, 1, 1, 3, 3],
+      votePower: [1, 6, 1, 1, 1, 1], poll: [8, 0, 2, 0, 0, 0],
+      maoWenLongSeat: 0, zhuYouXiao: { ownerSeat: 1 } })
+    assert.equal(getVoteResolutionStatus(pending), 'pending')
+    assert.equal(getVoteResolutionStatus({ ...pending, poll: [20, 0, 2, 0, 0, 0] }), 'locked')
+    assert.equal(getVoteResolutionStatus({ ...pending, ballots: [3, 1, 1, 1, 3, 3] }), 'complete')
+  })
   it("finishes regular voting while leaving Mao Wenlong for the late-vote step", () => {
     assert.equal(getVoteResolutionStatus(scenario({
       ballots: [2, 1, 1, 1, 1, undefined],

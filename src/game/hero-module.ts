@@ -23,6 +23,7 @@ export interface HeroSpeechActionContext {
   activeSeats: readonly number[]
   undercoverSeats: readonly number[]
   whiteSeat: number
+  isDifferentFaction?: (firstSeat: number, secondSeat: number) => boolean
 }
 
 export type HeroSpeechActionResult =

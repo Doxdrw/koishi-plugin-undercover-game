@@ -1,5 +1,6 @@
 import { captureHistory, type HistorySnapshot, type HistoryParticipant, type HistoryIdentity, type HistoryCamp, type HistoryPhase, type HistoryEnding, type HistorySpeechSegment, type HistoryExplosionOutcome } from './history-snapshot'
 import type { ScoreReceipt } from './score-service'
+import type { VoteFact } from './vote-facts'
 
 export type HistoryStart = Pick<HistorySnapshot, 'gameId' | 'platform' | 'selfId' | 'guildId' | 'sandbox' | 'mode' | 'startedAt' | 'host' | 'ruleVersion' | 'rules'>
 
@@ -63,12 +64,33 @@ export class HistoryRecorder {
   speech(seat: number, text: string, question?: string, answer?: string, segments?: HistorySpeechSegment[]) {
     this.live(); const row = this.participant(seat)
     if (!this.current?.eligibleTenures.includes(row.tenureId)) throw new Error('不是本次历史发言参与者。')
-    const speech = { tenureId: row.tenureId, text,
+    this.writeSpeech(this.current, row.tenureId, text, question, answer, segments)
+  }
+  speechAt(seat: number, round: number, text: string, segments?: HistorySpeechSegment[]) {
+    this.live(); const row = this.participant(seat)
+    const phase = this.data.phases.find(p => p.round === round && p.kind === 'regular')
+    if (!phase) throw new Error('未找到补发言对应的普通阶段。')
+    if (!phase.eligibleTenures.includes(row.tenureId)) phase.eligibleTenures.push(row.tenureId)
+    this.writeSpeech(phase, row.tenureId, text, undefined, undefined, segments)
+  }
+  invalidateSpeech(seat: number, round: number, overtime: boolean, text: string, reason: string) {
+    this.live(); const row = this.participant(seat)
+    for (const phase of this.data.phases.filter(p => p.round === round && p.kind === (overtime ? 'overtime' : 'regular'))) {
+      const speech = phase.speeches.find(s => s.tenureId === row.tenureId && s.text === text)
+      if (speech) speech.invalidReason = reason
+    }
+  }
+  private writeSpeech(phase: HistoryPhase, tenureId: string, text: string, question?: string, answer?: string, segments?: HistorySpeechSegment[]) {
+    const old = phase.speeches.findIndex(s => s.tenureId === tenureId)
+    const previous = phase.speeches[old]
+    const previousInvalid = previous?.previousInvalid ? structuredClone(previous.previousInvalid) : []
+    if (previous?.invalidReason) previousInvalid.push({ text: previous.text, reason: previous.invalidReason, segments: previous.segments })
+    const speech = { tenureId, text,
       ...(question === undefined ? {} : { question }), ...(answer === undefined ? {} : { answer }),
-      ...(segments === undefined ? {} : { segments: structuredClone(segments) }) }
-    const old = this.current.speeches.findIndex(s => s.tenureId === row.tenureId)
-    if (old < 0) this.current.speeches.push(speech)
-    else this.current.speeches[old] = speech
+      ...(segments === undefined ? {} : { segments: structuredClone(segments) }),
+      ...(previousInvalid.length ? { previousInvalid } : {}) }
+    if (old < 0) phase.speeches.push(speech)
+    else phase.speeches[old] = speech
   }
   outcome(text: string) {
     this.live(); if (!this.current) throw new Error('尚未开始历史发言阶段。')
@@ -89,20 +111,20 @@ export class HistoryRecorder {
     if (!event || event.kind !== 'self-explosion') throw new Error('缺少待判定的自爆记录。')
     event.outcome = outcome; event.adjudicated = adjudicated
   }
-  /** Only final ballots, after all vote skills; null denotes no valid target. */
-  vote(ballots: Array<{
-    voterSeat: number
-    targetSeat: number | null
-    targetNickname?: string
-    weight?: number
-    status?: 'vote' | 'abstain' | 'timeout' | 'skip' | 'locked'
-  }>, effectiveVotes: HistoryPhase['effectiveVotes']) {
+  /** Replace this phase's facts; an aborted vote is not a completed result. */
+  vote(ballots: Array<Omit<VoteFact, 'weight' | 'status'> & Partial<Pick<VoteFact, 'weight' | 'status'>>>,
+    effectiveVotes: HistoryPhase['effectiveVotes'], settled = true, anonymousVotes: NonNullable<HistoryPhase['anonymousVotes']> = []) {
     this.live(); if (!this.current) throw new Error('尚未开始历史阶段。')
-    this.current.ballots = ballots.map(b => ({ voterTenureId: this.participant(b.voterSeat).tenureId, targetSeat: b.targetSeat,
+    this.current.ballots = ballots.map(b => ({ voterTenureId: this.participant(b.voterSeat).tenureId,
+      ...(b.deciderSeat === undefined ? {} : { deciderTenureId: this.participant(b.deciderSeat).tenureId }), targetSeat: b.targetSeat,
       ...(b.targetNickname === undefined ? {} : { targetNickname: b.targetNickname }),
       ...(b.weight === undefined ? {} : { weight: b.weight }),
-      ...(b.status === undefined ? {} : { status: b.status }) }))
+      ...(b.status === undefined ? {} : { status: b.status }),
+      ...(b.countedWeight === undefined ? {} : { countedWeight: b.countedWeight }),
+      ...(b.invalidReasons === undefined ? {} : { invalidReasons: [...b.invalidReasons] }) }))
     this.current.effectiveVotes = structuredClone(effectiveVotes)
+    this.current.voteSettled = settled
+    this.current.anonymousVotes = anonymousVotes.length ? structuredClone(anonymousVotes) : undefined
   }
   event(seat: number, event: Omit<Extract<HistoryPhase['events'][number], { kind: 'hero-reveal' }>, 'tenureId'>
     | Omit<Extract<HistoryPhase['events'][number], { kind: 'skill' }>, 'tenureId'>) {

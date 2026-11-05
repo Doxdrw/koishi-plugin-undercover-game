@@ -6,6 +6,7 @@ export const ResolutionCursor = {
   CalculateLeaders: "calculate-leaders",
   MaoWenLongLateVote: "mao-wen-long-late-vote",
   DuoErGunSwap: "duo-er-gun-swap",
+  LinDanHanVoteQualification: "lin-dan-han-vote-qualification",
   LinDanHanAwaken: "lin-dan-han-awaken",
   HuangTaiJiQuan: "huang-tai-ji-quan",
   DuoErGunSwapAfterHuangTaiJi: "duo-er-gun-swap-after-huang-tai-ji",
@@ -52,8 +53,9 @@ export const RESOLUTION_ORDER: readonly ResolutionCursor[] = [
   ResolutionCursor.CalculateLeaders,
   ResolutionCursor.MaoWenLongLateVote,
   ResolutionCursor.DuoErGunSwap,
-  ResolutionCursor.LinDanHanAwaken,
+  ResolutionCursor.LinDanHanVoteQualification,
   ResolutionCursor.HuangTaiJiQuan,
+  ResolutionCursor.LinDanHanAwaken,
   ResolutionCursor.FinalizeVote,
   ResolutionCursor.WuSanGuiOvertimeChoice,
   ...VOTE_ELIMINATION_ORDER,
@@ -61,17 +63,15 @@ export const RESOLUTION_ORDER: readonly ResolutionCursor[] = [
 
 export const VOTE_RESOLUTION_TAIL: readonly ResolutionCursor[] = [
   ResolutionCursor.DuoErGunSwap,
-  ResolutionCursor.LinDanHanAwaken,
+  ResolutionCursor.LinDanHanVoteQualification,
   ResolutionCursor.HuangTaiJiQuan,
+  ResolutionCursor.LinDanHanAwaken,
   ResolutionCursor.FinalizeVote,
 ]
 
 /**
- * Tail resumed after Huang Taiji actually changes the poll.
- *
- * The first Lin Dan Han check is intentionally retained here because the
- * existing Huang Taiji resume path rechecks it before finalizing.  Dorgon is
- * then checked against the post-Quan poll exactly once before the final vote.
+ * Resume after every Huang Taiji completion. Commit the final guard and
+ * deferred awakening together; only an actual poll change rechecks Dorgon.
  */
 export const VOTE_RESOLUTION_TAIL_AFTER_HUANG_TAI_JI: readonly ResolutionCursor[] = [
   ResolutionCursor.LinDanHanAwaken,

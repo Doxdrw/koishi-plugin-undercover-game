@@ -1,4 +1,5 @@
 import { HERO, HEROES } from "../heroes"
+import { normalizeHeroCommand, parseHeroNumber } from "../game/hero-command"
 import { HeroWindow } from "../game/hero-module"
 import type { HeroModule } from "../game/hero-module"
 import { WuSanGuiAuthorityPhase } from "../game/hero-state"
@@ -133,9 +134,9 @@ export const wuSanGuiModule = {
     state.wuSanGui.authorityPhase = WuSanGuiAuthorityPhase.Idle
   },
   classifyChoiceInput(content, candidateSeats) {
-    const normalized = content.replace(/\s/g, "")
+    const normalized = normalizeHeroCommand(content)
     if (normalized === "弃" || normalized === "弃权") return { kind: "abandon" }
-    const chosenSeat = Number(normalized)
+    const chosenSeat = parseHeroNumber(normalized)
     if (!candidateSeats.includes(chosenSeat)) return { kind: "invalid-target", chosenSeat }
     return { kind: "target", seat: chosenSeat }
   },

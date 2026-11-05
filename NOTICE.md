@@ -2,7 +2,7 @@
 
 ## Default hero cards
 
-The ten default PNG hero cards under `uc-pics/` are identified by stable hero
+The default PNG hero cards under `uc-pics/` are identified by stable hero
 keys in `uc-pics/manifest.json`. Their dimensions and SHA-256 values are
 recorded there for package integrity checks.
 

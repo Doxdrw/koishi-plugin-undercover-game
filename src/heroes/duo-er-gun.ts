@@ -1,4 +1,5 @@
 import { HERO, HEROES } from "../heroes"
+import { normalizeHeroCommand, parseHeroNumber } from "../game/hero-command"
 import { HeroWindow } from "../game/hero-module"
 import type { HeroModule } from "../game/hero-module"
 import type {
@@ -143,13 +144,13 @@ export const duoErGunModule = {
     return mark.kind === "none" ? null : mark.seat
   },
   classifyStrategyInput(state, input) {
-    const content = input.content.replace(/\s/g, "")
+    const content = normalizeHeroCommand(input.content)
     if (!content.startsWith("立")) return { kind: "ignore" } as const
     if (state.duoErGun.regencyState.kind === "spent") {
       return { kind: "skill-spent" } as const
     }
 
-    const chosenSeat = Number(content.replace("立", ""))
+    const chosenSeat = parseHeroNumber(content.slice(1))
     if (!input.activeSeats.includes(chosenSeat)) {
       return { kind: "invalid-target", chosenSeat } as const
     }
@@ -208,7 +209,8 @@ export const duoErGunModule = {
     }
   },
   classifyRegencyInput(state, input) {
-    const content = input.content.replace(/\s/g, "")
+    const content = normalizeHeroCommand(input.content)
+    if (!/^(?:保[0-9]+弃[0-9]+|弃[0-9]+保[0-9]+)$/u.test(content)) return { kind: "ignore" } as const
     const keepMatch = content.match(/保(\d+)/)
     const discardMatch = content.match(/弃(\d+)/)
     if (!keepMatch || !discardMatch) return { kind: "ignore" } as const

@@ -1,4 +1,5 @@
 import { HERO, HEROES } from "../heroes"
+import { normalizeHeroCommand, parseHeroNumber } from "../game/hero-command"
 import { HeroWindow } from "../game/hero-module"
 import type { HeroModule } from "../game/hero-module"
 import type { HeroStateStore, Seat } from "../game/hero-state"
@@ -82,9 +83,9 @@ export const huangTaiJiModule = {
     return null
   },
   classifyQuanChoice(input) {
-    const normalized = input.content.replace(/\s/g, "")
+    const normalized = normalizeHeroCommand(input.content)
     if (normalized === "弃" || normalized === "弃权") return { kind: "abandon" }
-    const choice = Number(normalized)
+    const choice = parseHeroNumber(normalized)
     if (input.mode === "choose-tied-leader") {
       if (!input.leaderSeats.includes(choice)) return { kind: "invalid-leader" }
       return { kind: "apply", targetSeat: choice, cost: 1, reduction: 1 }

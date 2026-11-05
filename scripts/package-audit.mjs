@@ -49,8 +49,12 @@ try {
   if (install.status !== 0) throw new Error(install.stderr || 'tarball install failed')
   const require = createRequire(join(smoke, 'smoke.cjs'))
   // Inspect the files extracted from the actual tarball, not the source tree.
-  auditPublicFiles(join(smoke, 'node_modules', pkg.name), [...names])
   const installedRoot = join(smoke, 'node_modules', pkg.name)
+  const cardManifest = join('uc-pics', 'manifest.json')
+  if (!readFileSync(join(installedRoot, cardManifest)).equals(readFileSync(join(root, cardManifest)))) {
+    throw new Error('安装包卡面清单与已验证源码不一致。')
+  }
+  auditPublicFiles(installedRoot, [...names])
   const entry = require.resolve(installedRoot)
   if (!realpathSync(entry).startsWith(realpathSync(installedRoot) + sep)) {
     throw new Error('插件加载路径不是刚安装的 tarball。')

@@ -1,4 +1,7 @@
-/** Staged archive contract. Not yet connected to live game settlement. */
+import type { BallotInvalidReason } from './vote-ballots'
+import type { VoteFactStatus } from './vote-facts'
+
+/** Persisted archive contract shared by capture, queries and report rendering. */
 export type HistoryMode = 'classic' | 'deer' | 'turtle'
 export type HistoryCamp = 'good' | 'undercover' | 'white'
 export type HistoryExplosionOutcome = 'undercover-win' | 'white-win' | 'good-win' | 'no-winner' | 'white-departure'
@@ -40,28 +43,44 @@ export type HistorySpeechSegment =
   | { kind: 'face'; id: string; name?: string; platform?: string }
   | { kind: 'media'; type: 'img' | 'audio' | 'video' | 'file'; src?: string; label?: string }
 
+export interface InvalidatedSpeech {
+  text: string
+  reason: string
+  segments?: HistorySpeechSegment[]
+}
+
 /** A fresh sequence even for a second overtime in the same round. */
 export interface HistoryPhase {
   sequence: number
   round: number
   kind: 'regular' | 'overtime'
   eligibleTenures: string[]
-  speeches: Array<{ tenureId: string; text: string; question?: string; answer?: string; segments?: HistorySpeechSegment[] }>
+  speeches: Array<{ tenureId: string; text: string; question?: string; answer?: string; segments?: HistorySpeechSegment[]; invalidReason?: string; previousInvalid?: InvalidatedSpeech[] }>
   ballots: Array<{
     voterTenureId: string
+    /** Fixed-seat voter who actually supplied a delegated ballot, if any. */
+    deciderTenureId?: string
     targetSeat: number | null
     /** Nickname at the time of the vote; optional for older snapshots. */
     targetNickname?: string
     weight?: number
     /** Public replay wording; absent on older snapshots, inferred by the renderer. */
-    status?: 'vote' | 'abstain' | 'timeout' | 'skip' | 'locked'
+    status?: VoteFactStatus
+    countedWeight?: number
+    invalidReasons?: BallotInvalidReason[]
   }>
+  /** False when a game stopped before this vote completed. Omitted on earlier records. */
+  voteSettled?: boolean
+  anonymousVotes?: Array<{ seat: number; count: number }>
   effectiveVotes: Array<{ seat: number; count: number }>
   /** Public result notices belonging to this phase; optional for older snapshots. */
   outcomes?: string[]
   events: Array<
     | { kind: 'hero-reveal'; tenureId: string; heroId: number }
-    | { kind: 'skill'; tenureId: string; heroId: number; effect: string; targetSeats: number[] }
+    | { kind: 'skill'; tenureId: string; heroId: number; effect: string; targetSeats: number[];
+        details?: { kind: 'wei-slander'; affectedSeats: number[]; changedSeats: number[];
+          retroactiveVotes: Array<{ phaseSerial: number; targetSeat: number }>; gainedFa: number }
+          | { kind: 'wei-fa'; phaseSerial: number; targetSeat: number; gainedFa: number; source?: 'normal' | 'slander' } }
     | { kind: 'self-explosion'; tenureId: string; text: string; outcome?: HistoryExplosionOutcome; adjudicated?: boolean }
     | { kind: 'replacement'; tenureId: string }
     | { kind: 'departure'; tenureId: string; reason: 'vote' | 'skill' | 'kick' | 'self-exit' | 'timeout' }
@@ -161,10 +180,19 @@ export function captureHistory(input: HistorySnapshot): Readonly<HistorySnapshot
           && (segment.label === undefined || typeof segment.label === 'string')))
       && (input.mode !== 'turtle' || typeof s.question === 'string' && typeof s.answer === 'string'), '发言/问答作者')
     invariant(new Set(phase.ballots.map(b => b.voterTenureId)).size === phase.ballots.length, '重复最终选票')
-    for (const b of phase.ballots) invariant(tenures.has(b.voterTenureId) && (b.targetSeat === null || seats.has(b.targetSeat))
+    for (const b of phase.ballots) invariant(tenures.has(b.voterTenureId)
+      && (b.deciderTenureId === undefined || tenures.has(b.deciderTenureId))
+      && (b.targetSeat === null || seats.has(b.targetSeat))
       && (b.targetNickname === undefined || typeof b.targetNickname === 'string')
       && (b.weight === undefined || Number.isFinite(b.weight) && b.weight >= 0)
-      && (b.status === undefined || ['vote', 'abstain', 'timeout', 'skip', 'locked'].includes(b.status)), '投票记录')
+      && (b.status === undefined || ['vote', 'abstain', 'timeout', 'skip', 'locked', 'pending'].includes(b.status))
+      && (b.countedWeight === undefined || Number.isFinite(b.countedWeight) && b.countedWeight >= 0)
+      && (b.invalidReasons === undefined || Array.isArray(b.invalidReasons)
+        && new Set(b.invalidReasons).size === b.invalidReasons.length
+        && b.invalidReasons.every(reason => ['lin-dan-han-protection', 'lin-dan-han-mutual', 'zhu-you-xiao-delegation'].includes(reason))), '投票记录')
+    invariant(phase.voteSettled === undefined || typeof phase.voteSettled === 'boolean', '投票结算状态')
+    if (phase.anonymousVotes !== undefined) invariant(Array.isArray(phase.anonymousVotes)
+      && phase.anonymousVotes.every(v => seats.has(v.seat) && Number.isFinite(v.count) && v.count >= 0), '无来源票数')
     invariant(new Set(phase.effectiveVotes.map(v => v.seat)).size === phase.effectiveVotes.length, '重复有效票型')
     for (const v of phase.effectiveVotes) invariant(seats.has(v.seat) && Number.isFinite(v.count) && v.count >= 0, '有效票数')
     if (phase.outcomes !== undefined) invariant(Array.isArray(phase.outcomes) && phase.outcomes.every(text => typeof text === 'string'), '阶段结果')

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to publish, e.g. v0.3.3
+        description: Existing version tag to stage (v + package version)
         required: true
         type: string
 

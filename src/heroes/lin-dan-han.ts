@@ -55,6 +55,8 @@ interface LinDanHanModule extends HeroModule {
     state: HeroStateStore,
     input: LinDanHanVoteAwakeningInput,
   ): boolean
+  recordVoteAwakening(state: HeroStateStore, phaseSerial: number, input: LinDanHanVoteAwakeningInput): void
+  finalizeVoteAwakening(state: HeroStateStore, phaseSerial: number, input: LinDanHanVoteAwakeningInput): boolean
 }
 
 export const linDanHanModule = {
@@ -73,6 +75,7 @@ export const linDanHanModule = {
     state.linDanHan.awakened = false
     state.linDanHan.realityRecords = []
     state.linDanHan.preventedVotePower = 0
+    state.linDanHan.pendingVoteAwakening = null
   },
   initializeRealityRecords(state, seats, heroSeat) {
     state.linDanHan.realityRecords = seats.filter(seat => seat !== heroSeat)
@@ -88,6 +91,7 @@ export const linDanHanModule = {
   beginVoteWindow(state) {
     state.linDanHan.ownVoteInvalidated = false
     state.linDanHan.preventedVotePower = 0
+    state.linDanHan.pendingVoteAwakening = null
   },
   realityRecords(state) {
     return state.linDanHan.realityRecords
@@ -169,5 +173,21 @@ export const linDanHanModule = {
       && input.preventedVotePower + input.heroPoll > input.maximumPoll + input.unvote
       && input.heroPoll <= input.maximumPoll
       && !input.shielded
+  },
+  recordVoteAwakening(state, phaseSerial, input) {
+    state.linDanHan.pendingVoteAwakening = {
+      phaseSerial,
+      qualified: input.heroActive && !state.linDanHan.awakened
+        && input.preventedVotePower + input.heroPoll > input.maximumPoll + input.unvote
+        && input.heroPoll <= input.maximumPoll,
+    }
+  },
+  finalizeVoteAwakening(state, phaseSerial, input) {
+    const pending = state.linDanHan.pendingVoteAwakening
+    state.linDanHan.pendingVoteAwakening = null
+    const numerical = input.preventedVotePower + input.heroPoll > input.maximumPoll + input.unvote
+      && input.heroPoll <= input.maximumPoll
+    return input.heroActive && !state.linDanHan.awakened && !input.shielded
+      && (pending?.phaseSerial === phaseSerial && pending.qualified || numerical)
   },
 } satisfies LinDanHanModule

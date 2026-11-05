@@ -1,8 +1,11 @@
 import { GameUserError } from './errors'
+import { projectHistoryParticipants } from './history-participants'
+import type { HistoryParticipant } from './history-snapshot'
 import { h, type Context } from 'koishi'
 import type { HistorySnapshot, HistoryPhase, HistorySpeechSegment } from './history-snapshot'
 import type { HistoryGameRow } from './history-store'
 import { HERO_NAMES } from '../heroes'
+import { WinrateAccumulator, type WinrateFilter, type WinrateHeader } from './history-winrate'
 
 export interface HistoryViewer {
   platform: string
@@ -101,11 +104,16 @@ export class HistoryQueries {
     }
     const ballotText = (ballot: HistoryPhase['ballots'][number]) => {
       const target = ballot.targetSeat === null
-        ? ({ abstain: '弃权', timeout: '未来得及投票', skip: '跳过投票阶段', locked: '无需投票' } as Record<string, string>)[ballotStatus(ballot)] ?? '未投票'
+        ? ({ abstain: '弃权', timeout: '未来得及投票', skip: '跳过投票阶段', locked: '无需投票', pending: '尚未投票' } as Record<string, string>)[ballotStatus(ballot)] ?? '未投票'
         : `${ballot.targetSeat}号玩家${ballot.targetNickname ? ballot.targetNickname : ''}`
       const weight = ballot.weight !== undefined && ballot.weight > 1 ? `（${ballot.weight}票）` : ''
-      if (ballot.targetSeat === null) return `${who(ballot.voterTenureId)}${target}${weight}。`
-      return `${who(ballot.voterTenureId)}投给了${target}${weight}。`
+      const decider = ballot.deciderTenureId && ballot.deciderTenureId !== ballot.voterTenureId
+        ? `（由${who(ballot.deciderTenureId)}代投）` : ''
+      if (ballot.targetSeat === null) return `${who(ballot.voterTenureId)}${target}${weight}${decider}。`
+      const reasonNames = { 'lin-dan-han-protection': '“避实”保护', 'lin-dan-han-mutual': '林丹汗互投限制', 'zhu-you-xiao-delegation': '“放权”' }
+      const invalid = ballot.invalidReasons?.length
+        ? `，此票因${ballot.invalidReasons.map(reason => reasonNames[reason]).join('及')}失效` : ''
+      return `${who(ballot.voterTenureId)}投给了${target}${weight}${decider}${invalid}。`
     }
     const reveals = new Map<string, string>()
     const departureTenures = new Set<string>()
@@ -211,12 +219,19 @@ export class HistoryQueries {
           '获得1个权': '获得1个“权”标记',
           '放弃权计': '放弃发动“权计”',
           '放弃出局技能': '放弃发动技能',
+          '放弃守卫': `放弃${targets}的守卫`,
           '入关觉醒': '入关，获得“摄政”',
+          '传弟被放弃': `发动“传弟”，但${targets}放弃接受`,
+          '传弟选择超时，放弃接受': `发动“传弟”，但${targets}选择超时，未接受`,
+          '指定放权对象，等待代投': `将本次投票交给${targets}决定`,
+          '选择缉访选项1，等待本次投票结算': '选择查看本次所投玩家的投票情况',
+          '选择缉访选项2，等待本次投票结算': `选择查看${targets}本次的被投票情况`,
         }
         const readableEffect = (value: string) =>
-          /^(?:选择处决|选择守卫|选择自裁|发动“|获得|觉醒|入关|放弃|将“|把|使|输入超时)/u.test(value)
+          /^(?:因|通过|选择处决|选择守卫|选择自裁|发动“|获得|觉醒|入关|放弃|将“|把|使|输入超时)/u.test(value)
             && !/^(?:处决：|觉醒及援寡结算|觉醒西迁|出局带走|权计指定出局|守卫连带出局|设置守卫目标|设置定策|配置摄政|抵诽：|迟投增加|定策保护：|消耗\d+个权，减票|赠予\d+个伐|获得\d+个伐|获得1个权)$/u.test(value)
         const rendered = natural[effect]
+          ?? (/^伐异获得([0-9]+)个伐$/u.test(effect) ? `因所投的${targets}在下轮开始前出局且与其非同阵营，发动“伐异”，获得${effect.match(/[0-9]+/)![0]}个“伐”标记` : undefined)
           ?? (/^迟投增加([\d.]+)票$/.test(effect) ? `使${targets}得票数增加${effect.match(/^迟投增加([\d.]+)票$/)![1]}票` : undefined)
           ?? (/^定策保护：减票([\d.]+)$/.test(effect) ? `发动“定策”，使${targets}得票数减少${effect.split('减票')[1]}票` : undefined)
           ?? (/^消耗([\d.]+)个权，减票([\d.]+)$/.test(effect) ? `消耗${effect.match(/^消耗([\d.]+)个权/)![1]}个“权”，使${targets}得票数减少${effect.split('减票')[1]}票` : undefined)
@@ -224,6 +239,10 @@ export class HistoryQueries {
           ?? (/^获得([\d.]+)个伐$/.test(effect) ? `获得${effect.match(/^获得([\d.]+)/)![1]}个“伐”标记` : undefined)
           ?? (/^觉醒西迁$/.test(effect) ? '觉醒，获得“西迁”' : undefined)
           ?? (/^觉醒及援寡结算$/.test(effect) ? '完成“援寡”结算' : undefined)
+          ?? (/^放权给\d+号玩家代投$/.test(effect) ? `将本次投票交给${targets}代投` : undefined)
+          ?? (/^传弟：.+恢复原生技能$/.test(effect) ? `让${targets}恢复原生技能` : undefined)
+          ?? (/^传弟：获得处决$/.test(effect) ? `让${targets}获得技能“处决”` : undefined)
+          ?? (/^传弟：(处决|诬诽|专镇)次数\+1$/.test(effect) ? `让${targets}增加一次“${effect.match(/^传弟：(处决|诬诽|专镇)/)![1]}”使用次数` : undefined)
           ?? (/^避实抵消([\d.]+)票(?:；免疫(.+?))?(?:；本人投票失效)?$/.test(effect) ? (() => {
             const match = effect.match(/^避实抵消([\d.]+)票(?:；免疫(.+?))?(?:；本人投票失效)?$/)!
             const immuneVotes = targets ? `${targets}的投票` : match[2]
@@ -243,8 +262,9 @@ export class HistoryQueries {
       ? [`${who(s.tenureId)}：问：${s.question}`, `答：${s.answer}`]
       : [`${who(s.tenureId)}：${s.text}`])
     const tailLines = [
-      ...(phase.ballots.length ? ['投票结果：', ...phase.ballots.map(ballotText)] : []),
-      ...(nonZeroVotes.length ? ['最终票数：', ...nonZeroVotes.map(v => `${v.seat}号玩家${header.participants.find(p => p.seat === v.seat)?.identity.nickname ?? ''}获得${v.count}票。`)] : []),
+      ...(phase.ballots.length ? [phase.voteSettled === false ? '投票尚未结算，以下为中止前已记录的投票：' : '投票结果：', ...phase.ballots.map(ballotText)] : []),
+      ...(nonZeroVotes.length ? [phase.voteSettled === false ? '中止时的票况（尚未结算）：' : '最终票数：', ...nonZeroVotes.map(v => `${v.seat}号玩家${header.participants.find(p => p.seat === v.seat)?.identity.nickname ?? ''}获得${v.count}票。`)] : []),
+      ...(phase.anonymousVotes ?? []).map(v => `${v.seat}号玩家有${v.count}票无来源。`),
       ...(phase.outcomes ?? []),
       ...eventLines]
     return { headerLine: `第${phase.round}轮${phase.kind === 'overtime' ? '加时' : ''}`, speechLines, tailLines }
@@ -275,6 +295,11 @@ export class HistoryQueries {
     for (const speech of this.orderedSpeeches(header, phase)) {
       const who = header.participants.find(p => p.tenureId === speech.tenureId)
       const prefix = `${who?.seat ?? ''}号玩家${who?.identity.nickname ?? '已移除玩家'}：`
+      for (const previous of speech.previousInvalid ?? []) {
+        nodes.push(h.text(prefix + '（已失效：' + previous.reason + '）'),
+          h('template', {}, this.speechSegments(previous.segments) ?? h.text(previous.text)), h.text('\n'))
+      }
+      if (speech.invalidReason) nodes.push(h.text('（已失效：' + speech.invalidReason + '）'))
       if (speech.segments?.some(s => s.kind === 'media')) nodes.push(h.text(prefix), h('template', {}, this.speechSegments(speech.segments)!), h.text('\n'))
       else if (header.mode === 'turtle') nodes.push(h.text(prefix + `问：${speech.question}\n答：${speech.answer}\n`))
       else if (speech.segments?.length) nodes.push(h.text(prefix), h('template', {}, this.speechSegments(speech.segments)!), h.text('\n'))
@@ -328,6 +353,33 @@ export class HistoryQueries {
     if (page > pages) throw new GameUserError(`当前只有${pages}页。`)
     return { page, pages, total, entries: result }
   }
+  async winrates(viewer: HistoryViewer, filter: WinrateFilter = {}) {
+    this.validate(viewer)
+    if (filter.from !== undefined && !Number.isFinite(filter.from) || filter.until !== undefined && !Number.isFinite(filter.until)
+      || filter.from !== undefined && filter.until !== undefined && filter.from >= filter.until) throw new GameUserError('周期范围无效。')
+    const result = new WinrateAccumulator(this.currentPerson, this.canonical)
+    let before: number | undefined
+    while (true) {
+      const rows = await this.database.get('undercover_history_game', { platform: viewer.platform, selfId: viewer.selfId, disposition: 'completed',
+        ...(viewer.guildId ? { guildId: viewer.guildId } : {}), ...(filter.mode ? { mode: filter.mode } : {}),
+        ...(before === undefined ? {} : { id: { $lt: before } }),
+        ...(filter.from === undefined && filter.until === undefined ? {} : { endedAt: {
+          ...(filter.from === undefined ? {} : { $gte: filter.from }), ...(filter.until === undefined ? {} : { $lt: filter.until }),
+        } }),
+      }, { sort: { id: 'desc' }, limit: 100 })
+      for (const row of rows) {
+        const header = JSON.parse(row.payload) as WinrateHeader
+        if (header.sandbox || header.ending.kind !== 'completed' || header.ending.winner === 'none' || !await this.allowed(viewer, row, header)) continue
+        // New archives keep only these small event facts in the header. Older
+        // retained archives are read one game at a time, without rendering content.
+        const departures = header.departureReasons ?? (await this.database.get('undercover_history_phase', { gameId: row.gameId }, { fields: ['payload'] }))
+          .flatMap(phase => (JSON.parse(phase.payload) as HistoryPhase).events.flatMap(event => event.kind === 'departure' ? [event] : []))
+        await result.add(header, departures)
+      }
+      if (rows.length < 100) return result
+      before = rows.at(-1)!.id
+    }
+  }
   async replay(viewer: HistoryViewer, id?: number, filter: { round?: number; sequence?: number; overtime?: boolean } = {}): Promise<HistoryReplay | undefined> {
     this.validate(viewer)
     if (id === undefined) id = (await this.list(viewer)).entries[0]?.id
@@ -351,7 +403,10 @@ export class HistoryQueries {
       ...(header.topics.undercoverHint ? [header.mode === 'classic' ? '卧底雷点：' + header.topics.undercoverHint : '卧底提示：' + header.topics.undercoverHint] : []),
       ...(header.topics.whiteHint ? ['白板提示：' + header.topics.whiteHint] : []),
     ] : []
-    const playerLines = header.participants.map(p => `${p.seat}号 ${p.identity.nickname}（${label[p.initialCamp]}${p.finalCamp !== p.initialCamp ? '→' + label[p.finalCamp] : ''}${p.heroId !== null ? '，' + (HERO_NAMES[p.heroId] ?? '未知武将') : ''}${p.replacedTenureId ? '，补位' : ''}）`)
+    const roster = await projectHistoryParticipants(header.participants, this.canonical)
+    const participantLine = (p: HistoryParticipant) => `${p.seat}号 ${p.identity.nickname}（${label[p.initialCamp]}${p.finalCamp !== p.initialCamp ? '→' + label[p.finalCamp] : ''}${p.heroId !== null ? '，' + (HERO_NAMES[p.heroId] ?? '未知武将') : ''}${p.replacedTenureId ? '，补位' : ''}）`
+    const playerLines = roster.current.map(participantLine)
+    const formerLines = roster.former.map(participantLine)
     const awardLines = header.awards.map(a => {
       const nickname = header.participants.find(p => p.tenureId === a.tenureId)?.identity.nickname ?? '已移除玩家'
       if (a.status === 'failed') return `${nickname}应得${a.amount}分，但积分未写入，请管理员核对。`
@@ -364,6 +419,7 @@ export class HistoryQueries {
       ...(header.ending.reason === 'elimination' ? [] : [`结束原因：${endingReasons[header.ending.reason]}`]),
       ...topicLines,
       '玩家：', ...playerLines,
+      ...(formerLines.length ? ['被替换的玩家：', ...formerLines] : []),
       ...(awardLines.length ? ['积分：', ...awardLines] : [])]
     return { ...summary, introduction: introduction.filter(Boolean).join('\n'),
       phases: phases.map(p => ({ sequence: p.sequence, round: p.round, kind: p.kind, text: this.phaseText(header, p), content: this.phaseContent(header, p) })) }

@@ -40,9 +40,11 @@ npm install koishi-plugin-undercover-game
 
 具体规则、武将说明和指令见[游戏指南](GAME_GUIDE.md)。
 
+私聊提示未收到时，玩家可发送 `我的待处理` 补取当前技能／代投操作，主持人可发送 `待处理操作` 查看待办；群内查询的隐藏详情会转私聊，补取不会重置时限。
+
 ## 常用配置
 
-配置页面按游戏、开局、时限、提醒、积分、历史和卡面分组。常用选项包括：
+配置页面按游戏、开局、时限、鹿模式重选、主持人超时、提醒、积分、历史和卡面分组。常用选项包括：
 
 | 配置 | 作用 |
 | --- | --- |
@@ -50,11 +52,14 @@ npm install koishi-plugin-undercover-game
 | `heroesByDefault` | 新局默认是否使用武将，默认开启 |
 | `minPlayers` | 开局所需的最少玩家数，默认 6 |
 | `enabledHeroes` | 武将局可随机使用的武将 |
+| `deerHostTimeoutAction` / `boomHostTimeoutAction` | 鹿选词审核／自爆判定超时的自动处理、协同主持招募或终止策略 |
 | `scoreSystemKey` | xp-points 中使用的积分系统 key |
 | `enablePersistentScoring` | 是否写入 xp-points，默认开启 |
 | `history.enabled` | 是否保存正式局历史 |
 | `history.sandbox` | 是否保存沙盒局历史，默认关闭 |
 | `history.mediaRetention` | 多媒体保留到下一局、永久保留或按天清理 |
+| `history.winrateMinimumGames` | 胜率榜最低参赛局数，默认 5；个人查询不设门槛 |
+| `reportImages.enabled` | 总结／复盘和选词公布优先发送图片，默认开启；Puppeteer 服务可选 |
 | `aiTools.enabled` | 提供 ChatLuna 只读规则与当前群状态工具，默认关闭 |
 
 时限、通知、白板、积分分值和卡面限制也可以在配置页面调整；实际数值以当前配置为准。
@@ -62,6 +67,10 @@ npm install koishi-plugin-undercover-game
 开启积分并接入 xp-points 后，默认的 `undercover` 群积分系统会自动创建；使用自定义 `scoreSystemKey` 时，先在 xp-points 中创建对应系统。累计榜可用 `积分.排行 undercover` 查询，月榜可用 `积分.排行 undercover 月`；自定义 key 时相应替换。
 
 ## 历史与隐私
+
+`胜率` 查看自己的累计胜率，也可 `胜率 @玩家 上周`、`胜率 模式=鹿 武将=袁崇焕`；`胜率榜 上月 好人` 查看本群榜单。周期查询需要 xp-points 0.3.0 及以上，复用当前绑定系统的周期设置；累计查询无需积分插件。
+
+在插件市场安装并启用 `puppeteer` 后，`总结`／`复盘` 和 `公布选人` 默认输出图片，长内容自动分图；发言里的表情和多媒体随图保留。未提供浏览器服务或图片输出失败时，使用完整文字回退。本次只看文字可发送 `总结 -t`、`复盘 编号 -t` 或 `公布选人 -t`。`回放` 保持合并转发。
 
 正式局可以保存题面、分轮发言、问答、投票、技能结果和结算；沙盒默认不保存。历史查询只在原群或对应主持人、参赛者的私聊中开放，鹿模式选词记录单独管理，不会混入普通复盘或关键词搜索。
 

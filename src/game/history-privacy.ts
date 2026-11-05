@@ -31,6 +31,8 @@ export function redactHistory(input: HistorySnapshot, markers: readonly HistoryR
     for (const s of phase.speeches) if (authors.has(s.tenureId)) {
       s.text = '发言已匿名化删除'
       delete s.segments
+      delete s.previousInvalid
+      delete s.invalidReason
       if (s.question !== undefined) s.question = '已删除'
       if (s.answer !== undefined) s.answer = '已删除'
     }

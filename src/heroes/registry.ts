@@ -10,6 +10,8 @@ import { wuSanGuiModule } from "./wu-san-gui"
 import { zhangXianZhongModule } from "./zhang-xian-zhong"
 import { yuanChongHuanModule } from "./yuan-chong-huan"
 import { zhuYouJianModule } from "./zhu-you-jian"
+import { zhuYouXiaoModule } from "./zhu-you-xiao"
+import { weiZhongXianModule } from "./wei-zhong-xian"
 
 export const heroRegistry = new HeroRegistry(HEROES)
   .register(zhangXianZhongModule)
@@ -22,3 +24,5 @@ export const heroRegistry = new HeroRegistry(HEROES)
   .register(wuSanGuiModule)
   .register(linDanHanModule)
   .register(maoWenLongModule)
+  .register(zhuYouXiaoModule)
+  .register(weiZhongXianModule)

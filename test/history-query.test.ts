@@ -68,6 +68,19 @@ it('never reads deer choices or exposes internal account identifiers in normal r
   assert.equal((await queries.list(group)).total, 1)
 })
 
+it('renders stored short-form Wei rewards with their target and cause', async () => {
+  const { store, queries } = await fixture()
+  const snapshot = input()
+  snapshot.participants[0].heroId = HERO.WEI_ZHONG_XIAN
+  snapshot.phases[0].events.push({ kind: 'skill', tenureId: 'a', heroId: HERO.WEI_ZHONG_XIAN,
+    effect: '伐异获得1个伐', targetSeats: [1] })
+  await store.save(snapshot)
+  const replay = await queries.replay(group)
+  assert.match(JSON.stringify(replay), /所投的1号玩家清风在下轮开始前出局且与其非同阵营/)
+  assert.match(JSON.stringify(replay), /获得1个“伐”标记/)
+  assert.doesNotMatch(JSON.stringify(replay), /发动武将技能/)
+})
+
 it('renders ending reason, phase outcomes, special vote weight and award write status', async () => {
   const { store, queries } = await fixture()
   const snapshot = input()
@@ -98,7 +111,7 @@ it('matches a readable golden recap for ballots, replacements and natural hero e
   Object.assign(snapshot.phases[0], {
     eligibleTenures: ['a', 'b', 'c', 'd', 'next'], speeches: [{ tenureId: 'b', text: '2曾经当过皇帝' }],
     ballots: [
-      { voterTenureId: 'next', targetSeat: 2, targetNickname: '明月', weight: 1, status: 'vote' },
+      { voterTenureId: 'next', deciderTenureId: 'b', targetSeat: 2, targetNickname: '明月', weight: 1, status: 'vote' },
       { voterTenureId: 'b', targetSeat: 3, targetNickname: '流云', weight: 2, status: 'vote' },
       { voterTenureId: 'c', targetSeat: null, weight: 1, status: 'timeout' },
       { voterTenureId: 'd', targetSeat: null, weight: 0, status: 'skip' },
@@ -115,15 +128,40 @@ it('matches a readable golden recap for ballots, replacements and natural hero e
   const replay = await queries.replay(group); assert.ok(replay)
   assert.match(replay.introduction, /好人雷点：好人雷点\n卧底雷点：卧底雷点/)
   assert.doesNotMatch(replay.introduction, /题面：\s*\n/)
-  assert.match(replay.introduction, /玩家：\n1号 清风/)
+  assert.match(replay.introduction, /玩家：\n1号 松风[^\n]*\n2号 明月/)
+  assert.match(replay.introduction, /被替换的玩家：\n1号 清风/)
   assert.equal(replay.phases[0].text, [
     '第1轮', '2号玩家明月：2曾经当过皇帝', '投票结果：',
-    '1号玩家松风投给了2号玩家明月。', '2号玩家明月投给了3号玩家流云（2票）。',
+    '1号玩家松风投给了2号玩家明月（由2号玩家明月代投）。', '2号玩家明月投给了3号玩家流云（2票）。',
     '3号玩家流云未来得及投票。', '4号玩家星河跳过投票阶段。', '最终票数：',
     '2号玩家明月获得1票。', '3号玩家流云获得2票。', '1号玩家清风被主持人踢出。', '1号玩家松风补位加入游戏。',
     '4号玩家星河使2号玩家明月得票数增加1票。', '1号玩家松风“避实”抵消2票。',
     '2号玩家明月发动“权计”，指定3号玩家流云出局。',
   ].join('\n'))
+})
+
+it('renders Zhu Youxiao delegation and heir effects as public causal sentences', async () => {
+  const { store, queries } = await fixture()
+  const snapshot = input()
+  snapshot.mode = 'classic'; snapshot.deerChoices = []
+  snapshot.topics = { publicText: '', good: '好人词条', undercover: '卧底词条' }
+  const first = snapshot.participants[0]
+  snapshot.participants.push(
+    { ...first, tenureId: 'b', seat: 2, identity: { platform: 'onebot', userId: 'bob', nickname: '明月' } },
+    { ...first, tenureId: 'c', seat: 3, identity: { platform: 'onebot', userId: 'carol', nickname: '流云' } },
+  )
+  snapshot.phases[0].events = [
+    { kind: 'skill', tenureId: 'a', heroId: HERO.ZHU_YOU_XIAO, effect: '放权给2号玩家代投', targetSeats: [2] },
+    { kind: 'skill', tenureId: 'a', heroId: HERO.ZHU_YOU_XIAO, effect: '传弟：流云恢复原生技能', targetSeats: [3] },
+    { kind: 'skill', tenureId: 'a', heroId: HERO.ZHU_YOU_XIAO, effect: '传弟被放弃', targetSeats: [2] },
+  ]
+  await store.save(snapshot)
+  const replay = await queries.replay(group)
+  assert.ok(replay)
+  assert.match(replay.phases[0].text, /1号玩家清风将本次投票交给2号玩家明月代投。/)
+  assert.match(replay.phases[0].text, /1号玩家清风让3号玩家流云恢复原生技能。/)
+  assert.match(replay.phases[0].text, /1号玩家清风发动“传弟”，但2号玩家明月放弃接受。/)
+  assert.doesNotMatch(replay.phases[0].text, /发动武将技能/)
 })
 
 for (const mode of ['classic', 'turtle'] as const) it(`orders ${mode} replay speech by seat and occupant in both renderers`, async () => {

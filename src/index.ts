@@ -2,7 +2,8 @@ import { App, Command, Context, Schema, h, $, Session } from "koishi"
 import { randomUUID } from 'node:crypto'
 import { HEROES, HERO_NUM, HERO_NAMES, HERO_ABILITIES, HERO, HeroState } from './heroes'
 import { createHeroStateStore, HeroStateStore } from './game/hero-state'
-import { PendingActionCoordinator } from './game/pending-action'
+import { createZhuYouXiaoState, beginZhuYouXiaoVotePhase, clearZhuYouXiaoPhase, detachZhuYouXiaoCurrent, recordZhuYouXiaoProxyVote, setZhuYouXiaoDelegate, zhuYouXiaoSuccessfulDelegates } from './game/zhu-you-xiao-state'
+import { PendingActionCoordinator, type PendingAction, type PendingActionKind } from './game/pending-action'
 import { GameTimerManager } from './game/game-timer-manager'
 import { ReplacementRequestCoordinator } from './game/replacement-request'
 import { GameRouteCoordinator } from './game/game-route'
@@ -25,6 +26,8 @@ import { HistoryPersistence, FileHistoryRetryQueue } from './game/history-retry'
 import { HistoryQueries, historyTextPages } from './game/history-query'
 import { DeerHistoryControls } from './game/history-deer'
 import { registerHistoryCommands } from './game/history-commands'
+import { registerWinrateCommands } from './game/winrate-commands'
+import { ReportImages, type ReportBrowser } from './game/report-images'
 import { createHistoryDeletionConsumer } from './game/history-deletion-consumer'
 import type { HistoryEnding, HistoryCamp, HistorySpeechSegment } from './game/history-snapshot'
 import { DiagnosticLog, GameDiagnostics, type DiagnosticConfig } from './game/diagnostics'
@@ -33,6 +36,8 @@ import { isEligibleSpeechSeat } from './game/speech-eligibility'
 import { removeArrayIndicesInPlace } from './game/sparse-array'
 import { SpeechPhaseCoordinator } from './game/speech-phase'
 import { SpeechHistory } from './game/speech-history'
+import { DeerRevisionCoordinator, type DeerSpeechReview } from './game/deer-revision'
+import { HostSupportCoordinator } from './game/host-support'
 import { PublicHeroRevealState } from './game/hero-reveal'
 import { projectPublicGameState, PublicGameTimelineStore, publicMessageText, type PublicGameEvent, type PublicGameStateQuery } from './game/public-game-state'
 import { installChatLunaGameTools } from './game/chatluna-game-tools'
@@ -41,7 +46,8 @@ import { classifyEliminationVictory } from './game/elimination-outcome'
 import { isStalemateEligible, StalemateTracker } from './game/stalemate'
 import { snapshotEliminationContext, snapshotVoteContext, VoteContext } from './game/resolution-context'
 import type { EliminationContext } from './game/resolution-context'
-import { rebuildVoteState } from './game/vote-ballots'
+import { rebuildVoteState, type BallotEffect } from './game/vote-ballots'
+import { captureVoteFacts, type VoteFact } from './game/vote-facts'
 import { retainBallotsAfterRosterChange } from './game/vote-roster'
 import type { VoteRosterSnapshot } from './game/vote-roster'
 import { calculateVoteLeaders } from './game/vote-leaders'
@@ -74,9 +80,14 @@ import { shiKeFaModule } from './heroes/shi-ke-fa'
 import { wuSanGuiModule } from './heroes/wu-san-gui'
 import { zhangXianZhongModule } from './heroes/zhang-xian-zhong'
 import { yuanChongHuanModule } from './heroes/yuan-chong-huan'
+import { normalizeHeroCommand, parseHeroNumber } from './game/hero-command'
 import { zhuYouJianModule } from './heroes/zhu-you-jian'
+import { weiZhongXianModule } from './heroes/wei-zhong-xian'
+import { claimWeiZhongXianReward, hasWeiZhongXianReward, type WeiZhongXianRewardSource } from './game/wei-zhong-xian-state'
+import { resetNativeHeroState } from './game/hero-reset'
+import { ZhuYouXiaoHeirOption, classifyDelegationInput, classifyHeirChoiceInput, classifyHeirTargetInput, classifyProxyVoteInput, zhuYouXiaoHeirOptions } from './heroes/zhu-you-xiao'
 import { HeroCardService, HeroCardValidationError, registerHeroCardModel } from './game/hero-card-service'
-import { safeErrorSummary } from './game/errors'
+import { GameUserError, safeErrorSummary } from './game/errors'
 import {
   HeroCardInteractionCoordinator,
   findHeroId,
@@ -97,6 +108,7 @@ declare module "koishi" {
       resolveNickname?(platform: string, userId: string, fallback?: string): string | undefined
       getManagedIdentity?(platform: string, userId: string): Promise<{ profileId: number, accountId: string, nickname: string } | null>
       resolveCanonicalProfileId?(profileId: number): Promise<number>
+      getPeriodWindow?(systemKey: string, options: { kind: 'day' | 'week' | 'month' | 'year' | 'season'; offset?: number }): Promise<{ start: number; end: number } | undefined>
       registerAccountConsumer?(name: string): {
         acquire(targets: readonly { platform: string, userId: string }[]): Promise<{
           accounts: Array<{ accountId: string, profileId: number, nickname: string }>, release(): void
@@ -160,15 +172,17 @@ function isEmpty(a) {
 
 export const name = "undercover-game"
 
-export const inject = { required: ["database"], optional: ["xpPoints"] }
+export const inject = { required: ["database"], optional: ["xpPoints", "puppeteer"] }
 
 export interface Config {
   debug?: DiagnosticConfig
   aiTools?: { enabled: boolean }
+  reportImages?: { enabled: boolean; timeout: number }
   history?: {
     enabled: boolean
     sandbox: boolean
     retentionDays: number
+    winrateMinimumGames?: number
     mediaRetention?: 'next-game' | 'permanent' | 'days'
     mediaRetentionDays?: number
   }
@@ -182,6 +196,7 @@ export interface Config {
   enabledSpecialModes: Array<'deer' | 'turtle'>
   allowLateJoinByDefault: boolean
   realtimeVoteNoticeDefault: boolean
+  realtimeSkillNoticeDefault?: boolean
   notifications: {
     voteStartPrivate: boolean
     voteFirstSuccessReceipt: boolean
@@ -189,6 +204,7 @@ export interface Config {
     voteHurryGroup: boolean
     turtleAnswerPrivate: boolean
     turtleHostHalfReminder: boolean
+    whiteGuessHost?: boolean
   }
   gatherTimeout: number
   setupTimeout: number
@@ -204,6 +220,15 @@ export interface Config {
   boomAdjudicationTimeout: number
   deerSelectionTimeout: number
   deerHostReviewTimeout: number
+  deerReselectionDeadline: 'first-round' | 'discussion' | 'game-end'
+  deerPreviousSpeechPolicy: 'review' | 'keep' | 'invalidate'
+  deerMakeupTimeout: number
+  deerSpeechReviewDefault: 'approve' | 'reject'
+  deerHostTimeoutAction: 'auto' | 'abort' | 'recruit'
+  boomHostTimeoutAction: 'auto' | 'abort' | 'recruit'
+  turtleHostTimeoutAction: 'abort' | 'recruit'
+  deerSpeechReviewTimeoutAction: 'auto' | 'abort' | 'recruit'
+  hostRecruitmentTimeout: number
   deerProgressDelay: number
   turtleAnswerTimeout: number
   heroCardMaxBytes: number
@@ -249,19 +274,46 @@ export const Config: Schema<Config> = Schema.intersect([
     hurryTimeout: Schema.natural().default(120).description("投票开始后自动催票的等待时间（秒）。"),
     skillTimeout: Schema.natural().default(120).description("等待武将发动技能的时限（秒）。"),
     replacementTimeout: Schema.natural().min(10).default(180).description("补位申请每个步骤的时限（秒）；等待武将技能时暂停。"),
-    boomAdjudicationTimeout: Schema.natural().min(10).default(300).description("主持人判定疑似自爆的时限（秒）；超时终止且不计分。"),
+    boomAdjudicationTimeout: Schema.natural().min(10).default(300).description("主持人判定疑似自爆的时限（秒）。"),
     deerSelectionTimeout: Schema.natural().min(30).default(900).description("鹿模式每名玩家的独立选词时限（秒）；超时踢出该座位。"),
     deerHostReviewTimeout: Schema.natural().min(30).default(300).description("鹿模式有待审核选词时的主持人空闲时限（秒）；有效审核后重新计时。"),
     deerProgressDelay: Schema.natural().default(300).description("鹿模式首轮开放后，公开查询或自动催促选词进度的等待时间（秒）。"),
-    turtleAnswerTimeout: Schema.natural().min(10).default(300).description("龟模式每个问题的主持人回答时限（秒）；过半提醒，超时终止且不计分。"),
+    turtleAnswerTimeout: Schema.natural().min(10).default(300).description("龟模式每个问题的主持人回答时限（秒）；可开启过半提醒。"),
   }).description("发言、投票与技能时限"),
   Schema.object({
+    deerReselectionDeadline: Schema.union([
+      Schema.const('first-round').description('第一轮结束前'),
+      Schema.const('discussion').description('解锁盘发言、带票前'),
+      Schema.const('game-end').description('游戏结束前'),
+    ]).default('first-round').description('已批准选词的重选申请截止节点；已提交的申请仍会继续审核。'),
+    deerPreviousSpeechPolicy: Schema.union([
+      Schema.const('review').description('主持人整批复核'), Schema.const('keep').description('保留前序发言'),
+      Schema.const('invalidate').description('前序发言失效并补发言'),
+    ]).default('review').description('新选词批准后，如何处理该玩家之前的发言。'),
+    deerMakeupTimeout: Schema.natural().default(120).description('鹿模式补发言时限（秒），0为不限时；不早于当前或下个发言阶段的超时时刻。'),
+    deerSpeechReviewDefault: Schema.union([Schema.const('reject').description('不通过'), Schema.const('approve').description('通过')])
+      .default('reject').description('鹿模式前序发言复核超时的裁定结果。'),
+  }).description('鹿模式重选与补发言'),
+  Schema.object({
+    deerHostTimeoutAction: Schema.union([Schema.const('auto').description('通过待审选词'), Schema.const('recruit').description('招募协同主持'), Schema.const('abort').description('终止本局')])
+      .default('auto').description('鹿模式选词审核超时的处理方式；招募失败后通过选词。'),
+    boomHostTimeoutAction: Schema.union([Schema.const('auto').description('判定自爆失败'), Schema.const('recruit').description('招募协同主持'), Schema.const('abort').description('终止本局')])
+      .default('auto').description('未匹配词条的自爆判定超时的处理方式；招募失败后判定自爆失败。'),
+    turtleHostTimeoutAction: Schema.union([Schema.const('abort').description('终止本局'), Schema.const('recruit').description('招募协同主持')])
+      .default('abort').description('龟模式回答超时的处理方式；招募失败后终止本局。'),
+    deerSpeechReviewTimeoutAction: Schema.union([Schema.const('auto').description('使用复核超时默认结果'), Schema.const('recruit').description('招募协同主持'), Schema.const('abort').description('终止本局')])
+      .default('auto').description('鹿模式前序发言复核超时的处理方式；招募失败后使用复核超时默认结果。'),
+    hostRecruitmentTimeout: Schema.natural().min(30).default(300).description('等待协同主持应答的时限（秒）；原主持在此期间仍可处理待办。'),
+  }).description('主持人超时与协同主持'),
+  Schema.object({
     realtimeVoteNoticeDefault: Schema.boolean().default(false).description("默认向主持人私聊实时票况；主持人可在局内切换。"),
+    realtimeSkillNoticeDefault: Schema.boolean().default(false).description('默认向所有主持人私聊技能选择、变化和结果；与实时票况独立，可在局内切换。'),
     notifications: Schema.object({
       voteStartPrivate: Schema.boolean().default(true).description("投票开始时私聊应投票玩家，合并可投对象和技能提示。"),
       voteFirstSuccessReceipt: Schema.boolean().default(false).description("首次投票成功后私聊确认；改票和非法输入提示保持现状。"),
       voteHurryPrivate: Schema.boolean().default(true).description("自动催票时私聊尚未投票的玩家。"),
       voteHurryGroup: Schema.boolean().default(true).description("自动催票时在群内显示尚未投票的玩家。"),
+      whiteGuessHost: Schema.boolean().default(true).description('白板猜词未匹配时私聊通知主持人，可引用通知认可其加入阵营。'),
       turtleAnswerPrivate: Schema.boolean().default(false).description("龟模式群内回答后，额外私聊玩家确认。"),
       turtleHostHalfReminder: Schema.boolean().default(true).description("龟模式等待回答过半时私聊提醒主持人。"),
     }),
@@ -282,6 +334,7 @@ export const Config: Schema<Config> = Schema.intersect([
       enabled: Schema.boolean().default(true).description("保存完成局及进入第一阶段后被主持人或管理员终止的对局；鹿模式另保留中止局有效选词。"),
       sandbox: Schema.boolean().default(false).description("持久保存沙盒对局。"),
       retentionDays: Schema.natural().default(0).description("对局历史保留天数；0为不限，到期清理本插件历史。"),
+      winrateMinimumGames: Schema.natural().min(1).default(5).description('胜率榜的最低参赛局数；个人胜率查询不设门槛。'),
       mediaRetention: Schema.union([
         Schema.const("next-game").description("保留至同一机器人下一局"),
         Schema.const("permanent").description("永久保留引用"),
@@ -296,6 +349,12 @@ export const Config: Schema<Config> = Schema.intersect([
     heroCardInteractionTimeout: Schema.natural().min(30).default(300).description("武将查询及卡面管理分步交互的时限（秒）。"),
     heroCardDownloadTimeout: Schema.natural().min(1).default(30).description("远程卡面下载全过程的时限（秒）。"),
   }).description("武将卡面"),
+  Schema.object({
+    reportImages: Schema.object({
+      enabled: Schema.boolean().default(true).description('优先将总结、复盘和选词公布渲染为图片；需可选 puppeteer 服务，缺少服务或失败时发送完整文字。'),
+      timeout: Schema.natural().min(1).default(15).description('单次图片渲染总时限（秒）；长内容自动拆为多张。'),
+    }),
+  }).description('总结与选词图片'),
   Schema.object({
     aiTools: Schema.object({
       enabled: Schema.boolean().default(false).description("向 ChatLuna 提供按需规则查询和当前群公开状态工具。由 AI 在需要时调用；接入说明见 ChatLuna 协作指南。"),
@@ -339,6 +398,7 @@ export function apply(ctx: Context, config: Config) {
     voteHurryGroup: true,
     turtleAnswerPrivate: false,
     turtleHostHalfReminder: true,
+    whiteGuessHost: true,
     ...config.notifications,
   }
   const enabledSpecialModes = new Set(config.enabledSpecialModes ?? ['deer', 'turtle'])
@@ -362,6 +422,9 @@ export function apply(ctx: Context, config: Config) {
   const historyQueries = new HistoryQueries(ctx.database, historyPerson, historyCanonical)
   const deerHistory = new DeerHistoryControls(ctx.database, historyPerson, historyCanonical)
   const pendingHistoryWrites = new Set<Promise<unknown>>()
+  const reportImages = new ReportImages(() => ctx.get('puppeteer') as ReportBrowser | undefined,
+    { enabled: config.reportImages?.enabled ?? true, timeoutMs: Math.max(1, config.reportImages?.timeout ?? 15) * 1000 },
+    error => ctx.logger.warn('图片输出未完成，使用文字回退：%s', safeErrorSummary(error)))
   registerHistoryCommands(ctx, historyQueries, deerHistory, historyStore, async () => { await Promise.allSettled([...pendingHistoryWrites]) },
     async (session, op) => {
       if (historyOptions.enabled && (!session.platform.startsWith('sandbox') || historyOptions.sandbox)) return
@@ -381,7 +444,15 @@ export function apply(ctx: Context, config: Config) {
     }, async () => {
       const result = await historyPersistence.retry()
       if (result.failed) throw new Error('历史数据库清理已完成，但部分本地待重试文件未清理，请检查日志。')
-    })
+    }, reportImages)
+  registerWinrateCommands(ctx, historyQueries, {
+    minimumGames: Math.max(1, config.history?.winrateMinimumGames ?? 5),
+    flush: async () => { await Promise.allSettled([...pendingHistoryWrites]) },
+    period: async (_session, selection) => {
+      if (!ctx.xpPoints?.getPeriodWindow) throw new GameUserError('周期胜率需要 xp-points 的周期功能；仍可查询累计胜率。')
+      return ctx.xpPoints.getPeriodWindow(config.scoreSystemKey, selection)
+    },
+  })
   const maintainHistory = async () => {
     await historyStore.prune()
     await historyStore.pruneExpiredMedia()
@@ -504,10 +575,15 @@ export function apply(ctx: Context, config: Config) {
     try { operation(historyRecorder) }
     catch (error) { historyCaptureFailed = true; ctx.logger.error('历史采集失败，游戏继续但不报告存档成功：%s', safeErrorSummary(error)) }
   }
-  const recordSkill = (heroId: number, effect: string, targetSeats: number[] = []) => {
-    const seat = heros?.[heroId]
-    if (seat > 0) capture(r => r.event(seat, { kind: 'skill', heroId, effect, targetSeats }))
+  const recordActorSkill = (seat: number, heroId: number, effect: string, targetSeats: number[] = [],
+    details?: Extract<import('./game/history-snapshot').HistoryPhase['events'][number], { kind: 'skill' }>['details']) => {
+    if (!(seat > 0)) return
+    capture(r => r.event(seat, { kind: 'skill', heroId, effect, targetSeats, ...(details ? { details } : {}) }))
+    queueHostSkillNotice(seat, effect, targetSeats)
   }
+  const recordSkill = (heroId: number, effect: string, targetSeats: number[] = [],
+    details?: Extract<import('./game/history-snapshot').HistoryPhase['events'][number], { kind: 'skill' }>['details']) =>
+    recordActorSkill(heros?.[heroId], heroId, effect, targetSeats, details)
   const historyCamp = (seat: number): HistoryCamp => flag_white && seat === white ? 'white' : uc.includes(seat) ? 'undercover' : 'good'
   const historyIdentity = (userId: string, nickname: string) => ({ platform: gameRoute.platform, userId, nickname,
     personId: profileIdByNickname.get(nickname), accountId: identityByUserId.get(userId)?.accountId ?? accountIdByNickname.get(nickname) })
@@ -525,7 +601,7 @@ export function apply(ctx: Context, config: Config) {
     rules.enabledSpecialModes = JSON.stringify(config.enabledSpecialModes ?? [])
     historyRecorder = new HistoryRecorder({ gameId: gameInstanceId, startedAt: gameStartedAt, mode: modeInteraction.mode,
       platform: gameRoute.platform, selfId: gameRoute.bot!.selfId, guildId: gameRoute.guildId,
-      sandbox: gameRoute.platform.startsWith('sandbox'), host: historyIdentity(hostid, hostname), ruleVersion: '0.3.1', rules })
+      sandbox: gameRoute.platform.startsWith('sandbox'), host: historyIdentity(hostid, hostname), ruleVersion: '0.4.0', rules })
     capture(r => {
       r.topics(modeInteraction.mode === 'deer' ? { publicText: instr3, good: item1, undercover: item2 }
         : modeInteraction.mode === 'turtle' ? { publicText: item1, good: item2, undercover: instr1 }
@@ -542,7 +618,8 @@ export function apply(ctx: Context, config: Config) {
   const personKey = (nickname: string): string => profileIdByNickname.has(nickname)
     ? 'person:' + profileIdByNickname.get(nickname) : 'name:' + nickname
   const personAlreadyRecorded = (nickname: string): boolean =>
-    personKey(hostname) === personKey(nickname) || player_copy.some(name => !isEmpty(name) && personKey(name) === personKey(nickname))
+    personKey(hostname) === personKey(nickname) || assistantIdentityKeys.has(personKey(nickname))
+      || player_copy.some(name => !isEmpty(name) && personKey(name) === personKey(nickname))
   const occupyPlayer = async (userId: string, nickname: string, platform: string): Promise<boolean> => {
     const epoch = gameInstanceId
     let identity = identityByUserId.get(userId)
@@ -612,6 +689,7 @@ export function apply(ctx: Context, config: Config) {
   var flag_fati: boolean
   var flag_ask_timeout: boolean
   var flag_notify: boolean
+  let flag_skill_notify = false
   var set_mode: boolean
   var set_flag: boolean[]
   var vote: Array<number>[]
@@ -627,6 +705,12 @@ export function apply(ctx: Context, config: Config) {
   // the replay renderer can retain the old player-facing wording.
   const lockedVoteSeats = new Set<string>()
   let votePhaseSerial = 0
+  let weiInquiryWindow: { epoch: number, serial: number } | null = null
+  let voteFactStage: 'none' | 'open' | 'counting' | 'published' = 'none'
+  let frozenVoteFacts: VoteFact[] = []
+  const anonymousVoteContributions = new Map<number, number>()
+  const isWeiInquiryWindowOpen = () => !game_off && weiInquiryWindow?.epoch === gameTimers.epoch
+    && weiInquiryWindow.serial === votePhaseSerial && order.includes(heros[HERO.WEI_ZHONG_XIAN])
   const votePhaseKey = (seat: number): string => `${votePhaseSerial}:${seat}`
   var unvote: number
   var score_enabled: boolean
@@ -666,7 +750,8 @@ export function apply(ctx: Context, config: Config) {
     userId: string,
     content: h.Fragment,
     label: string,
-  ): Promise<boolean> => messages.state(label, () => session.bot.sendPrivateMessage(userId, content))
+  ): Promise<boolean> => Promise.all((userId === hostid ? gameHostIds() : [userId])
+    .map(target => messages.state(label, () => session.bot.sendPrivateMessage(target, content)))).then(results => results.some(Boolean))
   const notifyGroup = (
     session: Session,
     content: h.Fragment,
@@ -681,7 +766,9 @@ export function apply(ctx: Context, config: Config) {
     userId: string,
     content: h.Fragment,
     label: string,
-  ): void => messages.bestEffort(label, () => session.bot.sendPrivateMessage(userId, content))
+  ): void => {
+    for (const target of userId === hostid ? gameHostIds() : [userId]) messages.bestEffort(label, () => session.bot.sendPrivateMessage(target, content))
+  }
   const notifySession = (
     session: Session,
     content: h.Fragment,
@@ -700,7 +787,54 @@ export function apply(ctx: Context, config: Config) {
     if (!game_off && guildId === gameRoute.guildId) recordPublicEvent(content)
     messages.bestEffort(label, () => bot.sendMessage(guildId, content))
   }
+  const notifyBotPrivate = (
+    bot: Session["bot"] | undefined,
+    userId: string,
+    content: h.Fragment,
+    label: string,
+  ): void => {
+    if (!bot || !userId) return
+    messages.bestEffort(label, () => bot.sendPrivateMessage(userId, content))
+  }
+  const skillNoticeBatches = new Map<string, { bot: Session['bot'], userId: string, lines: string[] }>()
+  let skillNoticeFlush: ReturnType<typeof setImmediate> | undefined
+  const queueHostSkillNotice = (seat: number, effect: string, targets: readonly number[]) => {
+    const bot = gameRoute.bot
+    if (!flag_skill_notify || game_off || !bot) return
+    const targetText = targets.length ? '（' + targets.map(target => `${target}号玩家${player_copy[target - 1] ?? ''}`).join('、') + '）' : ''
+    const heroName = HEROES[heros.indexOf(seat)]?.name
+    const line = `${seat}号玩家${player_copy[seat - 1] ?? ''}${heroName ? `（${heroName}）` : ''}：${effect}${targetText}`
+    for (const userId of gameHostIds()) {
+      const key = gameInstanceId + ':' + userId
+      const batch = skillNoticeBatches.get(key) ?? { bot, userId, lines: [] }
+      batch.lines.push(line)
+      skillNoticeBatches.set(key, batch)
+    }
+    if (skillNoticeFlush) return
+    skillNoticeFlush = setImmediate(() => {
+      skillNoticeFlush = undefined
+      const batches = [...skillNoticeBatches.values()]
+      skillNoticeBatches.clear()
+      for (const batch of batches) notifyBotPrivate(batch.bot, batch.userId,
+        '技能动态：\n' + batch.lines.join('\n'), '主持实时技能通知')
+    })
+  }
   const modeInteraction = new ModeInteractionCoordinator()
+  const hostSupport = new HostSupportCoordinator()
+  const hostParticipantKeys = new Set<string>()
+  const assistantIdentityKeys = new Set<string>()
+  const isGameHost = (userId: string) => userId === hostid || hostSupport.isAssistant(userId)
+  const gameHostIds = () => [hostid, ...hostSupport.assistantIds()].filter(Boolean)
+  let hostRecruitmentTimer: ReturnType<typeof setTimeout> | undefined
+  let boomAdjudicationClaimed = false
+  let boomAttemptText = ''
+  const turtleAnswerOwners = new WeakMap<object, string>()
+  const deerRevisions = new DeerRevisionCoordinator()
+  const deerMakeupTimers = new Map<number, ReturnType<typeof setTimeout>>()
+  const deerReviewTimers = new Map<number, ReturnType<typeof setTimeout>>()
+  const deerResetNeedsMakeup = new Set<number>()
+  let deerSpeechPhaseSerial = 0
+  let deerPhaseDeadline = 0
   var uc_num: number
   var sumup: string
   var waiver: number
@@ -778,7 +912,7 @@ export function apply(ctx: Context, config: Config) {
   const deerHandledProgressMessageIds = new Set<string>()
   var deerSelectionExpiryRunning = false
   var deerSpeechExpiryRunning = false
-  var kickActivePlayer: (session: Session, seat: number, cause: "host" | "selection-timeout" | "self") => Promise<"removed" | "blocked" | "missing">
+  var kickActivePlayer: (session: Session, seat: number, cause: "host" | "selection-timeout" | "makeup-timeout" | "self") => Promise<"removed" | "blocked" | "missing">
   interface DeerRevealRow {
     seat: number
     userId: string
@@ -798,6 +932,13 @@ export function apply(ctx: Context, config: Config) {
   }
   var lastDeerReveal: DeerRevealSnapshot | undefined
   const pendingAction = new PendingActionCoordinator()
+  interface WhiteGuessRequest { id: number; epoch: number; seat: number; userId: string; text: string; references: Set<string> }
+  const whiteGuessRequests = new Map<number, WhiteGuessRequest>()
+  let whiteGuessSequence = 0
+  let whiteGuessNotifications = notifications.whiteGuessHost
+  const zhuYouXiaoVotes = createZhuYouXiaoState()
+  let zhuYouXiaoHeirTargetSeat: number | null = null
+  let zhuYouXiaoHeirOwnerSeat: number | null = null
   interface RecoverablePendingPrompt {
     kind: import('./game/pending-action').PendingActionKind
     userId: string
@@ -821,7 +962,9 @@ export function apply(ctx: Context, config: Config) {
     rememberPendingPrompt(recorded)
     void messages.state(
       `${prompt.kind}私聊提示`,
-      () => session.bot.sendPrivateMessage(prompt.userId, prompt.content),
+      () => session.bot.sendPrivateMessage(prompt.userId, recorded.content
+        + (prompt.kind !== 'zhu-you-xiao-proxy-vote' && unfinishedVoteFor(prompt.userId)
+          ? '\n' + skillFirstNotice(prompt.userId) : '')),
     ).then(delivered => {
       if (delivered || game_off || recorded.gameEpoch !== gameTimers.epoch) return
       const stillActive = pendingAction.activeActions.some(action =>
@@ -836,6 +979,59 @@ export function apply(ctx: Context, config: Config) {
   const actionSeatLabel = (kind: import('./game/pending-action').PendingActionKind): string => {
     const action = pendingAction.activeActions.find(item => item.kind === kind)
     return action?.ownerSeat ? `${action.ownerSeat}号玩家` : '当前玩家'
+  }
+  const pendingActionNames: Record<PendingActionKind, string> = {
+    'mao-wen-long-late-vote': '塘报投票',
+    'huang-tai-ji-quan': '使用权',
+    'wu-san-gui-overtime-choice': '权计选择',
+    'zhang-xian-zhong-target': '殒阵选人',
+    'shi-ke-fa-gift': '落梅选人',
+    'zhu-you-xiao-heir-target': '传弟选人',
+    'zhu-you-xiao-heir-choice': '传弟选项',
+    'zhu-you-xiao-proxy-vote': '代理投票',
+    'host-adjudication': '主持判定',
+  }
+  const pendingSkillsFor = (userId: string): readonly PendingAction[] => pendingAction.activeActions
+    .filter(action => action.gameEpoch === gameTimers.epoch && action.ownerUserId === userId
+      && action.kind !== 'zhu-you-xiao-proxy-vote' && action.kind !== 'host-adjudication')
+    .sort((a, b) => Number(b.blocksRosterChanges) - Number(a.blocksRosterChanges))
+  const skillFirstNotice = (userId: string): string => {
+    const actions = pendingSkillsFor(userId)
+    if (!actions.length) return ''
+    const first = actions[0]
+    if (vote_off) return `你仍可在原期限内完成“${pendingActionNames[first.kind]}”选择；本次投票已结束，不会重开。`
+    return `请先完成“${pendingActionNames[first.kind]}”技能选择，再投票；可发送“我的待处理”查看用法和剩余时间。`
+  }
+  const pendingTimeText = (action: PendingAction): string => {
+    if (action.kind === 'zhu-you-xiao-proxy-vote') return vote_off ? '本次投票已结束' : '须在本次投票结束前完成'
+    const remaining = pendingAction.remainingMs(Date.now(), action.kind)
+    return Number.isFinite(remaining) ? `剩余约${Math.ceil(remaining / 1000)}秒` : '按原规则不限时'
+  }
+  const recoveredActionText = (action: PendingAction): string => {
+    let content = recoverablePendingPrompts.get(action.kind)?.content ?? '请按当前技能提示操作。'
+    if (action.kind === 'zhu-you-xiao-heir-choice') content += '\n也可发送“传弟选+选项序号”；发送“弃传弟”放弃。'
+    if (action.kind === 'zhu-you-xiao-heir-target') content += '\n也可发送“传+玩家序号”；发送“弃传弟”放弃。'
+    if (action.kind === 'zhu-you-xiao-proxy-vote') {
+      const owner = zhuYouXiaoVotes.current?.ownerSeat
+      if (owner != null) content = delegationPrompt(action.ownerSeat, owner)
+      if (owner != null) {
+        const location = zhuYouXiaoBallotLocation(owner, add_flag)
+        const ballot = location?.ballots[location.index]
+        content += '\n当前代理票：' + (isEmpty(ballot) ? '尚未投票' : ballot === 0 ? '已弃票'
+          : ballot! > 0 ? `已投给${ballot}号玩家${player_copy[ballot! - 1]}` : '本次无需继续投票') + '。'
+      }
+    }
+    return `【${pendingActionNames[action.kind]}】${pendingTimeText(action)}；请在${action.channel.scope === 'private' ? '私聊' : '原群'}操作。\n${content}`
+  }
+  const unfinishedVoteFor = (userId: string): boolean => {
+    if (vote_off) return false
+    const ids = add_flag ? add_voter : player
+    const ballots = add_flag ? add_vote[round - 1] : vote[round - 1]
+    return ids.some((id, index) => {
+      const seat = order[player.indexOf(id)]
+      return seat !== heros[HERO.MAO_WEN_LONG] && vote_num[seat - 1] !== 0
+        && isEmpty(ballots?.[index]) && zhuYouXiaoVoteReporter(seat, add_flag).userId === userId
+    })
   }
   const replacementRequest = new ReplacementRequestCoordinator()
   const gameTimers = new GameTimerManager({
@@ -910,20 +1106,221 @@ export function apply(ctx: Context, config: Config) {
       await finishTopicSetup(session)
     }, 60_000)
   }
+  const resolveBoomAdjudication = async (session: Session, str_ann: string) => {
+    if (game_off || !boom_pending || boomAdjudicationClaimed) return
+    if (str_ann !== "是" && str_ann !== "否") return "不识别的语句，请主持人发送“是”或“否”。"
+    boomAdjudicationClaimed = true
+  if (str_ann === "是") {
+    gameTimers.cancel(timer_boom)
+    switch (boom_state) {
+      case 1:
+        sumup += "卧底自爆成功，游戏结束，卧底胜利"
+        recordExplosionOutcome('undercover-win', true)
+        notifySession(session, "卧底自爆成功，游戏结束，卧底胜利")
+        increment = config.scoreUndercoverWin
+        for (let i = 0; i < player_copy.length; i++) {
+          if (uc_copy.indexOf(i + 1) !== -1 && !isEmpty(player_copy[i])) {
+            await addScore(player_copy[i], increment, 'confirmed-undercover-boom-win')
+            ptsstr += player_copy[i] + "，"
+          }
+        }
+        ptsstr = ptsstr.slice(0, -1)
+        ptsstr += "加" + increment + "分。"
+        await addScore(boomname, config.scoreUndercoverBoomBonus, 'confirmed-undercover-boom-bonus')
+        ptsstr += boomname + "自爆获胜，额外加" + config.scoreUndercoverBoomBonus + "分。"
+        await sendScoreSummary(session, 'undercover')
+        break
+      case 2:
+        sumup += "白板自爆成功，游戏结束，白板胜利"
+        recordExplosionOutcome('white-win', true)
+        notifySession(session, "白板自爆成功，游戏结束，白板胜利")
+        increment = config.scoreWhiteBoomWin
+        await addScore(boomname, increment, 'confirmed-white-boom-win-two')
+        ptsstr += boomname + "加" + increment + "分。"
+        await sendScoreSummary(session, 'white')
+        break
+      case 3:
+        sumup += "白板自爆成功，游戏结束，白板胜利"
+        recordExplosionOutcome('white-win', true)
+        notifySession(session, "白板自爆成功，游戏结束，白板胜利")
+        increment = config.scoreWhiteBoomWin
+        await addScore(boomname, increment, 'confirmed-white-boom-win-three')
+        ptsstr += boomname + "加" + increment + "分。"
+        await sendScoreSummary(session, 'white')
+        break
+      default:
+        notifySession(session, "出现未知bug，游戏已结束。")
+    }
+  }
+  else if (str_ann === "否") {
+    gameTimers.cancel(timer_boom)
+    switch (boom_state) {
+      case 1:
+        sumup += "卧底自爆失败，游戏结束，好人胜利。"
+        recordExplosionOutcome('good-win', true)
+        notifySession(session, "卧底自爆失败，游戏结束，好人胜利。")
+        increment = config.scoreGoodWin
+        for (let i = 0; i < player_copy.length; i++) {
+          if (uc_copy.indexOf(i + 1) === -1 && i + 1 !== white_copy && !isEmpty(player_copy[i])) {
+            await addScore(player_copy[i], increment, 'boom-resolution-good-win')
+            ptsstr += player_copy[i] + "，"
+          }
+        }
+        ptsstr = ptsstr.slice(0, -1)
+        ptsstr += "加" + increment + "分。"
+        await sendScoreSummary(session, 'good')
+        break
+      case 2:
+        let w = order.indexOf(white)
+        recordExplosionOutcome('white-departure', true)
+        const whiteEliminationText = publicHeroEliminationText(
+          white,
+          "白板自爆失败，场上仍有卧底在场，白板" + white + "号玩家" + player_name[w],
+          "出局，游戏继续。",
+        )
+        sumup += whiteEliminationText
+        notifySession(session, whiteEliminationText)
+        flag_white = false
+        boom_pending = false
+        capture(r => r.leave(white, 'skill', Date.now()))
+        player.splice(w, 1)
+        player_name.splice(w, 1)
+        order.splice(w, 1)
+        stalemate.reset()
+        if (order.indexOf(heros[HERO.WU_SAN_GUI]) !== -1) {
+          wuSanGuiModule.removeAttacker(heroState, white)
+        }
+        white = 0
+        if (add_flag) {
+          gameTimers.cancel(timer_htj)
+          gameTimers.cancel(timer_zxz)
+          gameTimers.cancel(timer_mwl)
+          gameTimers.cancel(timer_wsg)
+          gameTimers.cancel(timer_hurry)
+          gameTimers.cancel(timer_vote)
+          flag_just_vote = false
+          gameTimers.cancel(timer_ann)
+          round += 1
+          add_flag = false
+          if (!await new_round(session)) return
+          ann = Array(player.length)
+          vote.push(Array(player.length))
+          poll = Array(player.length).fill(0)
+          shield = Array(player_copy.length).fill(false)
+          annstr = "本轮发言结果：\n"
+          vstr = "本轮投票结果：\n"
+          notifyGroup(session, "结束加时，不再另外出人，游戏继续，开始第" + round + "轮发言。", "自爆判定结束加时通知")
+          return
+          // if (add_indices.indexOf(w) !== -1) {
+
+          // }
+          // else {
+          //   add_voter.splice(add_voter.indexOf(player[w]), 1)
+          //   for (let i = 0; i < add_indices.length; i++) {
+          //     if (w < add_indices[i]) add_indices[i] -= 1
+          //   }
+          //   add_vote[round - 1] = Array(add_voter.length)
+          // }
+        }
+        else {
+          ann.splice(w, 1)
+          end_ann(session)
+          if (!ann_off && (timeout_mode === 1 || timeout_mode === 3 || (timeout_mode === 2 && round > 1))) {
+            const t = annTimeoutMs(timeout_mode)
+            const phase = speechPhases.current()
+            timer_ann = setGameTimeout(() => {
+              if (!speechPhases.matches(phase)) return
+              return timeout_ann_auto(session)
+            }, t)
+            notifyGroup(session, "自爆判定结束，发言阶段恢复；本阶段重新限时" + t / 60000 + "分钟。", "自爆判定后发言恢复通知")
+          }
+        }
+        return
+      case 3:
+        sumup += "白板自爆失败，场上已无卧底在场，游戏结束，好人胜利。"
+        recordExplosionOutcome('good-win', true)
+        notifySession(session, "白板自爆失败，场上已无卧底在场，游戏结束，好人胜利。")
+        increment = config.scoreGoodWin
+        for (let i = 0; i < player_copy.length; i++) {
+          if (uc_copy.indexOf(i + 1) === -1 && i + 1 !== white_copy && !isEmpty(player_copy[i])) {
+            await addScore(player_copy[i], increment, 'boom-resolution-good-win-alternate')
+            ptsstr += player_copy[i] + "，"
+          }
+        }
+        ptsstr = ptsstr.slice(0, -1)
+        ptsstr += "加" + increment + "分。"
+        await sendScoreSummary(session, 'good', true)
+        break
+      default:
+        notifySession(session, "出现未知bug，游戏已结束。")
+    }
+  }
+  else {
+    return ("不识别的语句，请主持人发送“是”或“否”。")
+  }
+  end_game(boom_state >= 1 && boom_state <= 3 ? { kind: 'completed', reason: 'self-explosion', winner: str_ann === '否' ? 'good' : boom_state === 1 ? 'undercover' : 'white' } : { kind: 'aborted', reason: 'system-error' })
+  return
+  }
   const beginBoomAdjudication = (session: Session, state: number) => {
+    boomAdjudicationClaimed = false
+    boomAttemptText = session.content
     boom_pending = true
     boom_state = state
     gameTimers.cancel(timer_ann)
     gameTimers.cancel(timer_boom)
     const delay = Math.max(10, Number(config.boomAdjudicationTimeout ?? 300) || 300) * 1000
-    timer_boom = setGameTimeout(() => {
+    const boomKey = 'boom:' + gameTimers.epoch + ':' + boomSeat + ':' + round
+    const arm = () => { timer_boom = setGameTimeout(async () => {
       if (!boom_pending) return
-      sumup += "主持人未在限时内完成自爆判定，本局自动终止且不计分。\n"
-      const bot = session.bot
-      const guildId = gameRoute.guildId
-      end_game({ kind: 'aborted', reason: 'host-timeout' })
-      notifyBotGroup(bot, guildId, "主持人未在限时内完成自爆判定，本局已自动终止且不计分。", "自爆判定超时通知")
-    }, delay)
+      await handleHostTimeout(session, 'boom', boomKey, () => boom_pending && !boomAdjudicationClaimed, arm,
+        async () => { if (boom_pending) { notifyGroup(session, '主持人判定超时，本次自爆按失败结算。', '自爆超时默认裁定'); await resolveBoomAdjudication(session, '否') } })
+    }, delay) }
+    arm()
+  }
+  const abortHostTimeout = (session: Session, detail = '主持人处理超时') => {
+    const bot = session.bot, guild = gameRoute.guildId
+    sumup += detail + '，本局自动终止且不计分。\n'
+    end_game({ kind: 'aborted', reason: 'host-timeout' })
+    notifyBotGroup(bot, guild, detail + '，本局已自动终止且不计分。', '主持人超时终止通知')
+  }
+  const handleHostTimeout = async (session: Session, kind: 'deer' | 'boom' | 'turtle' | 'speech-review', key: string,
+    pending: () => boolean, resume: () => void, fallback: () => void | Promise<void>) => {
+    if (game_off || !pending()) return
+    const action = kind === 'deer' ? config.deerHostTimeoutAction ?? 'auto'
+      : kind === 'boom' ? config.boomHostTimeoutAction ?? 'auto'
+        : kind === 'turtle' ? config.turtleHostTimeoutAction ?? 'abort' : config.deerSpeechReviewTimeoutAction ?? 'auto'
+    if (action === 'abort') return kind === 'turtle' ? fallback() : abortHostTimeout(session, kind === 'deer' ? '主持人长时间未处理待审核选人'
+      : kind === 'boom' ? '主持人自爆判定超时' : '主持人前序发言复核超时')
+    if (action === 'auto') return fallback()
+    const result = hostSupport.request({ key, pending, resume, fallback })
+    if (result.kind === 'fallback') return fallback()
+    if (result.kind === 'joined') return
+    const window = result.window, epoch = gameTimers.epoch
+    gameTimers.cancel(hostRecruitmentTimer)
+    hostRecruitmentTimer = setGameTimeout(async () => {
+      for (const request of hostSupport.expire(window)) {
+        if (game_off) break
+        if (request.pending()) await request.fallback()
+      }
+    }, Math.max(30, config.hostRecruitmentTimeout ?? 300) * 1000)
+    let callable: string[] = []
+    try { callable = await subscriptions.getCallableUserIds(session.bot, session.platform, gameRoute.guildId) }
+    catch (error) { ctx.logger.warn('协同主持招募成员检查未完成：%s', safeErrorSummary(error)) }
+    if (game_off || gameTimers.epoch !== epoch || hostSupport.activeWindow !== window || !hostSupport.activeRequests().length) return
+    const mentions = callable.filter(id => !isGameHost(id) && !hostSupport.isParticipant(id)).map(id => h('at', { id }))
+    notifyGroup(session, h('template', {}, ...mentions, h.text('本局需要一名协同主持，未曾参加本局的群友可回复“1”接任。原主持仍可处理待办；'
+      + Math.max(30, config.hostRecruitmentTimeout ?? 300) / 60 + '分钟无人接任则采用超时默认处理。')), '协同主持招募')
+  }
+  const hostBrief = () => {
+    const state = modeInteraction.state
+    const rows = player_copy.map((name, index) => name ? `${index + 1}号${name}｜${factionOfSeat(index + 1) === 'undercover' ? '卧底' : factionOfSeat(index + 1) === 'white' ? '白板' : '好人'}｜${heros.includes(index + 1) ? hero_name[heros.indexOf(index + 1)] : '无武将'}｜${order.includes(index + 1) ? '在场' : '已离场'}` : '').filter(Boolean)
+    const details = state.kind === 'deer' ? ['易混：' + state.commonTerm, ...[...state.selections.values()].map(s => `${s.seat}号已批选词：${s.approvedCandidate ?? '未批准'}${s.status === 'pending-host' ? '；待审：' + s.candidate : ''}`),
+      ...modeInteraction.deerProgress().pendingHost.map(deerHostReviewPrompt).filter(Boolean), ...deerRevisions.pendingReviews().map(deerSpeechReviewPrompt)]
+      : state.kind === 'turtle' ? ['汤面：' + state.surface, ...modeInteraction.turtleProgress().pendingHost.map(turtleHostAnswerPrompt).filter(Boolean)] : ['好人雷点：' + instr1, '卧底雷点：' + instr2, '白板提示：' + instr3]
+    const goodTerm = state.kind === 'turtle' ? state.goodTerm : state.kind === 'deer' ? state.goodRule : item1_copy
+    const undercoverTerm = state.kind === 'turtle' ? state.undercoverTerm : state.kind === 'deer' ? state.undercoverRule : item2_copy
+    return ['本局协同主持资料；原主持仍然有效。', '模式：' + modeInteraction.module.label + '；第' + round + '轮。', '好人词条/规则：' + goodTerm, '卧底词条/规则：' + undercoverTerm,
+      ...rows, ...details, ...(boom_pending ? ['待判定自爆：' + boomAttemptText + '；请在群内回复“是”或“否”。'] : []), '可发送“待处理操作”补取待办。'].join('\n')
   }
   const timeout = config.skillTimeout * 1000
   var timeout_for_vote = config.voteTimeout * 1000
@@ -937,6 +1334,9 @@ export function apply(ctx: Context, config: Config) {
     }
   }
   const beginSpeechPhase = (eligibleSeats: readonly number[]) => {
+    // A published vote can still be resolving an elimination skill.  It only
+    // becomes a past phase when the next speech phase actually starts.
+    heroState.weiZhongXian.phaseSerial = null
     speechBackfillSeats.clear()
     speechBackfillUsers.clear()
     zhangSpeechHold = undefined
@@ -1031,6 +1431,9 @@ export function apply(ctx: Context, config: Config) {
     flag_fati = false
     flag_ask_timeout = false
     flag_notify = config.realtimeVoteNoticeDefault ?? false
+    flag_skill_notify = config.realtimeSkillNoticeDefault ?? false
+    whiteGuessNotifications = notifications.whiteGuessHost
+    whiteGuessRequests.clear()
     set_mode = false
     flag_just_vote = false
     set_flag = Array(6).fill(false)
@@ -1063,6 +1466,10 @@ export function apply(ctx: Context, config: Config) {
     add_voter = []
     lockedVoteSeats.clear()
     votePhaseSerial = 0
+    clearZhuYouXiaoPhase(zhuYouXiaoVotes)
+    zhuYouXiaoVotes.records = []
+    zhuYouXiaoHeirTargetSeat = null
+    zhuYouXiaoHeirOwnerSeat = null
   }
   const randomizeHeroesForRoster = () => {
     heros = []
@@ -1078,6 +1485,7 @@ export function apply(ctx: Context, config: Config) {
     seat,
     userId: player[index],
     nickname: player_name[index],
+    identityKey: profileIdByNickname.has(player_name[index]) ? 'person:' + profileIdByNickname.get(player_name[index]) : 'user:' + player[index],
   }))
   const sendHeroAssignment = async (session: Session, userId: string, seat: number) => {
     const heroIndex = heros.indexOf(seat)
@@ -1131,7 +1539,7 @@ export function apply(ctx: Context, config: Config) {
     return formatModeRoundCapabilities(modeInteraction.mode, prefix)
   }
   const hostPrimaryContentPrompt = () => {
-    if (modeInteraction.mode === "deer") return "请输入鹿模式好人阵营的选人/选词规则："
+    if (modeInteraction.mode === "deer") return "请输入鹿模式易混（不能作为玩家选词，将公开到群聊并私聊给所有玩家）："
     if (modeInteraction.mode === "turtle") return "请输入龟模式汤面："
     return "请输入好人词条(不用写雷点，稍后会问；时代等注意事项可以在人物名后使用任意标点符号分隔标注，请不要在词条名中夹杂除·与书名号以外的任何标点符号)："
   }
@@ -1144,8 +1552,8 @@ export function apply(ctx: Context, config: Config) {
       if (step === "undercover") return "请输入龟模式卧底阵营的实际词条；该内容只用于主持回答与赛后总结，不会发给玩家："
     }
     if (modeInteraction.mode === "deer") {
-      if (step === "good-detail") return "请输入鹿模式卧底阵营的选人/选词规则："
-      if (step === "undercover") return "请输入鹿模式易混（不能作为玩家选词，将公开到群聊并私聊给所有玩家）："
+      if (step === "good-detail") return "请输入鹿模式好人阵营的选人/选词规则："
+      if (step === "undercover") return "请输入鹿模式卧底阵营的选人/选词规则："
     }
     if (step === "good-detail") return "请输入好人词条" + item1 + "雷点："
     if (step === "undercover") return "请输入卧底词条(不用写雷点，稍后会问；时代等注意事项可以在人物名后使用任意标点符号分隔标注，请不要在词条名中夹杂除·与书名号以外的任何标点符号)："
@@ -1159,7 +1567,7 @@ export function apply(ctx: Context, config: Config) {
     const values = modeInteraction.mode === "turtle"
       ? ["汤面：" + (item1 || "（未填写）"), "好人实际词条：" + (item2 || "（未填写）"), "卧底实际词条：" + (instr1 || "（未填写）")]
       : modeInteraction.mode === "deer"
-        ? ["好人规则：" + (item1 || "（未填写）"), "卧底规则：" + (item2 || "（未填写）"), "易混：" + (instr3 || "（未填写）")]
+        ? ["易混：" + (instr3 || "（未填写）"), "好人规则：" + (item1 || "（未填写）"), "卧底规则：" + (item2 || "（未填写）")]
         : ["好人词条：" + (item1 || "（未填写）"), "好人雷点：" + (instr1 || "（未填写）"), "卧底词条：" + (item2 || "（未填写）"), "卧底雷点：" + (instr2 || "（未填写）"), ...(flag_white ? ["白板提示：" + (instr3 || "（未填写）")] : [])]
     return ["当前模式：" + modeLabel, "当前步骤：" + setupPromptText(step), ...values].join("\n")
   }
@@ -1194,15 +1602,15 @@ export function apply(ctx: Context, config: Config) {
     }
     if (modeInteraction.mode === "deer") {
       if (step === "good-detail") {
-        item1 = ""
+        instr3 = ""
         setSetupPromptStep("primary")
       }
       else if (step === "undercover") {
-        item2 = ""
+        item1 = ""
         setSetupPromptStep("good-detail")
       }
       else {
-        instr3 = ""
+        item2 = ""
         setSetupPromptStep("undercover")
       }
       return true
@@ -1263,8 +1671,9 @@ export function apply(ctx: Context, config: Config) {
         return "你是" + seat + "号玩家。\n你是白板。\n鹿模式易混：" + instr3 + "\n你不会收到阵营规则，也不需要选人；发言必须完全符合易混。"
       }
       const rule = uc_copy.includes(seat) || uc.includes(seat) ? undercoverTopic : goodTopic
+      const approved = modeInteraction.deerApprovedCandidate(seat)
       return "你是" + seat + "号玩家。\n鹿模式易混：" + instr3 + "\n你的选人/选词规则：" + rule + "\n"
-        + (replacement
+        + (approved ? '已批准选词：' + approved + '。' : replacement
           ? "你不能继承原玩家的选人，请私聊我重新提交并等待主持人审核。"
           : "请私聊我发送所选词条（可直接发送，或发送“选人 词条”）。不能选择易混本身；主持人审核通过后即可发言。")
     }
@@ -1316,10 +1725,10 @@ export function apply(ctx: Context, config: Config) {
   const persistentSpeechSegments = (segments: HistorySpeechSegment[]) => segments.map(segment =>
     segment.kind !== 'media' ? segment : { ...segment, src: mediaSourceForHistory(segment.src) })
   const speechRecordText = (record: ReturnType<SpeechHistory['bySeat']>[number]) =>
-    record.seat + "号玩家" + record.nickname + "：" + record.text
+    record.seat + "号玩家" + record.nickname + "：" + (record.invalidReason ? '（已失效：' + record.invalidReason + '）' : '') + record.text
   const plainSpeechSegments = (segments: HistorySpeechSegment[]) => segments
     .map(segment => segment.kind === 'text' ? segment.text : segment.kind === 'face' ? '[表情]' : `[${segment.type === 'img' ? '图片' : '媒体'}]`).join('')
-  const recordSpeech = (session: Session, seat: number, text: string, question?: string, answer?: string) => {
+  const recordSpeech = (session: Session, seat: number, text: string, question?: string, answer?: string, targetRound?: number) => {
     // Turtle records the player's question and the host's final answer, not
     // the host reply session alone. Parse the combined public Q/A fragment.
     const segments = extractSpeechSegments(question === undefined ? ((session as any).elements ?? session.content) : text)
@@ -1329,18 +1738,23 @@ export function apply(ctx: Context, config: Config) {
       ? plainSpeechSegments(segments)
       : text
     speechHistory.record({
-      round,
-      overtime: add_flag,
+      round: targetRound ?? round,
+      overtime: targetRound === undefined && add_flag,
       seat,
       nickname: player_copy[seat - 1] || (order.indexOf(seat) === -1 ? "" : player_name[order.indexOf(seat)]),
       text: plainText,
       segments,
+      identityKey: currentModeRoster().find(member => member.seat === seat)?.identityKey,
     })
     const nickname = player_copy[seat - 1] || (order.indexOf(seat) === -1 ? "" : player_name[order.indexOf(seat)])
     const publicSpeech = question === undefined
       ? `${seat}号玩家${nickname}：${plainText}`
       : `${seat}号玩家${nickname}提问：${plainSpeechSegments(extractSpeechSegments(question))}\n回答：${plainSpeechSegments(extractSpeechSegments(answer ?? ''))}`
     if (!game_off) publicTimeline.record({ round: Math.max(0, Math.floor(round || 0)), phase: 'speech', overtime: !!add_flag, text: publicSpeech })
+    if (targetRound !== undefined) {
+      capture(r => r.speechAt(seat, targetRound, plainText, persistentSpeechSegments(segments)))
+      return
+    }
     capture(r => r.speech(seat, plainText,
       question === undefined ? undefined : plainSpeechSegments(extractSpeechSegments(question)),
       answer === undefined ? undefined : plainSpeechSegments(extractSpeechSegments(answer)),
@@ -1357,11 +1771,13 @@ export function apply(ctx: Context, config: Config) {
     const phases = speechHistory.phases()
     if (phases.length === 0) return "本局目前还没有已记录的发言。"
     return phases.map(phase =>
-      speechPhaseLabel(phase.round, phase.overtime) + "：\n" + phase.records.map(speechRecordText).join("\n"),
+      speechPhaseLabel(phase.round, phase.overtime) + "：\n" + phase.records.flatMap(record => [
+        ...(record.previousInvalid ?? []).map(old => speechRecordText({ ...record, text: old.text, invalidReason: old.reason })), speechRecordText(record),
+      ]).join("\n"),
     ).join("\n\n")
   }
   const speechRecordFragment = (record: ReturnType<SpeechHistory['bySeat']>[number]): any => {
-    const prefix = record.seat + "号玩家" + record.nickname + "："
+    const prefix = record.seat + "号玩家" + record.nickname + "：" + (record.invalidReason ? '（已失效：' + record.invalidReason + '）' : '')
     if (!record.segments?.some(segment => segment.kind !== 'text')) return h.text(prefix + record.text)
     return h('template', {}, h.text(prefix), ...record.segments.map(segment => {
       if (segment.kind === 'text') return h.text(segment.text)
@@ -1376,7 +1792,10 @@ export function apply(ctx: Context, config: Config) {
       'message',
       {},
       h.text(speechPhaseLabel(phase.round, phase.overtime) + "：\n"),
-      phase.records.flatMap(record => [speechRecordFragment(record), h.text("\n")]),
+      phase.records.flatMap(record => [
+        ...(record.previousInvalid ?? []).flatMap(old => [speechRecordFragment({ ...record, text: old.text, segments: old.segments, invalidReason: old.reason }), h.text('\n')]),
+        speechRecordFragment(record), h.text("\n"),
+      ]),
     ))
     try {
       await messages.required(
@@ -1429,7 +1848,7 @@ export function apply(ctx: Context, config: Config) {
       if (isEmpty(player_copy[seat - 1])) continue
       const role = seat === white_copy ? "白板" : (uc_copy.indexOf(seat) !== -1 ? "卧底" : "好人")
       const rule = role === "白板" ? "仅易混" : (role === "卧底" ? state.undercoverRule : state.goodRule)
-      const choice = role === "白板" ? "（无需选人）" : (state.selections.get(seat)?.candidate ?? "（未通过）")
+      const choice = role === "白板" ? "（无需选人）" : (modeInteraction.deerApprovedCandidate(seat) ?? "（未通过）")
       rows.push({
         seat,
         userId: player_id_copy[seat - 1],
@@ -1474,6 +1893,9 @@ export function apply(ctx: Context, config: Config) {
     return snapshot.rows.find(row => row.userId === session.userId)
   }
   const cancelDeerTimers = () => {
+    for (const timer of deerMakeupTimers.values()) gameTimers.cancel(timer)
+    for (const timer of deerReviewTimers.values()) gameTimers.cancel(timer)
+    deerMakeupTimers.clear(); deerReviewTimers.clear(); deerRevisions.reset(); deerResetNeedsMakeup.clear()
     gameTimers.cancel(timer_deer_host_review)
     gameTimers.cancel(timer_deer_host_review_reminder)
     for (const timer of deerSelectionTimers.values()) gameTimers.cancel(timer)
@@ -1571,21 +1993,17 @@ export function apply(ctx: Context, config: Config) {
         if (modeInteraction.mode !== "turtle" || (ann_off && !turtleBackfillSeats.has(seat)) || !speechPhases.matches(phase)) return
         const current = modeInteraction.turtleTurnForSeat(seat)
         if (!current || current.status !== "pending-host" || current.pendingSince !== pendingSince) return
-        messages.bestEffort(
-          `龟模式${seat}号回答过半提醒`,
-          () => session.bot.sendPrivateMessage(hostid, "龟模式" + seat + "号玩家的问题等待回答时间已过半，请尽快在群内回答或驳回。"),
-        )
+        notifyPrivate(session, hostid, "龟模式" + seat + "号玩家的问题等待回答时间已过半，请尽快在群内回答或驳回。", `龟模式${seat}号回答过半提醒`)
       }, Math.max(1, Math.floor(total / 2))))
     }
-    turtleAnswerTimers.set(seat, setGameTimeout(() => {
+    turtleAnswerTimers.set(seat, setGameTimeout(async () => {
       if (modeInteraction.mode !== "turtle" || (ann_off && !turtleBackfillSeats.has(seat)) || !speechPhases.matches(phase)) return
       const current = modeInteraction.turtleTurnForSeat(seat)
       if (!current || current.status !== "pending-host" || current.pendingSince !== pendingSince) return
-      const bot = session.bot
-      const guildId = gameRoute.guildId
-      sumup += "龟模式主持人回答" + seat + "号问题超时，本局自动终止且不计分。\n"
-      end_game({ kind: 'aborted', reason: 'host-timeout' })
-      notifyBotGroup(bot, guildId, "龟模式主持人未在限时内回答" + seat + "号玩家的问题，本局已自动终止且不计分。", "龟模式回答超时通知")
+      await handleHostTimeout(session, 'turtle', 'turtle:' + modeInteraction.turtleActiveRoundKey + ':' + seat + ':' + pendingSince,
+        () => modeInteraction.mode === 'turtle' && modeInteraction.turtleTurnForSeat(seat)?.status === 'pending-host'
+          && modeInteraction.turtleTurnForSeat(seat)?.pendingSince === pendingSince,
+        () => armTurtleAnswerTimer(session, seat), () => abortHostTimeout(session, '主持人未在限时内回答' + seat + '号玩家的问题'))
     }, total))
   }
   const startTurtleRound = (session: Session) => {
@@ -1714,25 +2132,30 @@ export function apply(ctx: Context, config: Config) {
     timer_deer_host_review_reminder = setGameTimeout(() => {
       if (modeInteraction.mode !== "deer" || deerHostReviewDeadlineAt !== expectedDeadline
         || modeInteraction.deerProgress().pendingHost.length === 0) return
-      messages.bestEffort(
-        '鹿模式主持审核过半提醒',
-        () => session.bot.sendPrivateMessage(hostid, "鹿模式仍有待审核选人，请尽快处理。\n" + deerProgressText()),
-      )
+      notifyPrivate(session, hostid, "鹿模式仍有待审核选人，请尽快处理。\n" + deerProgressText(), '鹿模式主持审核过半提醒')
     }, Math.max(1, Math.floor(total / 2)))
-    timer_deer_host_review = setGameTimeout(() => {
+    timer_deer_host_review = setGameTimeout(async () => {
       if (modeInteraction.mode !== "deer" || deerHostReviewDeadlineAt !== expectedDeadline
         || modeInteraction.deerProgress().pendingHost.length === 0) return
-      const bot = session.bot
-      const guildId = gameRoute.guildId
-      sumup += "鹿模式主持人审核持续超时，本局自动终止且不计分。\n"
-      end_game({ kind: 'aborted', reason: 'host-timeout' })
-      notifyBotGroup(bot, guildId, "鹿模式主持人长时间未处理待审核选人，本局已自动终止且不计分。", "鹿模式主持审核超时通知")
+      const proposals = modeInteraction.deerProgress().pendingHost.map(seat => ({ seat, version: modeInteraction.deerSelectionForSeat(seat)!.version }))
+      for (const proposal of proposals) {
+        if (game_off) return
+        const applicant = modeInteraction.deerSelectionForSeat(proposal.seat)?.userId
+        await handleHostTimeout(session, 'deer', 'deer:' + proposal.seat + ':' + applicant + ':' + proposal.version,
+          () => { const s = modeInteraction.deerSelectionForSeat(proposal.seat); return modeInteraction.mode === 'deer' && s?.userId === applicant && s.status === 'pending-host' && s.version === proposal.version },
+          () => syncDeerHostReviewClock(session, true), async () => {
+            const selection = modeInteraction.deerSelectionForSeat(proposal.seat)
+            if (selection?.userId !== applicant || selection.status !== 'pending-host' || selection.version !== proposal.version) return
+            await applyDeerSelectionReview(session, { ...proposal, approved: true })
+            notifyGroup(session, proposal.seat + '号玩家的选词审核超时，已自动通过。', '鹿模式选词自动通过')
+          })
+      }
     }, total)
   }
   const deerSeatNeedsSelection = (seat: number): boolean => {
     if (modeInteraction.mode !== "deer") return false
     const selection = modeInteraction.deerSelectionForSeat(seat)
-    return !!selection && selection.status !== "approved"
+    return !!selection && !modeInteraction.deerApprovedCandidate(seat)
   }
   const deerSeatHasSpoken = (seat: number): boolean => {
     const activeIndex = order.indexOf(seat)
@@ -1776,19 +2199,29 @@ export function apply(ctx: Context, config: Config) {
     if (!Number.isFinite(duration) || duration <= 0) return
     const phase = speechPhases.current()
     if (!phase || !phase.eligibleSeats.includes(seat)) return
-    const deadline = Date.now() + duration
+    const task = deerRevisions.makeup(seat)
+    const deadline = Math.max(Date.now() + duration, task ? deerRevisions.deadline(task) : 0)
+    if (!Number.isFinite(deadline)) return
     deerSpeechDeadlines.set(seat, deadline)
+    deerPhaseDeadline = Math.max(deerPhaseDeadline, deadline)
+    deerRevisions.noteSpeechDeadline(deerSpeechPhaseSerial, deerPhaseDeadline)
+    scheduleDeerMakeups(session)
     if (zhangXianZhongModule.isAwaitingTarget(heroState)) return
     deerSpeechTimers.set(seat, setGameTimeout(() => {
       if (!speechPhases.matches(phase)) return
       return processDeerSpeechExpiries(session)
-    }, duration))
+    }, Math.max(1, deadline - Date.now())))
   }
   const startDeerSpeechRound = (session: Session, firstRound = false): boolean => {
     if (modeInteraction.mode !== "deer" || game_off) return false
     gameTimers.cancel(timer_ann)
     for (const seat of [...deerSpeechTimers.keys()]) cancelDeerSpeechClock(seat)
     ann_off = false
+    deerSpeechPhaseSerial++
+    const phaseDuration = deerSpeechDurationMs()
+    deerPhaseDeadline = Number.isFinite(phaseDuration) ? Date.now() + phaseDuration : Infinity
+    deerRevisions.noteSpeechDeadline(deerSpeechPhaseSerial, deerPhaseDeadline)
+    scheduleDeerMakeups(session)
     if (firstRound && modeInteraction.markDeerFirstRoundStarted()) {
       deerProgressAvailableAt = Date.now() + Math.max(0, Number(config.deerProgressDelay ?? 300) || 0) * 1000
       if (order.indexOf(heros[HERO.LIN_DAN_HAN]) !== -1) {
@@ -1799,12 +2232,115 @@ export function apply(ctx: Context, config: Config) {
     beginSpeechPhase(eligibleSeats)
     for (const seat of eligibleSeats) armDeerSpeechClock(session, seat)
     const duration = deerSpeechDurationMs()
-    const timing = Number.isFinite(duration) ? "每名获得发言资格的玩家独立限时" + duration / 60000 + "分钟。" : "本轮发言不限时。"
-    const prefix = firstRound
-      ? "鹿模式易混：" + instr3 + "\n鹿模式第1轮发言已开放：已获得发言资格的玩家可以发言，其他玩家请继续完成私聊选人流程。"
-      : "鹿模式第" + round + "轮发言开始。"
-    notifyGroup(session, prefix + timing, '鹿模式发言开始通知')
+    if (firstRound) {
+      const timing = Number.isFinite(duration) ? "每名获得发言资格的玩家独立限时" + duration / 60000 + "分钟。" : "本轮发言不限时。"
+      notifyGroup(session, "鹿模式易混：" + instr3 + "\n鹿模式第1轮发言已开放：已获得发言资格的玩家可以发言，其他玩家请继续完成私聊选人流程。" + timing, '鹿模式发言开始通知')
+    }
+    else if (Number.isFinite(duration)) {
+      notifyGroup(session, "本次发言阶段限时：" + duration / 60000 + "分钟", '鹿模式发言限时通知')
+    }
     return true
+  }
+  const deerChangesOpen = (): boolean => {
+    const deadline = config.deerReselectionDeadline ?? 'first-round'
+    if (game_off || deadline === 'first-round' && round > 1
+      || deadline === 'discussion' && speechReviewUnlocked()) deerRevisions.closeApplications()
+    return !deerRevisions.applicationsClosed
+  }
+  const deerReselectionHint = (): string => {
+    if (!deerChangesOpen()) return ''
+    const deadline = config.deerReselectionDeadline ?? 'first-round'
+    const label = deadline === 'first-round' ? '第一轮结束前'
+      : deadline === 'discussion' ? '解锁盘发言、带票前' : '游戏结束前'
+    return `\n${label}，可发送“选词＋新内容”或“选人＋新内容”重新申请。`
+  }
+  const clearDeerRevisionSeat = (seat: number) => {
+    gameTimers.cancel(deerMakeupTimers.get(seat)); deerMakeupTimers.delete(seat)
+    gameTimers.cancel(deerReviewTimers.get(seat)); deerReviewTimers.delete(seat)
+    deerRevisions.clearSeat(seat)
+  }
+  const scheduleDeerMakeups = (session: Session) => {
+    for (const task of deerRevisions.pendingMakeups()) {
+      gameTimers.cancel(deerMakeupTimers.get(task.seat)); deerMakeupTimers.delete(task.seat)
+      const deadline = deerRevisions.deadline(task)
+      if (!Number.isFinite(deadline)) continue
+      const check = async () => {
+        if (game_off || deerRevisions.makeup(task.seat) !== task || player[order.indexOf(task.seat)] !== task.userId) return
+        if (isRosterChangeBlocked()) {
+          deerMakeupTimers.set(task.seat, setGameTimeout(check, 1000)); return
+        }
+        clearDeerRevisionSeat(task.seat)
+        await kickActivePlayer(session, task.seat, 'makeup-timeout')
+      }
+      deerMakeupTimers.set(task.seat, setGameTimeout(check, Math.max(1, deadline - Date.now())))
+    }
+  }
+  const requestDeerMakeup = (session: Session, seat: number, version: number) => {
+    const index = order.indexOf(seat)
+    if (index < 0 || game_off) return
+    deerRevisions.requestMakeup({ seat, userId: player[index], version, round,
+      now: Date.now(), durationMs: Math.max(0, config.deerMakeupTimeout ?? 120) * 1000,
+      ...(!ann_off ? { referencePhase: deerSpeechPhaseSerial, referenceDeadline: deerPhaseDeadline } : {}) })
+    if (!ann_off && !add_flag) ann[index] = ''
+    scheduleDeerMakeups(session)
+    if (!ann_off) armDeerSpeechClock(session, seat, deerPhaseDeadline)
+    notifyGroup(session, deerSeatDisplay(seat, true) + '的前序发言已失效，请发送“' + seat + '补发言内容”补一次本轮发言；当前投票和技能照常进行。', '鹿模式补发言提示')
+  }
+  const invalidateDeerSpeeches = (records: DeerSpeechReview['records']) => {
+    const reason = '更换选词后复核未通过'
+    speechHistory.invalidate(records, reason)
+    for (const record of records) capture(r => r.invalidateSpeech(record.seat, record.round, record.overtime, record.text, reason))
+  }
+  const deerSpeechReviewPrompt = (review: DeerSpeechReview) =>
+    deerSeatDisplay(review.seat) + '已更换选词，请整批复核以下前序发言是否仍然成立：\n'
+    + review.records.map(record => speechPhaseLabel(record.round, record.overtime) + '：' + record.text).join('\n')
+    + '\n请私聊发送“复核' + review.seat + '是”或“复核' + review.seat + '否”。'
+  const finishDeerSpeechReview = async (session: Session, seat: number, approved: boolean, version?: number) => {
+    const selection = modeInteraction.deerSelectionForSeat(seat)
+    const pending = deerRevisions.review(seat)
+    if (!selection || !pending || selection.approvedVersion !== pending.version || version !== undefined && pending.version !== version) return false
+    const review = deerRevisions.finishReview(seat, selection.userId, pending.version)
+    if (!review) return false
+    gameTimers.cancel(deerReviewTimers.get(seat)); deerReviewTimers.delete(seat)
+    if (!approved && !game_off) {
+      invalidateDeerSpeeches(review.records)
+      requestDeerMakeup(session, seat, pending.version)
+    }
+    return true
+  }
+  const onDeerWordApproved = async (session: Session, seat: number, previousCandidate?: string) => {
+    const selection = modeInteraction.deerSelectionForSeat(seat)!
+    const existingMakeup = deerRevisions.makeup(seat)
+    const existingReview = deerRevisions.review(seat)
+    if (previousCandidate && previousCandidate === selection.approvedCandidate) {
+      if (existingReview || existingMakeup) selection.approvedVersion = (existingReview ?? existingMakeup)!.version
+      return
+    }
+    const identityKey = currentModeRoster().find(member => member.seat === seat)?.identityKey
+    const records = speechHistory.bySeat(seat).filter(record => !record.invalidReason && record.identityKey === identityKey)
+    clearDeerRevisionSeat(seat)
+    if (deerResetNeedsMakeup.delete(seat) || existingMakeup && !records.length) {
+      requestDeerMakeup(session, seat, selection.approvedVersion!); return
+    }
+    if (!previousCandidate || previousCandidate === selection.approvedCandidate || !records.length) return
+    const policy = config.deerPreviousSpeechPolicy ?? 'review'
+    if (policy === 'keep') return
+    if (policy === 'invalidate') {
+      invalidateDeerSpeeches(records); requestDeerMakeup(session, seat, selection.approvedVersion!); return
+    }
+    const review = { seat, userId: selection.userId, version: selection.approvedVersion!, records }
+    deerRevisions.beginReview(review)
+    await armDeerSpeechReview(session, deerRevisions.review(seat)!)
+  }
+  async function armDeerSpeechReview(session: Session, review: DeerSpeechReview) {
+    const seat = review.seat
+    const total = Math.max(1, (review.deadlineAt ?? (Date.now() + Math.max(30, config.deerHostReviewTimeout ?? 300) * 1000)) - Date.now())
+    review.deadlineAt = Date.now() + total
+    const armReview = () => deerReviewTimers.set(seat, setGameTimeout(() => handleHostTimeout(session, 'speech-review', 'speech:' + seat + ':' + review.userId + ':' + review.version,
+      () => deerRevisions.review(seat) === review, armReview,
+      async () => { await finishDeerSpeechReview(session, seat, config.deerSpeechReviewDefault === 'approve', review.version) }), total))
+    armReview()
+    await sendPrivateNotice(session, hostid, deerSpeechReviewPrompt(review), '鹿模式前序发言复核')
   }
   const timeoutSettingsPrompt = "请输入本局游戏发言限时模式（输入选项对应的序号）：\n"
     + "1.每轮发言限时" + config.speakTimeoutMode1 / 60 + "分钟（适合普通局）\n"
@@ -1920,7 +2456,7 @@ export function apply(ctx: Context, config: Config) {
       ann_off = false
       startClassicSpeechPhase(session)
     }
-    return ("发题配置已完成。实时投票通知默认关闭；主持人可随时发送“开启投票通知”或“关闭投票通知”。")
+    return `发题配置已完成。实时投票通知当前已${flag_notify ? '开启' : '关闭'}，技能通知当前已${flag_skill_notify ? '开启' : '关闭'}；主持人可发送“开启/关闭投票通知”或“开启/关闭技能通知”切换。`
   }
   const restartPreDealSetupAfterRosterChange = async (session: Session): Promise<void> => {
     gameTimers.cancel(timer_uc)
@@ -2013,19 +2549,21 @@ export function apply(ctx: Context, config: Config) {
 踢出3：踢出玩家　取消补位：主持人取消当前申请
 发题状态 / 重发发题提示 / 发题上一步 / 重新发题：主持人私聊检查或纠正配置
 我的题面 / 我的武将 / 重发我的信息：玩家随时私聊补取本局信息
+我的待处理：玩家查看当前技能选择与代投待办　待处理操作：主持人查看待办，详情私聊获取
 谁没发言 / 谁没投票：经典与鹿进度　龟进度：龟模式问答进度
 凑人进度 / 几个人了：查看当前人数　发言总览：合并查看本局各轮发言
 盘3：解锁盘发言后，由在场玩家查看3号从开局至今的全部发言
 亮将情况：查看本局当前已公开武将牌的固定座位
 结束投票：主持人强制结算　总结 / 复盘：查看上局记录
 开启投票通知 / 关闭投票通知：主持人随时切换私聊票况；投票通知状态可查询
+开启技能通知 / 关闭技能通知：独立切换主持人私聊技能动态；技能通知状态可查询
 隐藏选人：上把鹿模式玩家在原群隐藏自己的记录，避免被主持人批量公布
 公布选人：原主持人公布全部未隐藏记录；上把玩家公布自己的记录并解除隐藏
 查询武将 [武将名]：查看技能；省略名称可交互选择　停止卧底：终止本局
 
 【重要规则】
 使用前请先添加 bot 为好友；主持人不参与游戏。
-结果公布前可以改发言、改票；鹿模式选人通过后不能自行更改。
+结果公布前可以改发言、改票；鹿模式选词在本局配置的截止节点前可发送“选词+内容”申请更换。
 禁止自爆只限制普通座位号加自爆流程，不影响武将技能。
 同一机器人同时只进行一局游戏。`
   ctx.command("卧底帮助")
@@ -2131,6 +2669,29 @@ export function apply(ctx: Context, config: Config) {
       return("好的，" + resolvePlayerNickname(session) + "，我叫人的时候不会再烦你了。")
     })
   })
+  ctx.guild().middleware(async (session, next) => {
+    if (game_off || hostSupport.activeWindow === undefined || session.content.trim() !== '1'
+      || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
+    if (isGameHost(session.userId) || hostSupport.isParticipant(session.userId)) return '本局主持人及曾参赛玩家不能接任协同主持。'
+    const epoch = gameTimers.epoch, expectedWindow = hostSupport.activeWindow
+    const identity = await ctx.xpPoints?.getManagedIdentity?.(session.platform, session.userId)
+    if (game_off || gameTimers.epoch !== epoch || hostSupport.activeWindow !== expectedWindow) return
+    if (identity && hostParticipantKeys.has('person:' + identity.profileId)) return '本局曾参赛玩家的关联账号不能接任协同主持。'
+    const window = hostSupport.claim(session.userId)
+    if (window === undefined) return next()
+    const delivered = await messages.state('协同主持资料交付', () => session.bot.sendPrivateMessage(session.userId, h.text(hostBrief())))
+    if (game_off || gameTimers.epoch !== epoch) return
+    if (!delivered) {
+      hostSupport.releaseClaim(session.userId, window)
+      return '主持资料私聊发送失败，尚未接任；请允许机器人私聊后重试，其他符合条件的群友也可回复1。'
+    }
+    const requests = hostSupport.grant(session.userId, window)
+    if (!requests) return '原待办已处理，无需接任。'
+    assistantIdentityKeys.add(identity ? 'person:' + identity.profileId : personKey(resolvePlayerNickname(session)))
+    gameTimers.cancel(hostRecruitmentTimer)
+    for (const request of requests) if (request.pending()) request.resume()
+    return resolvePlayerNickname(session) + '已接任协同主持，原主持仍然有效。'
+  })
   ctx.command("叫人")
   .userFields(["authority"])
   .alias("召唤术")
@@ -2138,7 +2699,7 @@ export function apply(ctx: Context, config: Config) {
     if (!session.guildId) {
       return("本功能仅支持qq群内使用哦~")
     }
-    if(session.user.authority < 2 && (session.userId !== hostid || (wait_off && !flag_start && isEmpty(kickout)))) return(resolvePlayerNickname(session) + "，你又不是bot管理员，也没在凑人，我才不理你呢！")
+    if(session.user.authority < 2 && (!isGameHost(session.userId) || (wait_off && !flag_start && isEmpty(kickout)))) return(resolvePlayerNickname(session) + "，你又不是bot管理员，也没在凑人，我才不理你呢！")
     return runPublicCommand("叫人", async () => {
       let at_str = ""
       let callableUserIds: string[]
@@ -2276,9 +2837,13 @@ export function apply(ctx: Context, config: Config) {
       })
     })
   ctx.middleware((session, next) => {//主持人实时投票通知开关
-    if (game_off || session.userId !== hostid) return next()
+    if (game_off || !isGameHost(session.userId)) return next()
     if (!matchesActiveSession(session)) return next()
     const input = session.content.replace(/\s/g, "")
+    if (/^(?:开启|打开|关闭)白板通知$/u.test(input)) {
+      whiteGuessNotifications = !input.startsWith('关闭')
+      return '白板未匹配猜词通知已' + (whiteGuessNotifications ? '开启。' : '关闭。')
+    }
     if (["开启投票通知", "打开投票通知", "开启实时投票通知"].includes(input)) {
       if (flag_notify) return ("实时投票通知已经开启。")
       flag_notify = true
@@ -2292,7 +2857,30 @@ export function apply(ctx: Context, config: Config) {
     if (input === "投票通知状态") {
       return ("实时投票通知当前已" + (flag_notify ? "开启。" : "关闭。"))
     }
+    if (/^(?:开启|打开|关闭)(?:实时)?技能通知$/u.test(input)) {
+      flag_skill_notify = !input.startsWith('关闭')
+      return '实时技能通知已' + (flag_skill_notify ? '开启。' : '关闭。')
+    }
+    if (/^(?:实时)?技能通知状态$/u.test(input)) return '实时技能通知当前已' + (flag_skill_notify ? '开启。' : '关闭。')
     return next()
+  })
+  ctx.exclude(ctx.guild()).middleware(async (session, next) => {
+    if (game_off || !isGameHost(session.userId) || !matchesActiveSession(session)) return next()
+    const input = normalizeHeroCommand(session.content)
+    const byId = input.match(/^白板判定([1-9][0-9]*)(好人|卧底)$/u)
+    const reference = resolveModeMessageReference({ quote: session.quote, eventQuote: session.event.message?.quote,
+      rawMessage: session.event._data?.message, onebotMessage: (session as any).onebot?.message })
+    const camp = byId?.[2] ?? (reference && /^(?:好人|卧底)$/u.test(input) ? input : undefined)
+    if (!camp) return next()
+    const request = byId ? whiteGuessRequests.get(Number(byId[1])) : [...whiteGuessRequests.values()].find(item =>
+      !!reference?.messageId && item.references.has(session.userId + ':' + reference.messageId))
+    return gameInputQueue.run(async () => {
+      if (!request || request.epoch !== gameTimers.epoch || !flag_white || white !== request.seat
+        || player[order.indexOf(request.seat)] !== request.userId || !whiteGuessRequests.has(request.id)) return '这次白板猜词已失效或已处理。'
+      whiteGuessRequests.clear()
+      await recruitWhite(session, camp === '好人' ? item1 : item2, request.text)
+      return '已认可这次猜词，白板加入' + camp + '阵营。'
+    })
   })
   const deerHostReviewPrompt = (seat: number): string | undefined => {
     const state = modeInteraction.state
@@ -2302,9 +2890,45 @@ export function apply(ctx: Context, config: Config) {
     const isUndercover = uc_copy.includes(seat)
     const role = isUndercover ? '卧底' : '好人'
     const rule = isUndercover ? state.undercoverRule : state.goodRule
-    return "鹿模式" + seat + "号玩家" + selection.nickname + "提交选人：“" + selection.candidate + "”。"
+    return "鹿模式" + seat + "号玩家" + selection.nickname + (selection.version > 1 ? "重新申请选人：“" : "提交选人：“") + selection.candidate + "”"
+      + (selection.version > 1 ? `（第${selection.version}次）` : '') + "。"
       + "\n该座位身份：" + role + "；对应规则：" + rule + "；本局易混：" + state.commonTerm + "。"
       + "\n请引用本消息回复“是”或“否”，也可以发送“" + seat + "是”或“" + seat + "否 原因”。"
+  }
+  const sendDeerSelectionRequest = async (session: Session, seat: number) => {
+    const selection = modeInteraction.deerSelectionForSeat(seat)
+    const request = deerHostReviewPrompt(seat)
+    if (!selection || !request) return
+    const version = selection.version
+    modeInteraction.recordDeerRequestMessage(seat, undefined, request, version)
+    let ids: string[] = []
+    const results = await Promise.all(gameHostIds().map(target => messages.state('鹿模式选词审核提示', async () => {
+      const result = await session.bot.sendPrivateMessage(target, request)
+      ids.push(...(Array.isArray(result) ? result : [result]).filter(Boolean).map(String))
+    })))
+    const delivered = results.some(Boolean)
+    if (delivered) modeInteraction.recordDeerRequestMessage(seat, ids, request, version)
+    else await sendGroupNotice(session, `鹿模式${seat}号玩家的主持审核私聊发送失败，主持人可私聊发送“待处理操作”补取。`, '鹿模式审核补取提示')
+  }
+  const applyDeerSelectionReview = async (session: Session, input: Parameters<ModeInteractionCoordinator['reviewDeerSelection']>[0]) => {
+    const review = modeInteraction.reviewDeerSelection(input)
+    if (review.kind === 'not-found') return '没有找到对应的待审核选人，请检查座位号或引用消息。'
+    if (review.kind === 'not-pending') return '该座位当前没有待审核的选人。'
+    const { selection } = review
+    syncDeerHostReviewClock(session, true)
+    if (review.kind === 'approved') {
+      capture(r => r.choice(selection.seat, selection.approvedCandidate ?? null))
+      if (!ann_off) armDeerSpeechClock(session, selection.seat)
+      await onDeerWordApproved(session, selection.seat, review.previousCandidate)
+      notifyPrivate(session, selection.userId, '主持人已通过你的选人“' + selection.approvedCandidate + '”。' + deerReselectionHint(), '鹿模式选词通过通知')
+      const speechHint = deerRevisions.makeup(selection.seat) ? '该玩家可按补发言提示补发言。'
+        : !ann_off && !deerSeatHasSpoken(selection.seat) ? '该玩家现在可以发言。' : ''
+      return '已通过' + selection.seat + '号玩家的选人，选人已生效。' + speechHint
+    }
+    if (!selection.approvedCandidate) armDeerPlayerSelectionClock(session, selection.seat)
+    notifyPrivate(session, selection.userId, '主持人驳回了本次选人。' + (selection.approvedCandidate ? '原选词“' + selection.approvedCandidate + '”继续有效。' : '请重新提交。')
+      + (review.reason ? '原因：' + review.reason : ''), '鹿模式选词驳回通知')
+    return '已驳回' + selection.seat + '号玩家本次选人。'
   }
   const turtleHostAnswerPrompt = (seat: number): string | undefined => {
     const state = modeInteraction.state
@@ -2323,21 +2947,28 @@ export function apply(ctx: Context, config: Config) {
     if (!matchesActiveSession(session)) return next()
     const input = session.content.replace(/\s/g, "")
     if (input === "待处理操作") {
-      if (session.userId !== hostid) return next()
+      if (!isGameHost(session.userId)) return next()
       const actions = pendingAction.activeActions.filter(action => action.gameEpoch === gameTimers.epoch)
       const actionLines = actions.map(action => {
         const owner = action.ownerSeat ? `${action.ownerSeat}号玩家` : "主持人"
-        const remaining = pendingAction.remainingMs(Date.now(), action.kind)
-        const time = Number.isFinite(remaining) ? `，剩余约${Math.ceil(remaining / 1000)}秒` : ""
-        return `正在等待${owner}处理${action.kind}${time}。`
+        return `正在等待${owner}处理“${pendingActionNames[action.kind]}”，${pendingTimeText(action)}。`
       })
       const modeStatus: string[] = []
       const modeDetails: string[] = []
+      if (boom_pending) {
+        modeStatus.push('正在等待主持人判定自爆。')
+        if (!session.guildId) modeDetails.push('自爆发言：' + boomAttemptText + '；请在群内回复“是”或“否”。')
+      }
       if (modeInteraction.mode === 'deer') {
         const seats = modeInteraction.deerProgress().pendingHost
         if (seats.length) {
           modeStatus.push(`鹿模式待主持审核座位：${seats.join('、')}。`)
           if (!session.guildId) modeDetails.push(...seats.map(deerHostReviewPrompt).filter((value): value is string => !!value))
+        }
+        const reviews = deerRevisions.pendingReviews()
+        if (reviews.length) {
+          modeStatus.push('鹿模式待复核前序发言座位：' + reviews.map(r => r.seat).join('、') + '。')
+          if (!session.guildId) modeDetails.push(...reviews.map(deerSpeechReviewPrompt))
         }
       }
       if (modeInteraction.mode === 'turtle') {
@@ -2348,24 +2979,41 @@ export function apply(ctx: Context, config: Config) {
         }
       }
       if (!actionLines.length && !modeStatus.length) return "当前没有等待处理的武将技能或主持操作。"
-      if (session.guildId && modeStatus.length) modeStatus.push('详细内容请主持人私聊发送“待处理操作”补取。')
+      if (session.guildId) {
+        const delivered = await messages.state('主持待办私聊', () => session.bot.sendPrivateMessage(session.userId,
+          [...actionLines, ...modeStatus, '详细主持审核内容可私聊发送“待处理操作”补取。'].join('\n\n')))
+        return [...modeStatus, delivered ? '已私聊发送待处理详情。' : '私聊未送达，请添加机器人好友后私聊发送“待处理操作”。'].join('\n')
+      }
       return [...actionLines, ...modeStatus, ...modeDetails].join("\n\n")
     }
     if (input !== "我的待处理") return next()
-    const action = pendingAction.activeActions.find(item =>
+    const actions = pendingAction.activeActions.filter(item =>
       item.gameEpoch === gameTimers.epoch && item.ownerUserId === session.userId,
     )
-    if (!action) return "你当前没有等待处理的武将技能或游戏操作。"
-    const prompt = recoverablePendingPrompts.get(action.kind)
-    if (!prompt || prompt.gameEpoch !== gameTimers.epoch) {
-      return "当前操作仍在等待，但没有可重发的提示；请联系主持人查看“待处理操作”。"
+    if (!actions.length) return "你当前没有等待处理的武将技能或游戏操作。"
+    const content = [skillFirstNotice(session.userId), ...actions.map(recoveredActionText)].filter(Boolean).join('\n\n')
+    if (!session.guildId) return content
+    const results = [await messages.state('待办补取提示', () => session.bot.sendPrivateMessage(session.userId, content))]
+    return results.every(Boolean) ? "已私聊重发当前操作提示。" : "部分私聊提示仍发送失败，请检查是否已添加机器人好友。"
+  })
+  ctx.exclude(ctx.guild()).middleware(async (session, next) => {
+    if (game_off || !matchesActiveSession(session)) return next()
+    const skills = pendingSkillsFor(session.userId)
+    if (!skills.length) return next()
+    const input = normalizeHeroCommand(session.content)
+    const heir = skills.find(action => action.kind === 'zhu-you-xiao-heir-target' || action.kind === 'zhu-you-xiao-heir-choice')
+    const resolutionChoice = skills.some(action => action.kind === 'huang-tai-ji-quan' || action.kind === 'mao-wen-long-late-vote' || action.kind === 'shi-ke-fa-gift')
+    const numericChoice = /^(?:[0-9]+|弃|弃权)$/u.test(input)
+    const explicitHeir = /^(?:传弟|传|弃传弟)/u.test(input)
+    if (heir && (explicitHeir || numericChoice && !resolutionChoice)) {
+      return heir.kind === 'zhu-you-xiao-heir-target'
+        ? handleZhuYouXiaoHeirTarget(session, next)
+        : handleZhuYouXiaoHeirChoice(session, next)
     }
-    if (prompt.scope === 'group' || !session.guildId) return prompt.content
-    const delivered = await messages.state(
-      `${prompt.kind}补取提示`,
-      () => session.bot.sendPrivateMessage(session.userId, prompt.content),
-    )
-    return delivered ? "已私聊重发当前操作提示。" : "私聊提示仍发送失败，请检查是否已添加机器人好友。"
+    if ((numericChoice && !resolutionChoice) || /^(?:伐[0-9]*|代(?:投|伐)?(?:[0-9]+|弃|弃权))$/u.test(input)) {
+      return skillFirstNotice(session.userId)
+    }
+    return next()
   })
   ctx.middleware(async (session, next) => {//玩家主动退出
     if (game_off || !["退出游戏", "退出卧底"].includes(session.content.replace(/\s/g, ""))) return next()
@@ -2534,7 +3182,7 @@ export function apply(ctx: Context, config: Config) {
       const sameRoute = gameRoute.matchesSession(session.platform, session.guildId, session.selfId)
       if (!sameBot) return next()
       if (sameRoute) {
-        return session.userId === hostid
+        return isGameHost(session.userId)
           ? "当前已有一局卧底正在进行中。如需重开，请先发送“停止卧底”。"
           : "当前已有一局卧底正在进行中，请继续当前游戏。"
       }
@@ -2561,6 +3209,7 @@ export function apply(ctx: Context, config: Config) {
       gameTimers.advanceEpoch()
       preDealRevision += 1
       modeInteraction.reset("classic")
+      hostSupport.reset(); hostParticipantKeys.clear(); assistantIdentityKeys.clear(); gameTimers.cancel(hostRecruitmentTimer)
       heroesEnabled = config.heroesByDefault ?? true
       speechHistory.clear()
       publicHeroReveals.clear()
@@ -2584,6 +3233,9 @@ export function apply(ctx: Context, config: Config) {
       flag_fati = false
       flag_ask_timeout = false
       flag_notify = config.realtimeVoteNoticeDefault ?? false
+      flag_skill_notify = config.realtimeSkillNoticeDefault ?? false
+      whiteGuessNotifications = notifications.whiteGuessHost
+      whiteGuessRequests.clear()
       stalemate.reset()
       set_mode = false
       flag_just_vote = false
@@ -2713,24 +3365,24 @@ export function apply(ctx: Context, config: Config) {
     const content = session.content.replace(/\s/g, "")
     const selectedMode = parseGameModeSelection(session.content)
     const shortcutMode = parseModeStart(session.content)
-    if (session.userId === hostid && !flag_fati && selectedMode) return true
-    if (session.userId === hostid && (content === "普通局" || content === "武将局" || (flag_start && content === "自定义"))) return true
+    if (isGameHost(session.userId) && !flag_fati && selectedMode) return true
+    if (isGameHost(session.userId) && (content === "普通局" || content === "武将局" || (flag_start && content === "自定义"))) return true
     if (!wait_off && !flag_start && content === "１") return true
-    if (session.userId === hostid && flag_start && (
+    if (isGameHost(session.userId) && flag_start && (
       content === "停止加人" || content === "关闭加人" || content === "结束加人"
       || content === "终止加人" || content === "不加人了" || content === "不加了"
       || content === "开启加人" || content === "开始加人" || content === "继续加人"
     )) return true
     if (content === "1" && !flag_start) return true
-    if (content === "1" && flag_start && session.userId !== hostid && player.indexOf(session.userId) === -1) return true
+    if (content === "1" && flag_start && !isGameHost(session.userId) && player.indexOf(session.userId) === -1) return true
     // Route host start requests through the roster queue even when the
     // minimum count is not true yet.  The queued task evaluates the latest
     // player list after earlier concurrent `1` messages have been processed;
     // deciding here would let a start sent in the same burst fall through to
     // ChatLuna/Character before those joins become visible.
-    if (session.userId === hostid && !flag_start
+    if (isGameHost(session.userId) && !flag_start
       && (content === "开始" || shortcutMode !== null)) return true
-    return session.userId === hostid && flag_start && content.indexOf("踢出") === 0
+    return isGameHost(session.userId) && flag_start && content.indexOf("踢出") === 0
   }
 
   ctx.guild().middleware(async (session: Session, next) => {//凑人阶段
@@ -2742,7 +3394,7 @@ export function apply(ctx: Context, config: Config) {
       if (inputEpoch !== gameTimers.epoch || !shouldQueueGatheringInput(session)) return forwardGameInput
       if (wait_off && !flag_start) return forwardGameInput
     const selectedMode = parseGameModeSelection(session.content)
-    if (session.userId === hostid && !flag_fati && selectedMode) {
+    if (isGameHost(session.userId) && !flag_fati && selectedMode) {
       if (selectedMode !== 'classic' && !enabledSpecialModes.has(selectedMode)) {
         return "本实例未启用" + (selectedMode === 'deer' ? '鹿模式' : '龟模式') + "。"
       }
@@ -2761,41 +3413,42 @@ export function apply(ctx: Context, config: Config) {
       return "已选择" + modeInteraction.module.label + "，发题前仍可切换。"
     }
     const shortcutMode = parseModeStart(session.content)
-    if (session.userId === hostid && !flag_start && shortcutMode && shortcutMode !== 'classic' && !enabledSpecialModes.has(shortcutMode)) {
+    if (isGameHost(session.userId) && !flag_start && shortcutMode && shortcutMode !== 'classic' && !enabledSpecialModes.has(shortcutMode)) {
       return "本实例未启用" + (shortcutMode === 'deer' ? '鹿模式' : '龟模式') + "。"
     }
-    if (session.userId === hostid && !flag_start && shortcutMode) modeInteraction.reset(shortcutMode)
+    if (isGameHost(session.userId) && !flag_start && shortcutMode) modeInteraction.reset(shortcutMode)
     const startRequestedDuringGather = session.content.replace(/\s/g, "") === "开始" || shortcutMode !== null
     let str_nos = session.content.replace(/\s/g, "")
     if (!wait_off && !flag_start && str_nos === "１") {
       return "全角“１”不会加入游戏；如要参与请发送半角数字 1。"
     }
-    if (session.userId === hostid && !flag_start && (str_nos === "普通局" || str_nos === "武将局")) {
+    if (isGameHost(session.userId) && !flag_start && (str_nos === "普通局" || str_nos === "武将局")) {
       heroesEnabled = str_nos === "武将局"
       return heroesEnabled ? "已设定本局为武将局。" : "已设定本局为无武将普通局。"
     }
-    if (session.userId === hostid && flag_start && add_player && (str_nos === "停止加人" || str_nos === "关闭加人" || str_nos === "结束加人" || str_nos === "终止加人" || str_nos === "不加人了" || str_nos === "不加了")) {
+    if (isGameHost(session.userId) && flag_start && add_player && (str_nos === "停止加人" || str_nos === "关闭加人" || str_nos === "结束加人" || str_nos === "终止加人" || str_nos === "不加人了" || str_nos === "不加了")) {
       add_player = false
       return ("已关闭加人模式，发送“开启加人”以继续加人。")
     }
-    else if (session.userId === hostid && flag_start && (!add_player) && (str_nos === "开启加人" || str_nos === "开始加人" || str_nos === "继续加人")) {
+    else if (isGameHost(session.userId) && flag_start && (!add_player) && (str_nos === "开启加人" || str_nos === "开始加人" || str_nos === "继续加人")) {
       add_player = true
       return ("已开启加人模式，群友可继续扣1。")
     }
     if (str_nos === "1" && !flag_start) {
-      if (player.indexOf(session.userId) == -1 && session.userId !== hostid) {
+      if (player.indexOf(session.userId) == -1 && !isGameHost(session.userId)) {
         const prepared = await prepareGatheringPlayer(session, inputEpoch)
         if (!prepared) return
         if ('error' in prepared) return prepared.error
         const joiningName = prepared.nickname
         player.push(session.userId)
+        hostSupport.recordParticipant(session.userId); hostParticipantKeys.add(personKey(joiningName))
         player_id_copy.push(session.userId)
         player_name.push(joiningName)
         player_copy.push(joiningName)
       }
     }
     else {
-      if ((startRequestedDuringGather && player.length >= config.minPlayers && session.userId === hostid && !flag_start) || (str_nos === "1" && player.indexOf(session.userId) === -1 && session.userId !== hostid) || (session.userId === hostid && str_nos.indexOf("踢出") === 0 && flag_start)) {
+      if ((startRequestedDuringGather && player.length >= config.minPlayers && isGameHost(session.userId) && !flag_start) || (str_nos === "1" && player.indexOf(session.userId) === -1 && !isGameHost(session.userId)) || (isGameHost(session.userId) && str_nos.indexOf("踢出") === 0 && flag_start)) {
         if (str_nos === "1") {
           if (!add_player) return ("主持人已经关闭了加人，你无法再加入。")
           if (flag_fati) return ("你来晚了，我已经在发题了")
@@ -2804,6 +3457,7 @@ export function apply(ctx: Context, config: Config) {
           if ('error' in prepared) return prepared.error
           const joiningName = prepared.nickname
           player.push(session.userId)
+          hostSupport.recordParticipant(session.userId); hostParticipantKeys.add(personKey(joiningName))
           player_id_copy.push(session.userId)
           player_name.push(joiningName)
           player_copy.push(joiningName)
@@ -2880,7 +3534,7 @@ export function apply(ctx: Context, config: Config) {
           ask_nice = true
         }
       }
-      else if (session.userId === hostid && (str_nos === "普通局" || str_nos === "武将局")) {
+      else if (isGameHost(session.userId) && (str_nos === "普通局" || str_nos === "武将局")) {
         heroesEnabled = str_nos === "武将局"
         if (heroesEnabled && heros.every(value => value === 0)) randomizeHeroesForRoster()
         else if (!heroesEnabled) heros = Array(hero_num).fill(0)
@@ -2894,7 +3548,7 @@ export function apply(ctx: Context, config: Config) {
   ctx.guild().middleware((session, next) => {
     if (game_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
     let str_askwh = session.content.replace(/\s/g, "")
-    if (!flag_ask_white || session.userId !== hostid || str_askwh === "停止卧底" || str_askwh === "中止卧底" || str_askwh === "终止卧底" || str_askwh === "结束卧底" || str_askwh === "关闭卧底") return next()
+    if (!flag_ask_white || !isGameHost(session.userId) || str_askwh === "停止卧底" || str_askwh === "中止卧底" || str_askwh === "终止卧底" || str_askwh === "结束卧底" || str_askwh === "关闭卧底") return next()
     uc_num = Math.floor(player.length / config.undercoverDivisor)
     if (str_askwh === "否") {
       flag_white = false
@@ -2944,8 +3598,11 @@ export function apply(ctx: Context, config: Config) {
     if (game_off || modeInteraction.mode !== "deer" || !matchesActiveSession(session)) return next()
     const state = modeInteraction.state
     if (state.kind !== "deer" || isEmpty(state.commonTerm)) return next()
-    if (session.userId === hostid) {
+    if (isGameHost(session.userId)) {
       const trimmed = session.content.trim()
+      const speechReview = trimmed.match(/^复核\s*([1-9]\d*)\s*(是|否)$/u)
+      if (speechReview) return await finishDeerSpeechReview(session, Number(speechReview[1]), speechReview[2] === '是')
+        ? '已记录前序发言复核结果。' : '该座位没有待复核的前序发言。'
       const seatMatch = trimmed.match(/^(\d+)\s*(是|否)(.*)$/s)
       const quoteReference = resolveModeMessageReference({
         quote: session.quote,
@@ -2964,77 +3621,39 @@ export function apply(ctx: Context, config: Config) {
       }
       const approved = (seatMatch?.[2] ?? quoteDecision?.[1]) === "是"
       const reason = (seatMatch?.[3] ?? quoteDecision?.[2])?.replace(/^[\s：:，,]+/, "").trim()
-      const review = modeInteraction.reviewDeerSelection({
+      return applyDeerSelectionReview(session, {
         seat: seatMatch ? Number(seatMatch[1]) : undefined,
         requestMessageId: quoteReference?.messageId,
         requestMessageContent: quoteReference?.content,
         approved,
         reason,
       })
-      if (review.kind === "not-found") return ("没有找到对应的待审核选人，请检查座位号或引用消息。")
-      if (review.kind === "not-pending") return ("该座位当前没有待审核的选人。")
-      if (review.kind === "approved") {
-        capture(r => r.choice(review.selection.seat, review.selection.candidate ?? null))
-        syncDeerHostReviewClock(session, true)
-        if (!ann_off) armDeerSpeechClock(session, review.selection.seat)
-        messages.bestEffort(
-          `鹿模式${review.selection.seat}号审核通过通知`,
-          () => session.bot.sendPrivateMessage(review.selection.userId, "主持人已通过你的选人“" + review.selection.candidate + "”。"),
-        )
-        return "已通过" + review.selection.seat + "号玩家的选人；该玩家现在可以发言。"
-      }
-      syncDeerHostReviewClock(session, true)
-      armDeerPlayerSelectionClock(session, review.selection.seat)
-      messages.bestEffort(
-        `鹿模式${review.selection.seat}号审核驳回通知`,
-        () => session.bot.sendPrivateMessage(review.selection.userId, "主持人驳回了你的选人，请重新提交。" + (review.reason ? "原因：" + review.reason : "")),
-      )
-      return ("已驳回" + review.selection.seat + "号玩家的选人。")
     }
     const selection = [...state.selections.values()].find(value => value.userId === session.userId)
-    if (!selection) return next()
-    if (selection.status === "approved") return next()
+    if (!selection || !player.includes(session.userId)) return next()
+    if (selection.approvedCandidate && !/^(?:选词|选人)/u.test(session.content.trim())) return next()
+    if (selection.approvedCandidate && !deerChangesOpen()) return '本局已超过选词重选截止节点。'
     const hadPendingReview = modeInteraction.deerProgress().pendingHost.length > 0
     const submitted = modeInteraction.submitDeerSelection(session.userId, session.content, Date.now())
     if (submitted.kind === "empty") return ("选人不能为空，请重新发送。")
     if (submitted.kind === "common-term") return ("不能选择易混本身，请重新选择符合阵营规则的词条。")
-    if (submitted.kind === "pending") return ("你的选人正在等待主持人审核，不能覆盖；如需重选，请先等待主持人驳回。")
     if (submitted.kind !== "accepted") return next()
     cancelDeerSelectionClock(submitted.selection.seat)
-    modeInteraction.recordDeerRequestMessage(
-      submitted.selection.seat,
-      undefined,
-      deerHostReviewPrompt(submitted.selection.seat),
-    )
     syncDeerHostReviewClock(session, !hadPendingReview)
-    const request = deerHostReviewPrompt(submitted.selection.seat)!
-    let requestIds: string[] = []
-    const delivered = await messages.state(
-      `鹿模式${submitted.selection.seat}号主持审核提示`,
-      async () => {
-        const messageIds = await session.bot.sendPrivateMessage(hostid, request)
-        requestIds = (Array.isArray(messageIds) ? messageIds : [messageIds]).filter(Boolean).map(String)
-      },
-    )
-    if (delivered) {
-      modeInteraction.recordDeerRequestMessage(submitted.selection.seat, requestIds, request)
-    }
-    else {
-      await sendGroupNotice(session,
-        `鹿模式${submitted.selection.seat}号玩家的主持审核私聊发送失败；流程仍在等待，主持人请私聊发送“待处理操作”补取。`,
-        `鹿模式${submitted.selection.seat}号审核群内补救提示`)
-    }
+    await sendDeerSelectionRequest(session, submitted.selection.seat)
     return ("已提交“" + submitted.selection.candidate + "”，请等待主持人审核。")
   })
   ctx.guild().middleware(async (session, next) => {//鹿模式重置选人
-    if (game_off || modeInteraction.mode !== "deer" || session.userId !== hostid || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
+    if (game_off || modeInteraction.mode !== "deer" || !isGameHost(session.userId) || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
     const match = session.content.replace(/\s/g, "").match(/^重置选人(\d+)$/)
     if (!match) return next()
     const seat = Number(match[1])
-    if (round !== 1) return ("只有第一轮尚未发言的玩家可以重置选人。")
-    if (deerSeatHasSpoken(seat)) return ("该玩家已经完成第一轮发言，不能再重置选人。")
+    if (!deerChangesOpen()) return '本局已超过选词重选截止节点。'
     const selection = modeInteraction.resetDeerSelection(seat)
     if (!selection) return ("该座位是白板、已离场或不存在，无需选人。")
+    const records = speechHistory.bySeat(seat).filter(record => !record.invalidReason && record.identityKey === currentModeRoster().find(member => member.seat === seat)?.identityKey)
+    clearDeerRevisionSeat(seat)
+    if (records.length) { invalidateDeerSpeeches(records); deerResetNeedsMakeup.add(seat) }
     capture(r => r.choice(seat, null))
     syncDeerHostReviewClock(session, false)
     cancelDeerSpeechClock(selection.seat)
@@ -3058,7 +3677,7 @@ export function apply(ctx: Context, config: Config) {
     return deerProgressText()
   })
   ctx.exclude(ctx.guild()).middleware((session, next) => {//主持人发题状态与回退
-    if (game_off || session.userId !== hostid || !matchesActiveSession(session)) return next()
+    if (game_off || !isGameHost(session.userId) || !matchesActiveSession(session)) return next()
     const input = session.content.replace(/\s/g, "")
     if (!["发题状态", "重发发题提示", "发题上一步", "重新发题"].includes(input)) return next()
     if (input === "发题状态") return setupStatusText()
@@ -3075,7 +3694,7 @@ export function apply(ctx: Context, config: Config) {
     return "已返回上一步；该步及之后输入已清除。\n" + setupPromptText()
   })
   ctx.exclude(ctx.guild()).middleware(async (session, next) => {//发题阶段
-    if (game_off || session.userId !== hostid || !matchesActiveSession(session)) return next()
+    if (game_off || !isGameHost(session.userId) || !matchesActiveSession(session)) return next()
     if (disp_off) return next()
     const inputEpoch = gameTimers.epoch, inputRevision = preDealRevision
     const result = await gameInputQueue.run(async () => {
@@ -3107,22 +3726,22 @@ export function apply(ctx: Context, config: Config) {
     }
     if (modeInteraction.mode === "deer") {
       if (ask_nice) {
-        item1 = session.content.trim()
-        if (isEmpty(item1)) return ("好人规则不能为空，请重新输入。")
-        ask_nice = false
-        ask_nice_instr = true
-        return ("请输入鹿模式卧底阵营的选人/选词规则：")
-      }
-      if (ask_nice_instr) {
-        item2 = session.content.trim()
-        if (isEmpty(item2)) return ("卧底规则不能为空，请重新输入。")
-        ask_nice_instr = false
-        ask_uc = true
-        return ("请输入鹿模式易混（不能作为玩家选词，将公开到群聊并私聊给所有玩家）：")
-      }
-      if (ask_uc) {
         instr3 = session.content.trim()
         if (isEmpty(instr3)) return ("易混不能为空，请重新输入。")
+        ask_nice = false
+        ask_nice_instr = true
+        return ("请输入鹿模式好人阵营的选人/选词规则：")
+      }
+      if (ask_nice_instr) {
+        item1 = session.content.trim()
+        if (isEmpty(item1)) return ("好人规则不能为空，请重新输入。")
+        ask_nice_instr = false
+        ask_uc = true
+        return ("请输入鹿模式卧底阵营的选人/选词规则：")
+      }
+      if (ask_uc) {
+        item2 = session.content.trim()
+        if (isEmpty(item2)) return ("卧底规则不能为空，请重新输入。")
         ask_uc = false
         instr1 = item1
         instr2 = item2
@@ -3209,7 +3828,7 @@ export function apply(ctx: Context, config: Config) {
     return result === forwardGameInput ? next() : result
   })
   ctx.guild().middleware((session, next) => {//自定义模式
-    if (game_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId) || session.userId !== hostid || !flag_start) return next()
+    if (game_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId) || !isGameHost(session.userId) || !flag_start) return next()
     let str_nos = session.content.replace(/\s/g, "")
     if (str_nos === "自定义") {
       disp_off = true
@@ -3251,7 +3870,7 @@ export function apply(ctx: Context, config: Config) {
     else return next()
   })
   ctx.exclude(ctx.guild()).middleware(async (session, next) => {
-    if (!set_mode || session.userId !== hostid || !matchesActiveSession(session)) return next()
+    if (!set_mode || !isGameHost(session.userId) || !matchesActiveSession(session)) return next()
     const inputEpoch = gameTimers.epoch, inputRevision = preDealRevision
     const result = await gameInputQueue.run(async () => {
       if (game_off || inputEpoch !== gameTimers.epoch || !matchesActiveSession(session)) return forwardGameInput
@@ -3372,6 +3991,13 @@ export function apply(ctx: Context, config: Config) {
     ending: HistoryEnding = { kind: 'aborted', reason: 'system-error' },
     historyOutcome?: string,
   )=>{
+    weiInquiryWindow = null
+    if (ending.kind === 'aborted' && (voteFactStage === 'open' || voteFactStage === 'counting')) {
+      if (voteFactStage === 'open') rebuildPollFromBallots()
+      const facts = voteFactStage === 'counting' ? frozenVoteFacts : captureCurrentVoteFacts(false)
+      capture(r => r.vote(facts, order.map((seat, i) => ({ seat, count: poll[i] })), false,
+        [...anonymousVoteContributions].map(([seat, count]) => ({ seat, count }))))
+    }
     if (historyRecorder) {
       const recorder = historyRecorder
       historyRecorder = undefined
@@ -3396,6 +4022,7 @@ export function apply(ctx: Context, config: Config) {
     }
     stalemate.reset()
     rememberDeerReveal()
+    hostSupport.reset(); hostParticipantKeys.clear(); assistantIdentityKeys.clear(); gameTimers.cancel(hostRecruitmentTimer)
     historyDepartureReasons.clear()
     cancelDeerTimers()
     cancelTurtleTimers()
@@ -3403,9 +4030,17 @@ export function apply(ctx: Context, config: Config) {
     speechBackfillSeats.clear()
     speechBackfillUsers.clear()
     pendingAction.clear()
+    whiteGuessRequests.clear()
     recoverablePendingPrompts.clear()
+    clearZhuYouXiaoPhase(zhuYouXiaoVotes)
+    zhuYouXiaoVotes.records = []
+    zhuYouXiaoHeirTargetSeat = null
+    zhuYouXiaoHeirOwnerSeat = null
     voteSettlement.clear()
     gameTimers.advanceEpoch()
+    voteFactStage = 'none'
+    frozenVoteFacts = []
+    anonymousVoteContributions.clear()
     game_off = true
     wait_off = true
     ann_off = true
@@ -3496,12 +4131,64 @@ export function apply(ctx: Context, config: Config) {
     }
     return continueResolution()
   }
-  const check_game_end = async (session, outplayer, extra, whiteSurvivalSettled = false) => {
+  const check_game_end = async (session, outplayer, extra, whiteSurvivalSettled = false, cause: 'skill' | 'kick' = 'skill') => {
     const control = await resolveEliminationVictory(session, whiteSurvivalSettled)
     if (control.kind === "game-end") return
+    if (cause === 'skill' && typeof outplayer === 'number'
+      && postEliminationHero(outplayer, heros, 'skill') === 'zhu-you-xiao') {
+      beginZhuYouXiaoHeirTarget(session, outplayer)
+    }
     await extra(session, outplayer)
   }
   const splice_player = (outplayer, is_kickout, is_check_white) => {
+    const delegation = zhuYouXiaoVotes.current
+    if (delegation && (delegation.delegateSeat === outplayer || delegation.ownerSeat === outplayer)) {
+      const owner = zhuYouXiaoCurrentOwner()
+      const delegatedSeat = delegation.delegateSeat
+      // Once final-vote resolution is running, the raw ballot and its
+      // historical delegate have already been accepted.  Removing the
+      // delegate as the resolution's elimination target must not replay the
+      // pre-resolution invalidation path; the successful relationship still
+      // belongs to 传弟's later reveal.  Before settlement starts, a leaving
+      // delegate still invalidates the pending proxy exactly as before.
+      const settledDelegateLeavesDuringResolution = voteSettlement.isRunning(currentVoteSettlementKey())
+        && delegatedSeat === outplayer
+        && delegation.successfulDelegateSeat !== null
+      const ownerLeavesAfterSuccessfulVote = !is_kickout
+        && delegation.ownerSeat === outplayer
+        && delegation.successfulDelegateSeat !== null
+      if (owner !== null && !ownerLeavesAfterSuccessfulVote && !settledDelegateLeavesDuringResolution) {
+        clearZhuYouXiaoBallot(owner, add_flag, true, false)
+      }
+      if (ownerLeavesAfterSuccessfulVote || settledDelegateLeavesDuringResolution) {
+        // The final ballot has already been recorded.  Keep its historical
+        // delegate for 传弟, but detach the live relation before the seat is
+        // removed from the roster.
+        detachZhuYouXiaoCurrent(zhuYouXiaoVotes, true)
+      }
+      else setZhuYouXiaoDelegate(zhuYouXiaoVotes, null)
+      if (!vote_off && !voteSettlement.isRunning(currentVoteSettlementKey())) rebuildPollFromBallots()
+      pendingAction.clear("zhu-you-xiao-proxy-vote")
+      recoverablePendingPrompts.delete("zhu-you-xiao-proxy-vote")
+      // Keep the hidden relation private.  An active owner is told only when
+      // the delegate leaves; if the owner itself leaves there is no recipient.
+      if (delegatedSeat === outplayer && owner !== null) {
+        const ownerIndex = order.indexOf(owner)
+        if (ownerIndex !== -1) notifyBotPrivate(gameRoute.bot, player[ownerIndex], "放权对象已离场，本次代投已失效；请重新投票或重新发送“放权+序号”。", "朱由校放权对象离场通知")
+      }
+    }
+    if (zhuYouXiaoHeirTargetSeat === outplayer) {
+      pendingAction.clear("zhu-you-xiao-heir-choice")
+      recoverablePendingPrompts.delete("zhu-you-xiao-heir-choice")
+      gameTimers.cancel(timer_zhu_you_xiao_heir)
+      zhuYouXiaoHeirTargetSeat = null
+      const ownerSeat = zhuYouXiaoHeirOwnerSeat
+      zhuYouXiaoHeirOwnerSeat = null
+      if (ownerSeat !== null && player_id_copy[ownerSeat - 1]) {
+        notifyBotPrivate(gameRoute.bot, player_id_copy[ownerSeat - 1], "传弟对象已离场，本次传弟选择失效。", "朱由校传弟对象离场通知")
+      }
+    }
+    weiZhongXianModule.recordDeparture(heroState, outplayer)
     capture(r => r.leave(outplayer, historyDepartureReasons.get(outplayer) ?? (is_kickout ? 'kick' : 'skill'), Date.now()))
     historyDepartureReasons.delete(outplayer)
     const result = removeRosterSeat({
@@ -3520,6 +4207,11 @@ export function apply(ctx: Context, config: Config) {
       checkWhiteOnly: is_check_white && (!add_flag || add_indices.some(index => order[index] === white)),
     })
     stalemate.reset()
+    const departedSelection = modeInteraction.mode === 'deer' ? modeInteraction.deerSelectionForSeat(outplayer) : undefined
+    if (departedSelection) deerRevisions.suspend(outplayer, departedSelection.identityKey ?? departedSelection.userId, Date.now())
+    clearDeerRevisionSeat(outplayer)
+    for (const [id, request] of whiteGuessRequests) if (request.seat === outplayer) whiteGuessRequests.delete(id)
+    deerResetNeedsMakeup.delete(outplayer)
     if (modeInteraction.mode === "turtle" && !ann_off) {
       modeInteraction.removeTurtleSeat(outplayer)
       cancelTurtleSeatTimers(outplayer)
@@ -3563,7 +4255,7 @@ export function apply(ctx: Context, config: Config) {
   const player_out_long = async (session, outplayer, extra, is_kickout, is_check_white) => {
     splice_player(outplayer, is_kickout, is_check_white)
     boom_pending = false
-    await check_game_end(session, outplayer, extra, whiteSurvivalSettlementPending)
+    await check_game_end(session, outplayer, extra, whiteSurvivalSettlementPending, is_kickout ? 'kick' : 'skill')
   }
   const player_out = async (session, outplayer, is_kickout, is_check_white) => {
     await player_out_long(session, outplayer, (session, outplayer) => {}, is_kickout, is_check_white)
@@ -3573,7 +4265,7 @@ export function apply(ctx: Context, config: Config) {
       splice_player(outplayers[i], is_kickout, is_check_white)
     }
     boom_pending = false
-    await check_game_end(session, outplayers, extra)
+    await check_game_end(session, outplayers, extra, false, is_kickout ? 'kick' : 'skill')
   }
   const new_round = async (session): Promise<boolean> => {
     if (game_off) return false
@@ -3601,6 +4293,7 @@ export function apply(ctx: Context, config: Config) {
       if (game_off) return false
     }
     whiteSurvivalSettlementPending = false
+    settleWeiZhongXianCandidates(session)
     // Round-start authority is settled only after Yuan Chonghuan's retaliation
     // has completed.  This keeps all public/new-round effects in the same
     // post-retaliation window and avoids awarding Huang Taiji or Wu Sangui
@@ -3687,7 +4380,7 @@ export function apply(ctx: Context, config: Config) {
       recordSkill(HERO.DUO_ER_GUN, '入关，获得“摄政”')
       notifyGroup(session, dorgonIdentity + "，入关，获得技能“摄政”。", "多尔衮入关通知")
       const d = dorgonRoundStart.strategySeat ?? 0
-      notifyPrivate(session, player[dorgonIndex], "恭喜王爷得获得摄政大权，您可向我发送“保A弃B”或“弃B保A”以发动技能（效果：下次A要被投出去时，AB得票数互换）\n注意A、B其一必须要在轮次开始时有“定策”标记；目前" + (order.indexOf(d)!==-1 ? (d + "号玩家" + player_name[order.indexOf(d)] + "拥有“定策”标记。") : "场上没有“定策”标记，您需要先拥立一人。"), "多尔衮摄政私聊通知")
+      notifyPrivate(session, player[dorgonIndex], "恭喜王爷获得摄政大权，您可向我发送“保A弃B”或“弃B保A”以发动技能（效果：下次A要被投出去时，AB得票数互换）\n注意A、B其一必须要在轮次开始时有“定策”标记；目前" + (order.indexOf(d)!==-1 ? (d + "号玩家" + player_name[order.indexOf(d)] + "拥有“定策”标记。") : "场上没有“定策”标记，您需要先拥立一人。"), "多尔衮摄政私聊通知")
     }
     if (isEmpty(uc) && flag_white) white_only = true
     if (round > uc_num || player_copy.length - player.length - kickout.length >= uc_num) {
@@ -3702,24 +4395,34 @@ export function apply(ctx: Context, config: Config) {
     else startClassicSpeechPhase(session)
     return true
   }
-  // 林丹汗「转进」觉醒判定：若其因「避实」防下一次致命伤害（避实防下的票数 + 实际得票
-  // 超过最高票，且自身实际得票不高于最高票，且未被守卫），则觉醒获得「西迁」。
-  // 该判定原先在投票结算链的多个分支（毛文龙超时回调、皇太极超时回调、正常流程）中逐字重复，
-  // 现统一抽取为此函数。
-  const tryAwakenLinDanHan = (session, max: number) => {
+  const linDanHanVoteAwakeningInput = (max: number) => {
     const linIndex = order.indexOf(heros[HERO.LIN_DAN_HAN])
-    if (linDanHanModule.shouldAwakenFromVote(heroState, {
+    return {
       heroActive: linIndex !== -1,
       heroPoll: linIndex === -1 ? 0 : poll[linIndex],
       preventedVotePower: heroState.linDanHan.preventedVotePower,
       maximumPoll: max,
       unvote,
       shielded: shield[heros[HERO.LIN_DAN_HAN] - 1],
-    })) {
+    }
+  }
+  // No await between locking the final guard and committing vote awakening.
+  // Vote effects have already recorded eligible attacks; do not rebuild the
+  // poll here, since Mao/Quan/Regency may have changed it in the meantime.
+  const lockGuardAndAwakenLinDanHan = (session: Session, max: number) => {
+    const yuanSeat = heros[HERO.YUAN_CHONG_HUAN]
+    if (!add_flag && order.includes(yuanSeat)) {
+      const locked = yuanChongHuanModule.lockVoteWindow(heroState, votePhaseSerial, yuanSeat)
+      if (locked?.seat !== null && locked?.seat !== undefined) {
+        shield[locked.seat - 1] = locked.effective
+        if (locked.seat === yuanSeat) recordSkill(HERO.YUAN_CHONG_HUAN, '发动“专镇”，守卫自己', [yuanSeat])
+      }
+    }
+    if (linDanHanModule.finalizeVoteAwakening(heroState, votePhaseSerial, linDanHanVoteAwakeningInput(max))) {
+      linDanHanModule.awaken(heroState)
       notifyPrivate(session, player[order.indexOf(heros[HERO.LIN_DAN_HAN])], "可汗，由于您防下了一次致命伤害，您从现在获得“西迁”。", "林丹汗觉醒通知")
       sumup += heros[HERO.LIN_DAN_HAN] + "号玩家" + player_copy[heros[HERO.LIN_DAN_HAN] - 1] + "（林丹汗）觉醒，获得“西迁”。\n"
       recordSkill(HERO.LIN_DAN_HAN, '觉醒，获得“西迁”')
-      linDanHanModule.awaken(heroState)
     }
   }
   // 林丹汗因「避实」挡下致命技能后，由模块先完成状态迁移，此处仅保留原有通知语义。
@@ -3871,12 +4574,15 @@ export function apply(ctx: Context, config: Config) {
     order: readonly ResolutionCursor[] = VOTE_RESOLUTION_TAIL,
   ) => {
     const context: VoteResolutionTailContext = { ...input, vote: liveVoteContext(input) }
+    const serial = votePhaseSerial
+    const isCurrentVote = () => !game_off && context.vote.gameEpoch === gameTimers.epoch && serial === votePhaseSerial
     return runResolutionPipeline({
       context,
       order,
       trace: traceResolution("vote-tail"),
       handlers: {
         [ResolutionCursor.DuoErGunSwap]: (current) => {
+          if (!isCurrentVote()) return endResolution()
           if (!current.skipDuoErGunSwap) {
             current.quanStr = tryDuoergunSwap(
               current.session,
@@ -3887,11 +4593,18 @@ export function apply(ctx: Context, config: Config) {
           }
           return continueResolution()
         },
+        [ResolutionCursor.LinDanHanVoteQualification]: (current) => {
+          if (!isCurrentVote()) return endResolution()
+          linDanHanModule.recordVoteAwakening(heroState, votePhaseSerial, linDanHanVoteAwakeningInput(current.max))
+          return continueResolution()
+        },
         [ResolutionCursor.LinDanHanAwaken]: (current) => {
-          tryAwakenLinDanHan(current.session, current.max)
+          if (!isCurrentVote()) return endResolution()
+          lockGuardAndAwakenLinDanHan(current.session, current.max)
           return continueResolution()
         },
         [ResolutionCursor.HuangTaiJiQuan]: (current) => {
+          if (!isCurrentVote()) return endResolution()
           if (!current.skipHuangTaiJiPrompt
             && resolveHuangTaiJi(current.session, current.max, current.max2, current.quanStr)) {
             return pauseResolution(ResolutionCursor.LinDanHanAwaken)
@@ -3899,6 +4612,7 @@ export function apply(ctx: Context, config: Config) {
           return continueResolution()
         },
         [ResolutionCursor.DuoErGunSwapAfterHuangTaiJi]: (current) => {
+          if (!isCurrentVote()) return endResolution()
           if (current.recheckDuoErGunAfterHuangTaiJi) {
             current.quanStr = tryDuoergunSwap(
               current.session,
@@ -3910,6 +4624,7 @@ export function apply(ctx: Context, config: Config) {
           return continueResolution()
         },
         [ResolutionCursor.FinalizeVote]: async (current) => {
+          if (!isCurrentVote()) return endResolution()
           return resolveFinalVote({
             session: current.session,
             maximum: current.max,
@@ -3928,6 +4643,7 @@ export function apply(ctx: Context, config: Config) {
     gameTimers.cancel(timer_htj)
     if (completion === "timeout") pendingAction.clear("huang-tai-ji-quan")
     else pendingAction.complete("huang-tai-ji-quan")
+    if (completion === 'timeout') recordSkill(HERO.HUANG_TAI_JI, '因减票选择超时，本次不减票')
 
     const leaders = calculateVoteLeaders({ poll, activeSeats: order, playerNames: player_name })
     add_indices_0 = leaders.leaderIndices.slice()
@@ -3942,9 +4658,7 @@ export function apply(ctx: Context, config: Config) {
       skipDuoErGunSwap: true,
       skipHuangTaiJiPrompt: true,
       recheckDuoErGunAfterHuangTaiJi,
-    }, recheckDuoErGunAfterHuangTaiJi
-      ? VOTE_RESOLUTION_TAIL_AFTER_HUANG_TAI_JI
-      : VOTE_RESOLUTION_TAIL)
+    }, VOTE_RESOLUTION_TAIL_AFTER_HUANG_TAI_JI)
   }
   interface MaoWenLongLateVoteContext {
     session: Session
@@ -3964,6 +4678,7 @@ export function apply(ctx: Context, config: Config) {
     if (targetSeat !== null) {
       const targetIndex = order.indexOf(targetSeat)
       poll[targetIndex] += vote_num[maoSeat - 1]
+      anonymousVoteContributions.set(targetSeat, (anonymousVoteContributions.get(targetSeat) ?? 0) + vote_num[maoSeat - 1])
       sumup += maoSeat + "号玩家" + player_copy[maoSeat - 1] + "（毛文龙）使"
         + targetSeat + "号玩家" + player_name[targetIndex] + "得票数加" + vote_num[maoSeat - 1] + "。\n"
     }
@@ -4022,6 +4737,110 @@ export function apply(ctx: Context, config: Config) {
       notifyGroup(context.session, "毛文龙技能发动超时，自动取消。", "毛文龙技能超时群通知", maoGuildId)
     }, timeout)
   }
+  var timer_zhu_you_xiao_heir
+  const nativeLimitedSkillName = (heroId: number): string => heroId === HERO.WEI_ZHONG_XIAN
+    ? "诬诽" : heroId === HERO.YUAN_CHONG_HUAN ? "专镇" : "处决"
+  const zhuYouXiaoResetDescription = (heroId: number): string => {
+    switch (heroId) {
+      case HERO.ZHANG_XIAN_ZHONG: return "恢复殒阵的待发动状态。"
+      case HERO.LI_ZI_CHENG: return "清除本轮流兵待结算状态。"
+      case HERO.ZHU_YOU_JIAN: return "处决恢复为未使用；已有额外处决次数保留。"
+      case HERO.WU_SAN_GUI: return "权计次数、援寡限制和自立状态恢复初始；若正在等待权计选择，当前选择继续有效。"
+      case HERO.HUANG_TAI_JI: return "清除集权当前记录的投票对象。"
+      case HERO.YUAN_CHONG_HUAN: return "清除守卫、反噬和上一轮守卫记录，恢复专镇为未使用；已有额外专镇次数保留。"
+      case HERO.LIN_DAN_HAN: return "恢复未觉醒状态，并按当前在场玩家重建避实记录。"
+      case HERO.SHI_KE_FA: return "恢复抵诽，清除抵诽发动记录；已经赠出的伐不返还。"
+      case HERO.WEI_ZHONG_XIAN: return "恢复诬诽为未使用，清除攻击、被攻击、历史伐异和缉访记录；已经获得的伐保留。"
+      case HERO.MAO_WEN_LONG: return "清除塘报待处理状态。"
+      case HERO.DUO_ER_GUN: return "清除定策发动次数和摄政状态；已有定策标记保留。"
+      default: return "恢复该武将的原生技能状态。"
+    }
+  }
+  const revealZhuYouXiaoDelegates = (session: Session) => {
+    const lines: string[] = []
+    for (const seat of zhuYouXiaoSuccessfulDelegates(zhuYouXiaoVotes)) {
+      const heroIndex = heros.indexOf(seat)
+      if (heroIndex === -1 || isEmpty(player_copy[seat - 1])) continue
+      const activeIndex = order.indexOf(seat)
+      const currentName = activeIndex === -1 ? player_copy[seat - 1] : player_name[activeIndex]
+      if (publicHeroReveals.isRevealed(seat)) {
+        lines.push(seat + "号玩家" + currentName + "（" + hero_name[heroIndex] + "）")
+      }
+      else {
+        const first = publicHeroReveals.reveal(seat)
+        if (first) capture(r => r.event(seat, { kind: 'hero-reveal', heroId: heroIndex }))
+        lines.push(seat + "号玩家" + currentName + "亮出武将牌：" + hero_name[heroIndex])
+      }
+    }
+    if (!lines.length) return
+    const text = "朱由校的所有放权对象亮出武将牌：\n" + lines.join("\n")
+    sumup += text + "\n"
+    notifyGroup(session, text, "朱由校放权对象亮将通知")
+  }
+  const beginZhuYouXiaoHeirTarget = (session: Session, outplayer: number) => {
+    const ownerUserId = player_id_copy[outplayer - 1]
+    if (!ownerUserId) return
+    zhuYouXiaoHeirOwnerSeat = outplayer
+    zhuYouXiaoHeirTargetSeat = null
+    pendingAction.clear("zhu-you-xiao-heir-target")
+    pendingAction.clear("zhu-you-xiao-heir-choice")
+    pendingAction.open({
+      kind: "zhu-you-xiao-heir-target",
+      ownerSeat: outplayer,
+      ownerUserId,
+      channel: { scope: "private" },
+      blocksRosterChanges: false,
+      gameEpoch: gameTimers.epoch,
+      timeoutMs: null,
+      resumeAt: ResolutionCursor.PostElimination,
+    })
+    sendRecoverablePrivatePrompt(session, {
+      kind: "zhu-you-xiao-heir-target",
+      userId: ownerUserId,
+      content: "您已因出局触发“传弟”。请选择一名当前在场玩家，将其设为传弟对象（私聊发送玩家序号、“传弟+序号”或“传+序号”；发送“弃”放弃）。当前在场玩家：" + order.join("、") + "。",
+    })
+  }
+  const beginZhuYouXiaoHeirChoice = (session: Session, targetSeat: number) => {
+    const targetIndex = order.indexOf(targetSeat)
+    if (targetIndex === -1) return
+    const heroIndex = heros.indexOf(targetSeat)
+    const options = zhuYouXiaoHeirOptions(heroIndex === -1 ? null : heroIndex)
+    const optionText = options.map((option, index) => {
+      if (option === ZhuYouXiaoHeirOption.Reset) return (index + 1) + ".所有技能恢复为游戏初始状态（已有的标记不清空）"
+      if (option === ZhuYouXiaoHeirOption.GrantLimited) return (index + 1) + ".增加一次已有的限定技可发动次数（当前为“" + nativeLimitedSkillName(heroIndex) + "”）"
+      return (index + 1) + ".获得技能“处决”"
+    }).join("\n")
+    const userId = player[targetIndex]
+    pendingAction.clear("zhu-you-xiao-heir-choice")
+    pendingAction.open({
+      kind: "zhu-you-xiao-heir-choice",
+      ownerSeat: targetSeat,
+      ownerUserId: userId,
+      channel: { scope: "private" },
+      blocksRosterChanges: false,
+      gameEpoch: gameTimers.epoch,
+      timeoutMs: timeout,
+      resumeAt: ResolutionCursor.PostElimination,
+    })
+    sendRecoverablePrivatePrompt(session, {
+      kind: "zhu-you-xiao-heir-choice",
+      userId,
+      content: "朱由校选择了您作为“传弟”对象，请选择一项（私聊发送序号；发送“弃”放弃接受）：\n" + optionText,
+    })
+    gameTimers.cancel(timer_zhu_you_xiao_heir)
+    timer_zhu_you_xiao_heir = setGameTimeout(() => {
+      if (!pendingAction.matches("zhu-you-xiao-heir-choice", {
+        userId,
+        scope: "private",
+        gameEpoch: gameTimers.epoch,
+      })) return
+      pendingAction.clear("zhu-you-xiao-heir-choice")
+      recoverablePendingPrompts.delete("zhu-you-xiao-heir-choice")
+      recordSkill(HERO.ZHU_YOU_XIAO, '传弟选择超时，放弃接受', [targetSeat])
+      zhuYouXiaoHeirTargetSeat = null
+      notifyPrivate(session, userId, "传弟选择超时，已放弃接受。", "朱由校传弟超时通知")
+    }, timeout)
+  }
   const promptZhangXianZhongTarget = (session: Session, outplayer: number) => {
     const content = "技能触发，请" + player_copy[outplayer - 1] + h('at', { id: player_id_copy[outplayer - 1] }) + "选择带出局的玩家。（在群里发送玩家序号，或发送“弃”放弃发动技能）"
     rememberPendingPrompt({
@@ -4063,6 +4882,7 @@ export function apply(ctx: Context, config: Config) {
     timer_zxz = setGameTimeout(async () => {
       zhangXianZhongModule.finishTargetSelection(heroState)
       const action = pendingAction.clear("zhang-xian-zhong-target")
+      recordSkill(HERO.ZHANG_XIAN_ZHONG, '因带人选择超时，放弃发动技能')
       sumup += player_copy[zhangSeat - 1] + "（张献忠）放弃发动技能。\n"
       if (action?.resumeAt === ResolutionCursor.NextRound) {
         await resumeZhangXianZhongAtNextRound(session)
@@ -4192,8 +5012,180 @@ export function apply(ctx: Context, config: Config) {
   const currentVoteData = () => add_flag
     ? { voterIds: add_voter, ballots: add_vote[round - 1] }
     : { voterIds: player, ballots: vote[round - 1] }
+  const weiZhongXianSeat = () => heros[HERO.WEI_ZHONG_XIAN]
+  const factionOfSeat = (seat: number): "undercover" | "white" | "good" =>
+    uc_copy.includes(seat) ? "undercover" : seat === white_copy ? "white" : "good"
+  const weiActualDifferent = (firstSeat: number, secondSeat: number): boolean =>
+    factionOfSeat(firstSeat) !== factionOfSeat(secondSeat)
+  const weiFactionOverride = (firstSeat: number, secondSeat: number, actualDifferent: boolean): boolean => {
+    const weiSeat = weiZhongXianSeat()
+    if (firstSeat === weiSeat && order.includes(secondSeat)) {
+      return weiZhongXianModule.considersDifferent(heroState, secondSeat, actualDifferent)
+    }
+    if (secondSeat === weiSeat && order.includes(firstSeat)) {
+      return weiZhongXianModule.considersDifferent(heroState, firstSeat, actualDifferent)
+    }
+    return actualDifferent
+  }
+  const weiSameFaction = (firstSeat: number, secondSeat: number): boolean =>
+    !weiFactionOverride(firstSeat, secondSeat, weiActualDifferent(firstSeat, secondSeat))
+  const weiDifferentFaction = (firstSeat: number, secondSeat: number): boolean =>
+    !weiSameFaction(firstSeat, secondSeat)
+  const weiCurrentBallotTarget = (): number | null => {
+    const weiSeat = weiZhongXianSeat()
+    const index = order.indexOf(weiSeat)
+    if (index === -1) return null
+    const { voterIds, ballots } = currentVoteData()
+    const voterId = player[index]
+    const ballotIndex = voterIds.indexOf(voterId)
+    const ballot = ballotIndex === -1 ? undefined : ballots[ballotIndex]
+    return typeof ballot === "number" && order.includes(ballot) ? ballot : null
+  }
+  const weiCanVoteCurrentPhase = (): boolean => {
+    const weiSeat = weiZhongXianSeat()
+    const index = order.indexOf(weiSeat)
+    if (voteFactStage === 'counting') return frozenVoteFacts.some(entry => entry.voterSeat === weiSeat && entry.status !== 'skip')
+    if (index === -1 || vote_num[weiSeat - 1] === 0) return false
+    const voterIds = add_flag ? add_voter : player
+    return voterIds.includes(player[index]) && getVotableTargets(weiSeat).length > 0
+  }
+  const warnWeiInquiryConflict = (session: Session, targetSeat: number): void => {
+    const weiSeat = weiZhongXianSeat()
+    const choice = heroState.weiZhongXian.inquiry
+    if (!choice || choice.kind !== "voted-by" || choice.targetSeat !== targetSeat) return
+    const index = order.indexOf(weiSeat)
+    if (index === -1) return
+    notifyPrivate(
+      session,
+      player[index],
+      `你当前投给了${targetSeat}号玩家；若保持当前投票，缉访选项2将在结算时失效。你可以重新发送“缉访1/缉1/访1/查1”或“缉访2+座位号”修改选择。`,
+      "魏忠贤缉访失效预警",
+    )
+  }
+  const weiInquiryTargetStatus = (entry: Pick<VoteFact, 'targetSeat' | 'status' | 'invalidReasons'>): string => {
+    const target = entry.targetSeat === null ? "未投有效票" : `投给${entry.targetSeat}号玩家${player_copy[entry.targetSeat - 1] ?? ''}`
+    if (entry.status === "abstain") return "弃票"
+    if (entry.status === "timeout") return "未及时投票"
+    if (entry.status === "skip") return "跳过投票阶段"
+    if (entry.status === "locked") return "无需投票"
+    return target + (entry.invalidReasons?.length ? '（此票失效）' : '')
+  }
+  const weiInquirySeatStatus = (seat: number, entries: VoteFact[]): string => {
+    const entry = entries.find(item => item.voterSeat === seat)
+    if (entry) return weiInquiryTargetStatus(entry)
+    const seatIndex = order.indexOf(seat)
+    if (seatIndex === -1) return "当前已离场，未参与本次投票"
+    const voterIds = add_flag ? add_voter : player
+    const voterId = player[seatIndex]
+    if (!voterIds.includes(voterId) || vote_num[seat - 1] === 0 || seat === heros[HERO.MAO_WEN_LONG]) {
+      return "跳过投票阶段"
+    }
+    return "未记录有效投票"
+  }
+  const resolveWeiInquiry = (session: Session, entries: VoteFact[]) => {
+    const wei = heroState.weiZhongXian
+    const choice = wei.inquiry
+    const weiSeat = weiZhongXianSeat()
+    if (!choice) return
+    let content = ""
+    let historyContent = ""
+    if (choice.kind === "vote-target") {
+      const targetSeat = entries.find(entry => entry.voterSeat === weiSeat)?.targetSeat ?? null
+      if (targetSeat === null) content = "本次投票没有有效的投票对象，缉访无结果。"
+      else {
+        content = `${targetSeat}号玩家${player_copy[targetSeat - 1] ?? player_name[order.indexOf(targetSeat)]}本次${weiInquirySeatStatus(targetSeat, entries)}。`
+      }
+    }
+    else if (choice.kind === "voted-by") {
+      const target = choice.targetSeat
+      const currentTarget = weiCurrentBallotTarget()
+      if (currentTarget === target) {
+        content = `你本次最终投给了${target}号玩家，缉访选项2已失效。`
+      }
+      else {
+        const voters = entries.filter(entry => entry.targetSeat === target)
+          .map(entry => `${entry.voterSeat}号玩家${player_copy[entry.voterSeat - 1] ?? player_name[order.indexOf(entry.voterSeat)]}${weiInquiryTargetStatus(entry)}${entry.weight ? `（${entry.weight}票）` : ""}`)
+        const total = poll[order.indexOf(target)] ?? 0
+        const anonymous = anonymousVoteContributions.get(target) ?? 0
+        const targetName = `${target}号玩家${player_copy[target - 1] ?? player_name[order.indexOf(target)]}`
+        const result = `本次获得${total}票。`
+          + (voters.length ? `\n投票情况：\n${voters.join("\n")}。` : anonymous ? '' : "没有玩家投向该座位。")
+          + (anonymous ? `\n有${anonymous}票无来源。` : '')
+        content = (target === weiSeat ? '你' : targetName) + result
+        historyContent = targetName + result
+      }
+    }
+    if (content) {
+      const index = order.indexOf(weiSeat)
+      if (index !== -1) notifyPrivate(session, player[index], content, "魏忠贤缉访结果")
+      const target = choice.kind === 'voted-by' ? choice.targetSeat : entries.find(entry => entry.voterSeat === weiSeat)?.targetSeat
+      recordSkill(HERO.WEI_ZHONG_XIAN, `通过“缉访”${choice.kind === 'vote-target' ? '查看所投玩家的投票情况' : '查看目标的被投票情况'}，获知：${(historyContent || content).replace(/\n/g, '；')}`,
+        target == null ? [] : [target])
+      sumup += `${weiSeat}号玩家${player_copy[weiSeat - 1]}通过“缉访”获知：${historyContent || content}\n`
+    }
+    weiZhongXianModule.clearInquiry(heroState.weiZhongXian)
+  }
+  const awardWeiZhongXianCandidate = (
+    session: Session,
+    candidate: typeof heroState.weiZhongXian.candidates[number],
+    source: WeiZhongXianRewardSource = 'normal',
+  ) => {
+    const weiSeat = weiZhongXianSeat()
+    if (order.indexOf(weiSeat) === -1) return
+    const actualDifferent = weiActualDifferent(weiSeat, candidate.targetSeat)
+    const effectiveDifferent = weiZhongXianModule.considersDifferent(
+      heroState,
+      candidate.targetSeat,
+      actualDifferent,
+    )
+    if (!claimWeiZhongXianReward(candidate, effectiveDifferent, source)) return
+    fa[weiSeat - 1] += 1
+    const index = order.indexOf(weiSeat)
+    if (source === 'normal' && index !== -1) notifyPrivate(session, player[index], `伐异生效：你投票的${candidate.targetSeat}号玩家出局，且与你非同阵营；你获得1个“伐”标记。`, "魏忠贤伐异通知")
+    sumup += `${weiSeat}号玩家${player_copy[weiSeat - 1]}（魏忠贤）获得1个“伐”标记。\n`
+    const rewardEffect = source === 'normal'
+      ? `因所投的${candidate.targetSeat}号玩家${player_copy[candidate.targetSeat - 1]}在下轮开始前出局，且与其非同阵营，发动“伐异”，获得1个“伐”标记`
+      : `因发动“诬诽”，与第${candidate.phaseSerial}次投票所投的${candidate.targetSeat}号玩家${player_copy[candidate.targetSeat - 1]}视为非同阵营，追补“伐异”，获得1个“伐”标记`
+    recordSkill(HERO.WEI_ZHONG_XIAN, rewardEffect, [candidate.targetSeat],
+      { kind: 'wei-fa', phaseSerial: candidate.phaseSerial, targetSeat: candidate.targetSeat, gainedFa: 1, source })
+  }
+  const settleWeiZhongXianCandidates = (session: Session) => {
+    for (const candidate of heroState.weiZhongXian.candidates) {
+      if (candidate.settled) continue
+      candidate.settled = true
+      candidate.targetExitedBeforeNextRound ||= !order.includes(candidate.targetSeat)
+      if (candidate.targetExitedBeforeNextRound) awardWeiZhongXianCandidate(session, candidate)
+    }
+  }
+  const retroactivelyAwardWeiZhongXianCandidates = (session: Session, newlyDifferentSeats: readonly number[]): Array<{ phaseSerial: number; targetSeat: number }> => {
+    const weiSeat = weiZhongXianSeat()
+    if (order.indexOf(weiSeat) === -1) return []
+    const awarded: Array<{ phaseSerial: number; targetSeat: number }> = []
+    for (const candidate of heroState.weiZhongXian.candidates) {
+      if (!candidate.phaseCompleted || !candidate.targetExitedBeforeNextRound || hasWeiZhongXianReward(candidate)
+        || candidate.phaseSerial === heroState.weiZhongXian.phaseSerial && !candidate.settled
+        || !newlyDifferentSeats.includes(candidate.targetSeat)) continue
+      // The pre-activation relation was same-faction; only this activation's
+      // newly changed relations can fill a missing reward on an old vote.
+      candidate.blockedByFaction = true
+      awardWeiZhongXianCandidate(session, candidate, 'slander')
+      if (candidate.retroactiveAwarded) awarded.push({ phaseSerial: candidate.phaseSerial, targetSeat: candidate.targetSeat })
+    }
+    return awarded
+  }
   // 名单变化后不再依靠局部加减 poll，而是以保留下来的原始选票重新演算票池及武将派生状态。
   // 这样既能只作废真正失效的票，也不会遗留林丹汗互投/避实、史可法队友票或皇太极目标。
+  let currentBallotEffects: BallotEffect[] = []
+  const captureCurrentVoteFacts = (closed: boolean) => {
+    const { voterIds, ballots } = currentVoteData()
+    const delegation = zhuYouXiaoVotes.current
+    return captureVoteFacts({ voterIds, ballots, playerIds: player, seats: order, names: player_name,
+      weights: vote_num, maoSeat: heros[HERO.MAO_WEN_LONG], closed, effects: currentBallotEffects,
+      lockedSeats: new Set(order.filter(seat => lockedVoteSeats.has(votePhaseKey(seat)))),
+      delegation: delegation?.serial === votePhaseSerial && delegation.ownerSeat !== null && delegation.successfulDelegateSeat !== null
+        ? { owner: delegation.ownerSeat, decider: delegation.successfulDelegateSeat } : undefined,
+    })
+  }
   const rebuildPollFromBallots = () => {
     const { voterIds, ballots } = currentVoteData()
     const rebuilt = rebuildVoteState({
@@ -4215,7 +5207,13 @@ export function apply(ctx: Context, config: Config) {
         realityRecords: linDanHanModule.realityRecords(heroState),
       },
       huangTaiJiRegularTarget: huangTaiJiModule.trackedVoteTarget(heroState) ?? 0,
+      isSameFaction: weiSameFaction,
+      zhuYouXiao: zhuYouXiaoVotes.current?.serial === votePhaseSerial
+        && zhuYouXiaoVotes.current.ownerSeat !== null
+        ? { ownerSeat: zhuYouXiaoVotes.current.ownerSeat, delegateSeat: zhuYouXiaoVotes.current.delegateSeat }
+        : undefined,
     })
+    currentBallotEffects = rebuilt.ballotEffects
     poll = rebuilt.poll
     waiver = rebuilt.waiver
     unvote = rebuilt.unvote
@@ -4229,6 +5227,20 @@ export function apply(ctx: Context, config: Config) {
     shiKeFaModule.replaceTeammateAttackers(heroState, rebuilt.shiKeFaTeammateAttackers)
     huangTaiJiModule.replaceTrackedVoteTarget(heroState, rebuilt.huangTaiJiRegularTarget)
   }
+  const delegationOwnBallotText = (seat: number, ownerSeat: number, revoked = false): string => {
+    const effect = currentBallotEffects.find(ballot => ballot.voterSeat === seat && ballot.targetSeat === ownerSeat)
+    if (!effect) return ''
+    if (!revoked) return '\n你当前投给朱由校的自有票已记录，但将因本次放权关系失效。'
+    return effect.invalidReasons.length
+      ? '\n你投给朱由校的自有票仍保留，无需重投；不再受放权影响，但仍因其他技能失效。'
+      : '\n你投给朱由校的自有票仍保留，无需重投，已恢复有效。'
+  }
+  const delegationPrompt = (delegateSeat: number, ownerSeat: number, reselected = false): string =>
+    `${ownerSeat}号玩家${player_copy[ownerSeat - 1]}（朱由校）放权给你，请发送“代投+序号/代+序号”或“代弃”。`
+      + (reselected ? '\n原代投票已作废，请重新代投。' : '')
+      + '\n你的自有票与代投分别记录，自有票投给朱由校时会失效。'
+      + (fa[ownerSeat - 1] > 0 ? `\n可用${fa[ownerSeat - 1]}个“伐”，发送“代伐N”使用。` : '')
+      + delegationOwnBallotText(delegateSeat, ownerSeat)
   const applyShiKeFaResistance = (session: Session) => {
     const { voterIds, ballots } = currentVoteData()
     const shiSeat = heros[HERO.SHI_KE_FA]
@@ -4243,6 +5255,7 @@ export function apply(ctx: Context, config: Config) {
       undercoverSeats: uc,
       whiteSeat: white,
       shiKeFaSeat: shiSeat,
+      isSameFaction: weiSameFaction,
     })
     if (shiIndex === -1) return
     if (result.pollAdjustment !== 0) poll[shiIndex] += result.pollAdjustment
@@ -4385,6 +5398,13 @@ export function apply(ctx: Context, config: Config) {
         }
       }
     }
+    for (const effect of currentBallotEffects) {
+      if (!effect.invalidReasons.includes('zhu-you-xiao-delegation')) continue
+      sumup += `${effect.voterSeat}号玩家${player_copy[effect.voterSeat - 1]}投给${effect.targetSeat}号玩家${player_copy[effect.targetSeat - 1]}的自有票因“放权”失效。\n`
+      if (effect.voterSeat === heros[HERO.LI_ZI_CHENG]) liZiChengModule.recordBallotOutcome(heroState, {
+        ballot: effect.targetSeat, invalidatedByLinDanHan: false, invalidatedByDelegation: true,
+      })
+    }
     liZiChengModule.recordBallotOutcome(heroState, {
       ballot: vote[round - 1][order.indexOf(heros[HERO.LI_ZI_CHENG])],
       invalidatedByLinDanHan: false,
@@ -4411,6 +5431,8 @@ export function apply(ctx: Context, config: Config) {
       handlers: {
         [ResolutionCursor.RebuildBallots]: () => {
           rebuildPollFromBallots()
+          frozenVoteFacts = captureCurrentVoteFacts(true)
+          voteFactStage = 'counting'
           return continueResolution()
         },
         [ResolutionCursor.ApplyShiKeFaResistance]: ({ session: currentSession }) => {
@@ -4490,6 +5512,9 @@ export function apply(ctx: Context, config: Config) {
         whiteSeat: white,
       },
       duoErGunStrategyMark: duoErGunModule.strategyMark(heroState),
+      isSameFaction: weiSameFaction,
+      zhuYouXiao: zhuYouXiaoVotes.current?.ownerSeat == null ? undefined
+        : { ownerSeat: zhuYouXiaoVotes.current.ownerSeat, ballotEffects: currentBallotEffects },
     })
   }
   const reconcileVoteAfterRosterChange = async (session, notice: string, snapshot: VoteRosterSnapshot) => {
@@ -4505,7 +5530,10 @@ export function apply(ctx: Context, config: Config) {
     })
     const ballots = retained.ballots
     for (const voterId of retained.autoWaivedVoterIds) {
-      notifyPrivate(session, voterId, "玩家变动后你已没有可投票的对象，已为你自动弃票。", "名单变化自动弃票通知")
+      const ownerIndex = player.indexOf(voterId)
+      const ownerSeat = ownerIndex === -1 ? null : order[ownerIndex]
+      const reporter = ownerSeat === null ? null : zhuYouXiaoAutoVoteReporter(ownerSeat, add_flag)
+      notifyPrivate(session, reporter?.userId ?? voterId, "玩家变动后你已没有可投票的对象，已为你自动弃票。", "名单变化自动弃票通知")
     }
     if (add_flag) {
       add_voter = voterIds
@@ -4523,9 +5551,10 @@ export function apply(ctx: Context, config: Config) {
         const playerIndex = player.indexOf(voterIds[i])
         const voterOrder = order[playerIndex]
         if (isEmpty(ballots[i]) && vote_num[voterOrder - 1] !== 0) {
+          const reporter = zhuYouXiaoAutoVoteReporter(voterOrder, add_flag)
           ballots[i] = -1
           lockedVoteSeats.add(votePhaseKey(voterOrder))
-          notifyPrivate(session, voterIds[i], "名单调整后票数已足以确定结果，无需你再进行投票。", "名单变化无需投票通知")
+          notifyPrivate(session, reporter.userId, "名单调整后票数已足以确定结果，无需你再进行投票。", "名单变化无需投票通知")
         }
       }
     }
@@ -4544,7 +5573,8 @@ export function apply(ctx: Context, config: Config) {
       const targets = getVotableTargets(voterOrder)
       const canVote = targets.map(targetOrder => targetOrder + "号" + player_copy[targetOrder - 1]).join("，")
       const prefix = retained.invalidatedVoterIds.has(voterIds[i]) ? "你原先投票的对象已不在有效候选中。" : "玩家名单刚刚发生变化。"
-      notifyPrivate(session, voterIds[i], prefix + "当前可投票的玩家为：" + canVote + "。请继续投票。", "名单变化投票对象通知")
+      const reporter = zhuYouXiaoVoteReporter(voterOrder, add_flag)
+      notifyPrivate(session, reporter.userId, prefix + "当前可投票的玩家为：" + canVote + "。请继续投票。", "名单变化投票对象通知")
     }
   }
   const currentVoteSettlementKey = () => `${gameTimers.epoch}:${round}:${add_flag ? "overtime" : "regular"}`
@@ -4568,74 +5598,77 @@ export function apply(ctx: Context, config: Config) {
     if (game_off || vote_off) return
     if (voteSettlement.isRunning(currentVoteSettlementKey())) return
     const guildId = gameRoute.guildId
-    let drag = 0
-    let novote = "目前，还有"
+    const reporters = outstandingVoteReporters()
+    const drag = reporters.length
+    let novote = "目前，还有" + reporters.map(reporter => reporter.seat + '号玩家' + reporter.name).join('，')
+      + "共" + drag + "位玩家未投票，"
     if (add_flag) {
       for (let i = 0; i < add_voter.length; i++) {
         let d = player.indexOf(add_voter[i])
         if (isEmpty(add_vote[round - 1][i]) && vote_num[order[d] - 1] !== 0 && order[d] !== heros[HERO.MAO_WEN_LONG]) {
-          drag += 1
-          novote += order[d] + "号玩家" + player_name[d] + "，"
-        }
-      }
-    }
-    else {
-      for (let i = 0; i < player.length; i++) {
-        if (isEmpty(vote[round - 1][i]) && vote_num[order[i] - 1] !== 0 && order[i] !== heros[HERO.MAO_WEN_LONG]) {
-          drag += 1
-          novote += order[i] + "号玩家" + player_name[i] + "，"
-        }
-      }
-    }
-    novote = novote.slice(0, -1)
-    novote += "共" + drag + "位玩家未投票，"
-    if (add_flag) {
-      for (let i = 0; i < add_voter.length; i++) {
-        let d = player.indexOf(add_voter[i])
-        if (isEmpty(add_vote[round - 1][i]) && vote_num[order[d] - 1] !== 0 && order[d] !== heros[HERO.MAO_WEN_LONG]) {
+          const reporter = zhuYouXiaoAutoVoteReporter(order[d], true)
           add_vote[round - 1][i] = -1
-          notifyPrivate(session, add_voter[i], "你投票太慢啦，投票阶段已经结束啦~", "加时投票超时通知")
         }
       }
     }
     else {
       for (let i = 0; i < player.length; i++) {
         if (isEmpty(vote[round - 1][i]) && vote_num[order[i] - 1] !== 0 && order[i] !== heros[HERO.MAO_WEN_LONG]) {
+          const reporter = zhuYouXiaoAutoVoteReporter(order[i], false)
           vote[round - 1][i] = -1
-          notifyPrivate(session, player[i], "你投票太慢啦，投票阶段已经结束啦~", "投票超时通知")
         }
       }
     }
+    for (const reporter of reporters) notifyPrivate(session, reporter.userId,
+      pendingSkillsFor(reporter.userId).length
+        ? '投票阶段已经结束啦~\n你的待选技能仍按原期限处理，可发送“我的待处理”查看；本次投票不会重开。'
+        : '你投票太慢啦，投票阶段已经结束啦~',
+      '投票超时通知')
     novote += "不等他" + (drag === 1 ? "" : "们") + "投票了，本次投票阶段结束。"
     await timeout_vote(session)
     notifyGroup(session, novote, "投票超时群通知", guildId)
   }
+  function outstandingVoteReporters() {
+    const reports = new Map<string, ReturnType<typeof zhuYouXiaoVoteReporter>>()
+    const ids = add_flag ? add_voter : player
+    const ballots = add_flag ? add_vote[round - 1] : vote[round - 1]
+    for (let index = 0; index < ids.length; index++) {
+      const activeIndex = player.indexOf(ids[index])
+      if (activeIndex < 0) continue
+      const seat = order[activeIndex]
+      if (!isEmpty(ballots?.[index]) || vote_num[seat - 1] === 0 || seat === heros[HERO.MAO_WEN_LONG]) continue
+      const reporter = zhuYouXiaoVoteReporter(seat, add_flag)
+      reports.set(reporter.userId, reporter)
+    }
+    return [...reports.values()]
+  }
+  function privateVoteObligations(userId: string): string[] {
+    const ids = add_flag ? add_voter : player
+    const ballots = add_flag ? add_vote[round - 1] : vote[round - 1]
+    return ids.flatMap((id, index) => {
+      const seat = order[player.indexOf(id)]
+      if (isEmpty(seat) || seat === heros[HERO.MAO_WEN_LONG] || vote_num[seat - 1] === 0
+        || !isEmpty(ballots?.[index]) || zhuYouXiaoVoteReporter(seat, add_flag).userId !== userId) return []
+      return id === userId ? []
+        : [`你代${seat}号玩家${player_copy[seat - 1]}进行的投票尚未完成，请发送“代投+序号”或“代弃”。`]
+    })
+  }
+  const privateVoteReminderDetails = (userId: string): string[] => {
+    const details = privateVoteObligations(userId)
+    const actions = pendingSkillsFor(userId)
+    if (actions.length) details.push('请先完成' + actions.map(action => '“' + pendingActionNames[action.kind] + '”').join('、')
+      + '技能选择，再投票；可私聊发送“我的待处理”查看。')
+    return details
+  }
   const hurry_vote = (session) => {
     if (game_off || vote_off) return
-    let drag = 0
-    let novote = "目前，还有"
-    if (add_flag) {
-      for (let i = 0; i < add_voter.length; i++) {
-        let d = player.indexOf(add_voter[i])
-        if (isEmpty(add_vote[round - 1][i]) && vote_num[order[d] - 1] !== 0 && order[d] !== heros[HERO.MAO_WEN_LONG]) {
-          drag += 1
-          novote += order[d] + "号玩家" + player_name[d] + "，"
-          if (notifications.voteHurryPrivate) notifyPrivate(session, player[d], "投票开始已经过去" + formatConfiguredDuration(config.hurryTimeout) + "了，赶快投票哦~\n（tip：如果你有技能可以发动，最好先发动技能再投票）", "加时催票私聊")
-        }
-      }
-    }
-    else {
-      for (let i = 0; i < player.length; i++) {
-        if (isEmpty(vote[round - 1][i]) && vote_num[order[i] - 1] !== 0 && order[i] !== heros[HERO.MAO_WEN_LONG]) {
-          drag += 1
-          novote += order[i] + "号玩家" + player_name[i] + "，"
-          if (notifications.voteHurryPrivate) notifyPrivate(session, player[i], "投票开始已经过去" + formatConfiguredDuration(config.hurryTimeout) + "了，赶快投票哦~\n（tip：如果你有技能可以发动，最好先发动技能再投票）", "催票私聊")
-        }
-      }
-    }
-    novote = novote.slice(0, -1)
-    novote += "共" + drag + "位玩家未投票，已经催了~"
-    if (drag > 0 && notifications.voteHurryGroup) notifyGroup(session, novote, "催票群通知")
+    const reporters = outstandingVoteReporters()
+    for (const reporter of reporters) if (notifications.voteHurryPrivate) notifyPrivate(session, reporter.userId,
+      ['投票开始已经过去' + formatConfiguredDuration(config.hurryTimeout) + '了，赶快投票哦~',
+        ...privateVoteReminderDetails(reporter.userId)].join('\n'), '催票私聊')
+    if (reporters.length && notifications.voteHurryGroup) notifyGroup(session,
+      '目前，还有' + reporters.map(reporter => reporter.seat + '号玩家' + reporter.name).join('，')
+        + '共' + reporters.length + '位玩家未投票，已经催了~', '催票群通知')
   }
   const turtleAnnouncementText = (seat: number): string => {
     const turn = modeInteraction.turtleTurnForSeat(seat)
@@ -4655,15 +5688,166 @@ export function apply(ctx: Context, config: Config) {
     const minutes = seconds / 60
     return Number.isInteger(minutes) ? `${minutes}分钟` : `${seconds}秒`
   }
+  const zhuYouXiaoCurrentOwner = (): number | null => {
+    const current = zhuYouXiaoVotes.current
+    if (!current || current.serial !== votePhaseSerial) return null
+    if (current.ownerSeat === null || !order.includes(current.ownerSeat)) return null
+    return current.ownerSeat
+  }
+  const zhuYouXiaoBallotLocation = (seat: number, overtime: boolean): { ballots: number[], index: number } | null => {
+    const activeIndex = order.indexOf(seat)
+    if (activeIndex === -1) return null
+    const userId = player[activeIndex]
+    const index = overtime ? add_voter.indexOf(userId) : activeIndex
+    const ballots = overtime ? add_vote[round - 1] : vote[round - 1]
+    if (!ballots || index < 0 || index >= ballots.length) return null
+    return { ballots, index }
+  }
+  const zhuYouXiaoVoteReporter = (ownerSeat: number, overtime: boolean): { seat: number, userId: string, name: string } => {
+    const ownerIndex = order.indexOf(ownerSeat)
+    const current = zhuYouXiaoVotes.current
+    const location = zhuYouXiaoBallotLocation(ownerSeat, overtime)
+    if (ownerIndex !== -1 && current?.serial === votePhaseSerial
+      && current.ownerSeat === ownerSeat && current.delegateSeat !== null
+      && order.includes(current.delegateSeat) && location && isEmpty(location.ballots[location.index])) {
+      const delegateIndex = order.indexOf(current.delegateSeat)
+      return { seat: current.delegateSeat, userId: player[delegateIndex], name: player_name[delegateIndex] }
+    }
+    return { seat: ownerSeat, userId: player[ownerIndex], name: player_name[ownerIndex] }
+  }
+  const zhuYouXiaoAutoVoteReporter = (ownerSeat: number, overtime: boolean) => {
+    // Resolve the hidden recipient while the owner's logical ballot is still
+    // empty.  Once an automatic timeout/lock writes -1, the regular reporter
+    // can no longer distinguish a delegated ballot from an ordinary one.
+    const reporter = zhuYouXiaoVoteReporter(ownerSeat, overtime)
+    const current = zhuYouXiaoVotes.current
+    const location = zhuYouXiaoBallotLocation(ownerSeat, overtime)
+    if (current?.serial === votePhaseSerial
+      && current.ownerSeat === ownerSeat
+      && current.delegateSeat !== null
+      && location
+      && isEmpty(location.ballots[location.index])) {
+      recordZhuYouXiaoProxyVote(zhuYouXiaoVotes)
+    }
+    return reporter
+  }
+  const clearZhuYouXiaoBallot = (seat: number, overtime: boolean, refundFa = false, rebuild = true): void => {
+    if (refundFa) {
+      const spent = flag_fa[seat - 1] || 0
+      fa[seat - 1] += spent
+      vote_num[seat - 1] -= spent
+      flag_fa[seat - 1] = 0
+      if (spent > 0) recordSkill(HERO.ZHU_YOU_XIAO,
+        `放弃旧有投票，退还本阶段已用的${spent}个“伐”标记，并撤销对应额外票权`)
+    }
+    const location = zhuYouXiaoBallotLocation(seat, overtime)
+    if (!location) return
+    location.ballots[location.index] = undefined as unknown as number
+    lockedVoteSeats.delete(votePhaseKey(seat))
+    // Replaying the raw ballots is the single source of truth for all derived
+    // poll effects (避实、抵诽、定策、皇太极目标和弃票)。 Manual subtraction
+    // can leave one of those coupled states behind after a delegated vote is
+    // withdrawn or replaced.
+    if (rebuild) rebuildPollFromBallots()
+  }
+  const zhuYouXiaoOwnerIsEligible = (overtime: boolean): number | null => {
+    const owner = zhuYouXiaoCurrentOwner()
+    if (owner === null) return null
+    const index = order.indexOf(owner)
+    if (index === -1 || vote_num[owner - 1] === 0) return null
+    const voterIds = overtime ? add_voter : player
+    if (!voterIds.includes(player[index])) return null
+    return owner
+  }
+  const zhuYouXiaoRecordProxyBallot = async (
+    session: Session,
+    target: number | 0,
+  ): Promise<string | void> => {
+    const overtime = add_flag
+    const owner = zhuYouXiaoOwnerIsEligible(overtime)
+    const current = zhuYouXiaoVotes.current
+    if (owner === null || !current || current.delegateSeat === null) return "当前没有需要你代投的朱由校投票。"
+    const delegate = current.delegateSeat
+    if (order.indexOf(delegate) === -1) return "放权对象已离场，本次代投已失效。"
+    if (target !== 0 && !getVotableTargets(owner).includes(target)) {
+      return "无效的投票对象，请按照朱由校的可投票范围重新发送“代投+序号”或“代+序号”，也可发送“代投弃权/代投弃/代弃”。"
+    }
+    const location = zhuYouXiaoBallotLocation(owner, overtime)
+    if (!location) return "当前投票阶段已无法代投，请稍候查看结算结果。"
+    if (voteSettlement.isRunning(currentVoteSettlementKey())) {
+      return "投票正在结算，请稍候。"
+    }
+    if (location.ballots[location.index] === -1 && lockedVoteSeats.has(votePhaseKey(owner))) {
+      return "本次票数已经锁定，不能再改票。"
+    }
+    const firstBallot = isEmpty(location.ballots[location.index])
+    clearZhuYouXiaoBallot(owner, overtime)
+    if (target === 0) {
+      location.ballots[location.index] = 0
+    }
+    else {
+      location.ballots[location.index] = target
+    }
+    // Rebuild every derived vote effect from the new raw ballot.  A proxy
+    // vote can complete a Lin Dan Han mutual vote or replace an abstention,
+    // so adjusting only poll/waiver would leave hero state stale.
+    rebuildPollFromBallots()
+    recordZhuYouXiaoProxyVote(zhuYouXiaoVotes)
+    if (target > 0 && owner === weiZhongXianSeat()) warnWeiInquiryConflict(session, target)
+    if (flag_notify) notifyPrivate(session, hostid,
+      `${owner}号玩家${player_copy[owner - 1]}${firstBallot ? '' : '改票，'}${target === 0 ? '弃权' : `投给了${target}号玩家${player_copy[target - 1]}`}（由${delegate}号玩家${player_copy[delegate - 1]}代投）。`,
+      '实时代投票况通知')
+    if (firstBallot) notifySession(session, "代投已记录；在本轮结算开始前，你仍可改投。", "朱由校代投回执")
+    else notifySession(session, "已改票。", "朱由校代投改票回执")
+    await finishChangedProxyVote(session, overtime)
+  }
+  async function finishChangedProxyVote(session: Session, overtime: boolean) {
+    const voterIds = overtime ? add_voter : player
+    const ballots = overtime ? add_vote[round - 1] : vote[round - 1]
+    const status = voteResolutionStatus()
+    if (status === "locked") {
+      for (let index = 0; index < voterIds.length; index++) {
+        const activeIndex = player.indexOf(voterIds[index])
+        if (activeIndex === -1) continue
+        const seat = order[activeIndex]
+        if (!isEmpty(ballots?.[index]) || seat === heros[HERO.MAO_WEN_LONG] || vote_num[seat - 1] === 0) continue
+        const reporter = zhuYouXiaoAutoVoteReporter(seat, overtime)
+        ballots[index] = -1
+        lockedVoteSeats.add(votePhaseKey(seat))
+        notifyPrivate(session, reporter.userId, "票数已够，无需你再进行投票。", "代理代投后提前锁票通知")
+      }
+    }
+    // Reuse the ordinary timeout path to run the existing completion and
+    // resolution logic.  Proxy ballots must use the same locked-result check
+    // as ordinary ballots or a decisive final proxy vote could leave the
+    // phase waiting for an input that can no longer change the result.
+    if (status !== "pending") await timeout_vote(session)
+  }
   const prepareVoteWindowAndNotifyPlayers = (session: Session, overtime: boolean) => {
     // Use a monotonic phase identity rather than round/overtime labels.  This
     // preserves replay status if a future skill deliberately creates another
     // overtime window in the same round.
     votePhaseSerial += 1
+    voteFactStage = 'open'
+    frozenVoteFacts = []
+    anonymousVoteContributions.clear()
+    weiInquiryWindow = { epoch: gameTimers.epoch, serial: votePhaseSerial }
+    weiZhongXianModule.beginPhase(heroState, votePhaseSerial)
     if (flag_white && isEmpty(uc) && (!overtime || add_indices.some(index => order[index] === white))) white_only = true
     const voterIds = overtime ? add_voter : player
+    const zhuYouXiaoSeat = heros[HERO.ZHU_YOU_XIAO]
+    const zhuYouXiaoIndex = order.indexOf(zhuYouXiaoSeat)
+    const zhuYouXiaoCanVote = zhuYouXiaoIndex !== -1
+      && voterIds.includes(player[zhuYouXiaoIndex])
+      && vote_num[zhuYouXiaoSeat - 1] !== 0
+      && getVotableTargets(zhuYouXiaoSeat).length > 0
+    beginZhuYouXiaoVotePhase(zhuYouXiaoVotes, {
+      serial: votePhaseSerial,
+      kind: overtime ? "overtime" : "regular",
+      ownerSeat: zhuYouXiaoCanVote ? zhuYouXiaoSeat : null,
+    })
     const previousGuardTarget = !overtime && order.includes(heros[HERO.YUAN_CHONG_HUAN])
-      ? yuanChongHuanModule.beginVoteWindow(heroState)
+      ? yuanChongHuanModule.beginVoteWindow(heroState, votePhaseSerial)
       : null
     const dorgonRegency = heroState.duoErGun.regencyState
     const dorgonStrategySeat = duoErGunModule.strategySeat(heroState)
@@ -4673,10 +5857,14 @@ export function apply(ctx: Context, config: Config) {
         || ((dorgonRegency.kind === "available" || dorgonRegency.kind === "armed")
           && (dorgonStrategySeat === null || !order.includes(dorgonStrategySeat))))
 
-    for (const voterId of voterIds) {
+    const reminderIds = new Set(voterIds)
+    const weiIndex = order.indexOf(heros[HERO.WEI_ZHONG_XIAN])
+    if (weiIndex !== -1) reminderIds.add(player[weiIndex])
+    for (const voterId of reminderIds) {
       const activeIndex = player.indexOf(voterId)
       if (activeIndex === -1) continue
       const seat = order[activeIndex]
+      const mustVote = voterIds.includes(voterId)
       if (seat === heros[HERO.MAO_WEN_LONG] || vote_num[seat - 1] === 0) continue
       const targets = getVotableTargets(seat)
       if (seat === heros[HERO.LIN_DAN_HAN] && linDanHanModule.isAwakened(heroState) && targets.length === 0) {
@@ -4687,18 +5875,24 @@ export function apply(ctx: Context, config: Config) {
         notifyPrivate(session, voterId, "可汗，您已经无法再向在场玩家进行投票，已为您自动弃票。", "林丹汗自动弃票通知")
         continue
       }
-      if (!notifications.voteStartPrivate) continue
+      const pendingNotice = skillFirstNotice(voterId)
+      if (!notifications.voteStartPrivate && !pendingNotice) continue
 
-      const lines = [
+      const lines = mustVote ? [
         `第${round}轮${overtime ? "加时" : ""}投票已开始，该投票了。`,
+        ...(pendingNotice ? [pendingNotice] : []),
         "可投票对象：" + targets.map(target => `${target}号${player_copy[target - 1]}`).join("，") + "。",
         "请私聊发送目标座位号；发送“弃”或“弃权”可弃票，结算前可以改票。",
-      ]
-      if (fa[seat - 1] > 0) {
+      ] : ['本次加时你不参与投票，仍可使用缉访选项2。']
+      if (mustVote && fa[seat - 1] > 0) {
         lines.push(`你有${fa[seat - 1]}个“伐”，可先发送“伐+数字”（只发“伐”默认使用1个）增加本次票数。`)
       }
       if (!overtime && seat === heros[HERO.YUAN_CHONG_HUAN]) {
-        lines.push("你可以发送“守+座位号”指定守卫目标"
+        const uses = yuanChongHuanModule.selfGuardUses(heroState, seat)
+        const selfGuide = uses <= 0 ? '“专镇”已用尽，不能守卫自己'
+          : previousGuardTarget === seat ? '本轮不能连续守卫自己'
+          : `发送“专镇”守卫自己（剩余${uses}次）`
+        lines.push("你可以发送“守+座位号”指定守卫目标；" + selfGuide + "，发送“弃守”放弃"
           + (previousGuardTarget === null || !order.includes(previousGuardTarget)
             ? "。"
             : `；本轮不能继续守卫${previousGuardTarget}号玩家${player_copy[previousGuardTarget - 1]}。`))
@@ -4710,6 +5904,16 @@ export function apply(ctx: Context, config: Config) {
         lines.push(dorgonStrategySeat === null || !order.includes(dorgonStrategySeat)
           ? "你可以发送“立+座位号”，指定一名其他玩家获得“定策”标记保护。"
           : `你可以发送“立+座位号”，将“定策”从${dorgonStrategySeat}号${player_copy[dorgonStrategySeat - 1]}转移给另一名其他玩家。`)
+      }
+      if (!overtime && seat === zhuYouXiaoSeat && zhuYouXiaoCanVote) {
+        lines.push("你可以发送“放权+座位号”或“放+座位号”将本次投票交给一名在场玩家；发送“弃放权”或“弃放”可恢复自行投票。")
+      }
+      else if (overtime && seat === zhuYouXiaoSeat && zhuYouXiaoCanVote) {
+        lines.push("你可以发送“放权+座位号”或“放+座位号”将本次加时投票交给一名在场玩家；发送“弃放权”或“弃放”可恢复自行投票。")
+      }
+      if (seat === heros[HERO.WEI_ZHONG_XIAN]) {
+        lines.push((mustVote ? "你可以私聊发送“缉访1”（也可用“缉1/访1/查1”）查看你所投玩家的投票情况，或" : '你可以私聊')
+          + "发送“缉访2+座位号”（也可用“缉2/访2/查2”）查看该玩家的被投票情况；票数公开前均可改选，发送“弃缉访”可放弃本次缉访。")
       }
       notifyPrivate(session, voterId, lines.join("\n"), `投票开始${seat}号私聊提醒`)
     }
@@ -4892,7 +6096,7 @@ export function apply(ctx: Context, config: Config) {
     if (game_off || modeInteraction.mode !== "turtle" || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
     if (ann_off && !modeInteraction.turtleHasPendingHost()) return next()
     if (session.content.replace(/\s/g, "") === "龟进度") return turtleProgressText()
-    if (session.userId !== hostid) return next()
+    if (!isGameHost(session.userId)) return next()
     if (replacementRequest.hasPending && /^(?:是|否)$/.test(session.content.trim())) return next()
     const quoteReference = resolveModeMessageReference({
       quote: session.quote,
@@ -4929,6 +6133,10 @@ export function apply(ctx: Context, config: Config) {
       return next()
     }
     const currentTurn = modeInteraction.turtleTurnForSeat(input.seat)
+    if (input.kind === 'answer' && currentTurn?.status === 'complete'
+      && turtleAnswerOwners.has(currentTurn) && turtleAnswerOwners.get(currentTurn) !== session.userId) {
+      return '该问题已由另一位主持人回答；如需更正，请发送“改' + input.seat + '是/否”等明确更正指令。'
+    }
     if (input.kind === "correction" || (input.kind === "answer" && currentTurn?.status === "complete")) {
       const corrected = modeInteraction.correctTurtleAnswer(input.seat, input.answer)
       if (corrected.kind === "not-found") return ("该座位不在本轮龟模式问答名单中。")
@@ -4939,6 +6147,7 @@ export function apply(ctx: Context, config: Config) {
     const result = modeInteraction.answerTurtleQuestion(input, Date.now())
     if (result.kind === "not-found") return ("该座位不在本轮龟模式问答名单中。")
     if (result.kind === "not-pending") return ("该座位当前没有等待主持人回答的问题。")
+    if (result.kind !== 'rejected') turtleAnswerOwners.set(result.turn, session.userId)
     cancelTurtleSeatTimers(input.seat)
     if (result.kind === "rejected") {
       armTurtleSpeechTimer(session, input.seat)
@@ -4961,7 +6170,7 @@ export function apply(ctx: Context, config: Config) {
   })
   ctx.guild().middleware(async (session: Session, next) => {//龟模式玩家提问
     if (game_off || modeInteraction.mode !== "turtle" || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
-    if (session.userId === hostid) return next()
+    if (isGameHost(session.userId)) return next()
     if (replacementRequest.hasPending && replacementRequest.applicant?.userId === session.userId) return next()
     const parsed = parseTurtleQuestion(session.content)
     if (!parsed) return next()
@@ -4995,13 +6204,13 @@ export function apply(ctx: Context, config: Config) {
     if (!backfill) armTurtleAnswerTimer(session, parsed.seat)
     const prompt = turtleHostAnswerPrompt(parsed.seat)!
     let promptIds: string[] = []
-    const delivered = await messages.state(
-      `龟模式${parsed.seat}号主持回答提示`,
-      async () => {
-        const ids = await session.bot.sendPrivateMessage(hostid, prompt)
-        promptIds = (Array.isArray(ids) ? ids : [ids]).filter(Boolean).map(String)
+    const deliveries = await Promise.all(gameHostIds().map(target => messages.state(
+      `龟模式${parsed.seat}号主持回答提示`, async () => {
+        const ids = await session.bot.sendPrivateMessage(target, prompt)
+        promptIds.push(...(Array.isArray(ids) ? ids : [ids]).filter(Boolean).map(String))
       },
-    )
+    )))
+    const delivered = deliveries.some(Boolean)
     if (delivered) {
       modeInteraction.recordTurtleQuestionMessage(
         parsed.seat,
@@ -5011,6 +6220,26 @@ export function apply(ctx: Context, config: Config) {
       return
     }
     return `龟模式${parsed.seat}号玩家的问题已记录，但主持人私聊提示发送失败；主持人可直接按群内问题发送座位号加答案，或私聊发送“待处理操作”补取。`
+  })
+  ctx.guild().middleware(async (session, next) => {//鹿模式独立补发言，不占用投票输入
+    if (game_off || modeInteraction.mode !== 'deer' || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
+    const index = player.indexOf(session.userId), seat = order[index]
+    const task = deerRevisions.makeup(seat)
+    if (!task || task.userId !== session.userId) return next()
+    const text = session.content.trimStart()
+    if (!text.startsWith(String(seat)) || !text.slice(String(seat).length).trim()) return next()
+    if (deerSeatNeedsSelection(seat)) return '你需要先通过选词审核，才能补发言。'
+    const version = modeInteraction.deerSelectionForSeat(seat)?.approvedVersion
+    if (version !== task.version || !deerRevisions.complete(seat, session.userId, version)) return next()
+    gameTimers.cancel(deerMakeupTimers.get(seat)); deerMakeupTimers.delete(seat)
+    recordSpeech(session, seat, text, undefined, undefined, task.round)
+    if (!ann_off && !add_flag) {
+      if (round !== task.round) recordSpeech(session, seat, text)
+      ann[index] = text
+      cancelDeerSpeechClock(seat)
+      end_ann(session)
+    }
+    return '已补入第' + task.round + '轮普通发言。'
   })
   ctx.guild().middleware(async (session: Session, next) => {//发言阶段
     if (game_off || ann_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
@@ -5114,7 +6343,7 @@ export function apply(ctx: Context, config: Config) {
         endOvertimeAnn(session)
         return
       }
-      else if (!(boom_pending && session.userId === hostid)) {
+      else if (!(boom_pending && isGameHost(session.userId))) {
         return next()
       }
     }
@@ -5200,158 +6429,7 @@ export function apply(ctx: Context, config: Config) {
       cancelDeerSpeechClock(n)
       end_ann(session)
     }
-    else if (boom_pending && session.userId === hostid) {
-      if (str_ann === "是") {
-        gameTimers.cancel(timer_boom)
-        switch (boom_state) {
-          case 1:
-            sumup += "卧底自爆成功，游戏结束，卧底胜利"
-            recordExplosionOutcome('undercover-win', true)
-            notifySession(session, "卧底自爆成功，游戏结束，卧底胜利")
-            increment = config.scoreUndercoverWin
-            for (let i = 0; i < player_copy.length; i++) {
-              if (uc_copy.indexOf(i + 1) !== -1 && !isEmpty(player_copy[i])) {
-                await addScore(player_copy[i], increment, 'confirmed-undercover-boom-win')
-                ptsstr += player_copy[i] + "，"
-              }
-            }
-            ptsstr = ptsstr.slice(0, -1)
-            ptsstr += "加" + increment + "分。"
-            await addScore(boomname, config.scoreUndercoverBoomBonus, 'confirmed-undercover-boom-bonus')
-            ptsstr += boomname + "自爆获胜，额外加" + config.scoreUndercoverBoomBonus + "分。"
-            await sendScoreSummary(session, 'undercover')
-            break
-          case 2:
-            sumup += "白板自爆成功，游戏结束，白板胜利"
-            recordExplosionOutcome('white-win', true)
-            notifySession(session, "白板自爆成功，游戏结束，白板胜利")
-            increment = config.scoreWhiteBoomWin
-            await addScore(boomname, increment, 'confirmed-white-boom-win-two')
-            ptsstr += boomname + "加" + increment + "分。"
-            await sendScoreSummary(session, 'white')
-            break
-          case 3:
-            sumup += "白板自爆成功，游戏结束，白板胜利"
-            recordExplosionOutcome('white-win', true)
-            notifySession(session, "白板自爆成功，游戏结束，白板胜利")
-            increment = config.scoreWhiteBoomWin
-            await addScore(boomname, increment, 'confirmed-white-boom-win-three')
-            ptsstr += boomname + "加" + increment + "分。"
-            await sendScoreSummary(session, 'white')
-            break
-          default:
-            notifySession(session, "出现未知bug，游戏已结束。")
-        }
-      }
-      else if (str_ann === "否") {
-        gameTimers.cancel(timer_boom)
-        switch (boom_state) {
-          case 1:
-            sumup += "卧底自爆失败，游戏结束，好人胜利。"
-            recordExplosionOutcome('good-win', true)
-            notifySession(session, "卧底自爆失败，游戏结束，好人胜利。")
-            increment = config.scoreGoodWin
-            for (let i = 0; i < player_copy.length; i++) {
-              if (uc_copy.indexOf(i + 1) === -1 && i + 1 !== white_copy && !isEmpty(player_copy[i])) {
-                await addScore(player_copy[i], increment, 'boom-resolution-good-win')
-                ptsstr += player_copy[i] + "，"
-              }
-            }
-            ptsstr = ptsstr.slice(0, -1)
-            ptsstr += "加" + increment + "分。"
-            await sendScoreSummary(session, 'good')
-            break
-          case 2:
-            let w = order.indexOf(white)
-            recordExplosionOutcome('white-departure', true)
-            const whiteEliminationText = publicHeroEliminationText(
-              white,
-              "白板自爆失败，场上仍有卧底在场，白板" + white + "号玩家" + player_name[w],
-              "出局，游戏继续。",
-            )
-            sumup += whiteEliminationText
-            notifySession(session, whiteEliminationText)
-            flag_white = false
-            boom_pending = false
-            capture(r => r.leave(white, 'skill', Date.now()))
-            player.splice(w, 1)
-            player_name.splice(w, 1)
-            order.splice(w, 1)
-            stalemate.reset()
-            if (order.indexOf(heros[HERO.WU_SAN_GUI]) !== -1) {
-              wuSanGuiModule.removeAttacker(heroState, white)
-            }
-            white = 0
-            if (add_flag) {
-              gameTimers.cancel(timer_htj)
-              gameTimers.cancel(timer_zxz)
-              gameTimers.cancel(timer_mwl)
-              gameTimers.cancel(timer_wsg)
-              gameTimers.cancel(timer_hurry)
-              gameTimers.cancel(timer_vote)
-              flag_just_vote = false
-              gameTimers.cancel(timer_ann)
-              round += 1
-              add_flag = false
-              if (!await new_round(session)) return
-              ann = Array(player.length)
-              vote.push(Array(player.length))
-              poll = Array(player.length).fill(0)
-              shield = Array(player_copy.length).fill(false)
-              annstr = "本轮发言结果：\n"
-              vstr = "本轮投票结果：\n"
-              notifyGroup(session, "结束加时，不再另外出人，游戏继续，开始第" + round + "轮发言。", "自爆判定结束加时通知")
-              return
-              // if (add_indices.indexOf(w) !== -1) {
-
-              // }
-              // else {
-              //   add_voter.splice(add_voter.indexOf(player[w]), 1)
-              //   for (let i = 0; i < add_indices.length; i++) {
-              //     if (w < add_indices[i]) add_indices[i] -= 1
-              //   }
-              //   add_vote[round - 1] = Array(add_voter.length)
-              // }
-            }
-            else {
-              ann.splice(w, 1)
-              end_ann(session)
-              if (!ann_off && (timeout_mode === 1 || timeout_mode === 3 || (timeout_mode === 2 && round > 1))) {
-                const t = annTimeoutMs(timeout_mode)
-                const phase = speechPhases.current()
-                timer_ann = setGameTimeout(() => {
-                  if (!speechPhases.matches(phase)) return
-                  return timeout_ann_auto(session)
-                }, t)
-                notifyGroup(session, "自爆判定结束，发言阶段恢复；本阶段重新限时" + t / 60000 + "分钟。", "自爆判定后发言恢复通知")
-              }
-            }
-            return
-          case 3:
-            sumup += "白板自爆失败，场上已无卧底在场，游戏结束，好人胜利。"
-            recordExplosionOutcome('good-win', true)
-            notifySession(session, "白板自爆失败，场上已无卧底在场，游戏结束，好人胜利。")
-            increment = config.scoreGoodWin
-            for (let i = 0; i < player_copy.length; i++) {
-              if (uc_copy.indexOf(i + 1) === -1 && i + 1 !== white_copy && !isEmpty(player_copy[i])) {
-                await addScore(player_copy[i], increment, 'boom-resolution-good-win-alternate')
-                ptsstr += player_copy[i] + "，"
-              }
-            }
-            ptsstr = ptsstr.slice(0, -1)
-            ptsstr += "加" + increment + "分。"
-            await sendScoreSummary(session, 'good', true)
-            break
-          default:
-            notifySession(session, "出现未知bug，游戏已结束。")
-        }
-      }
-      else {
-        return ("不识别的语句，请主持人发送“是”或“否”。")
-      }
-      end_game(boom_state >= 1 && boom_state <= 3 ? { kind: 'completed', reason: 'self-explosion', winner: str_ann === '否' ? 'good' : boom_state === 1 ? 'undercover' : 'white' } : { kind: 'aborted', reason: 'system-error' })
-      return
-    }
+    else if (boom_pending && isGameHost(session.userId)) return resolveBoomAdjudication(session, str_ann)
     else return next()
   })
   ctx.guild().middleware((session: Session, next) => {
@@ -5376,12 +6454,53 @@ export function apply(ctx: Context, config: Config) {
     if (!modeInteraction.module.allowsWhiteRecruitment) return next()
     if (session.userId !== player[order.indexOf(white)]) return next()
     let str_guess = session.content.replace(/[《》·\s]/g, "").replace(regex, "")
+    const explicitGuess = str_guess.startsWith('猜词')
+    if (explicitGuess) str_guess = str_guess.slice(2).replace(/^[\p{P}\p{S}\s]+/u, '')
+    else {
+      const seat = order[player.indexOf(session.userId)]
+      const input = normalizeHeroCommand(session.content)
+      const nativeSkill = seat === heros[HERO.WEI_ZHONG_XIAN]
+        && (weiZhongXianModule.classifySlander(input)
+          || /^(?:(?:缉访|缉|访|查)(?:1|2[0-9]+)|弃(?:缉访|缉|访|查))$/u.test(input))
+        || seat === heros[HERO.YUAN_CHONG_HUAN]
+          && /^(?:守[0-9]+|弃守|专镇)$/u.test(input)
+        || seat === heros[HERO.DUO_ER_GUN]
+          && /^(?:立[0-9]+|保[0-9]+弃[0-9]+|弃[0-9]+保[0-9]+)$/u.test(input)
+        || seat === heros[HERO.ZHU_YOU_XIAO]
+          && /^(?:(?:放权|放|传弟|传|传弟选)[0-9]+|放弃放权|弃放权|弃放|弃传弟)$/u.test(input)
+      const proxy = zhuYouXiaoVotes.current
+      const delegatedSkill = !vote_off && proxy?.delegateSeat === seat
+        && /^(?:代(?:投)?(?:[0-9]+|弃|弃权)|代伐[0-9]*)$/u.test(input)
+      const ownMark = !vote_off && /^伐[0-9]*$/u.test(input)
+      const pendingPrivate = pendingSkillsFor(session.userId).some(action => action.channel.scope === 'private')
+      if (nativeSkill || delegatedSkill || ownMark || pendingPrivate) return next()
+    }
     if (str_guess === "是" || str_guess === "否") return next()
+    if (str_guess === item1 || str_guess === item2) return recruitWhite(session, str_guess)
+    if (!explicitGuess && (str_guess === '弃' || str_guess === '弃权' || !isEmpty(Number(str_guess)))) return next()
+    if (whiteGuessNotifications && str_guess) {
+      const request: WhiteGuessRequest = { id: ++whiteGuessSequence, epoch: gameTimers.epoch, seat: white,
+        userId: session.userId, text: str_guess, references: new Set() }
+      whiteGuessRequests.set(request.id, request)
+      const content = `${white}号玩家${player_name[order.indexOf(white)]}（白板）猜人：${str_guess}，未匹配好人或卧底词条。`
+        + `\n若认可猜中，请引用本条回复“好人”或“卧底”；也可发送“白板判定${request.id}好人/卧底”。可发送“关闭白板通知”停止后续通知。`
+      for (const host of gameHostIds()) await messages.state('白板猜词主持通知', async () => {
+        const ids = await session.bot.sendPrivateMessage(host, content)
+        for (const id of ids) request.references.add(host + ':' + id)
+      })
+    }
+    return '未匹配好人或卧底词条，继续加油~'
+  })
+  async function recruitWhite(session: Session, str_guess: string, manualGuess?: string) {
+    if (game_off || !flag_white || !order.includes(white)) return
+    const whiteUserId = player[order.indexOf(white)]
+    if (manualGuess) capture(r => r.outcome(`主持人认可白板${white}号玩家${player_name[order.indexOf(white)]}猜词“${manualGuess}”，加入${str_guess === item1 ? '好人' : '卧底'}阵营。`))
+    whiteGuessRequests.clear()
     if (str_guess === item1) {
       capture(r => r.camp(white, 'good'))
       flag_white = false
       sumup += "白板" + white + "号玩家" + player_name[order.indexOf(white)] + "成功猜出好人词条" + item1 + "，加入好人阵营。\n"
-      notifySession(session, "恭喜猜中，成功加入好人或卧底阵营。\n雷点：" + instr1)
+      notifyPrivate(session, whiteUserId, "恭喜猜中，成功加入好人或卧底阵营。\n雷点：" + instr1, '白板加入阵营通知')
       notifyPrivate(session, hostid, "白板" + white + "号玩家" + player_name[order.indexOf(white)] + "成功猜出好人词条" + item1 + "，加入好人阵营。", "白板加入好人主持人通知")
       white = 0
       white_copy = 0
@@ -5409,7 +6528,7 @@ export function apply(ctx: Context, config: Config) {
       uc_copy.push(white)
       flag_white = false
       sumup += "白板" + white + "号玩家" + player_name[order.indexOf(white)] + "成功猜出卧底词条" + item2 + "，加入卧底阵营。\n"
-      notifySession(session, "恭喜猜中，成功加入好人或卧底阵营。\n雷点：" + instr2)
+      notifyPrivate(session, whiteUserId, "恭喜猜中，成功加入好人或卧底阵营。\n雷点：" + instr2, '白板加入阵营通知')
       notifyPrivate(session, hostid, "白板" + white + "号玩家" + player_name[order.indexOf(white)] + "成功猜出卧底词条" + item2 + "，加入卧底阵营。", "白板加入卧底主持人通知")
       white = 0
       white_copy = 0
@@ -5430,10 +6549,7 @@ export function apply(ctx: Context, config: Config) {
       }
       return
     }
-    else if (str_guess.indexOf("伐") !== -1 || str_guess.indexOf("守") === 0 || str_guess.indexOf("权") !== -1 || str_guess.indexOf("立") === 0 || (str_guess.indexOf("保") !== -1 && str_guess.indexOf("弃") !== -1)) return next()
-    else if (isEmpty(Number(str_guess)) && str_guess !== "弃" && str_guess !== "弃权") return ("未能猜中好人或卧底人物，继续加油~")
-    else return next()
-  })
+  }
   const grantLiZiChengReward = (session: Session) => {
     const liSeat = heros[HERO.LI_ZI_CHENG]
     const reward = vote_num[liSeat - 1]
@@ -5735,6 +6851,9 @@ export function apply(ctx: Context, config: Config) {
     if(postEliminationHero(outplayer, heros, 'vote') === "shi-ke-fa"){
       promptShiKeFaGift(session, outplayer)
     }
+    if (postEliminationHero(outplayer, heros, 'vote') === "zhu-you-xiao") {
+      beginZhuYouXiaoHeirTarget(session, outplayer)
+    }
     return continueResolution()
   }
 
@@ -5775,6 +6894,12 @@ export function apply(ctx: Context, config: Config) {
   }
 
   const completeVoteResolutionState = (session: Session) => {
+    pendingAction.clear("zhu-you-xiao-proxy-vote")
+    recoverablePendingPrompts.delete("zhu-you-xiao-proxy-vote")
+    // The phase has been fully recorded and no longer accepts delegation.
+    // Keep the historical successful-delegate records, but drop the live
+    // owner/delegate relation before the next speech or roster change.
+    clearZhuYouXiaoPhase(zhuYouXiaoVotes)
     if(order.indexOf(heros[HERO.LI_ZI_CHENG]) !== -1 && liZiChengModule.hasRewardPending(heroState)){
       grantLiZiChengReward(session)
     }
@@ -5797,47 +6922,53 @@ export function apply(ctx: Context, config: Config) {
     maximum,
     session,
   }: FinalVoteResolutionInput): Promise<ResolutionControl> => {
+    // Read the last accepted choice atomically, before publishing the poll.
+    // This does not reopen ordinary ballots during Mao/Huang waits.
+    weiInquiryWindow = null
     whiteSurvivalSettlementPending = flag_white && white_only
       && (!add_flag || add_indices.some(index => order[index] === white))
-    const historyVoters = add_flag ? add_voter : player
-    const historyBallots = add_flag ? add_vote[round - 1] : vote[round - 1]
-    const historyEntries = historyVoters.filter(id => player.includes(id)).map(id => {
-      const raw = historyBallots?.[historyVoters.indexOf(id)]
-      const voterSeat = order[player.indexOf(id)]
-      const targetSeat = Number.isInteger(raw) && order.includes(raw) ? raw : null
-      // Mao Wenlong's 据岛 leaves the regular ballot empty; 塘报 is settled
-      // separately after the ordinary voters, so an empty ballot here is a
-      // skipped phase rather than a timeout.
-      const maoSkippedRegularBallot = voterSeat === heros[HERO.MAO_WEN_LONG]
-        && (raw === undefined || raw === null)
-      const status: 'vote' | 'skip' | 'abstain' | 'locked' | 'timeout' = targetSeat !== null ? 'vote'
-        : maoSkippedRegularBallot ? 'skip'
-          : vote_num[voterSeat - 1] === 0 ? 'skip'
-          : raw === 0 ? 'abstain'
-            : raw === -1 && lockedVoteSeats.has(votePhaseKey(voterSeat)) ? 'locked' : 'timeout'
-      const targetIndex = targetSeat === null ? -1 : order.indexOf(targetSeat)
-      return {
-        voterSeat,
-        targetSeat,
-        ...(targetIndex >= 0 ? { targetNickname: player_name[targetIndex] } : {}),
-        weight: vote_num[voterSeat - 1],
-        status,
+    const historyEntries = frozenVoteFacts
+    const delegatedEntry = historyEntries.find(entry => entry.deciderSeat !== undefined)
+    const delegatedSeat = delegatedEntry ? { owner: delegatedEntry.voterSeat, decider: delegatedEntry.deciderSeat! } : null
+    const weiSeat = weiZhongXianSeat()
+    if (order.includes(weiSeat)) {
+      const weiEntry = historyEntries.find(entry => entry.voterSeat === weiSeat)
+      if (weiEntry?.targetSeat !== null && weiEntry?.targetSeat !== undefined) {
+        weiZhongXianModule.recordVoteCandidate(heroState, votePhaseSerial, weiEntry.targetSeat)
       }
-    })
-    capture(r => r.vote(historyEntries, order.map((seat, i) => ({ seat, count: poll[i] }))))
-    if (order.includes(heros[HERO.LIN_DAN_HAN]) && (heroState.linDanHan.preventedVotePower > 0 || linDanHanModule.isOwnVoteInvalidated(heroState))) {
-      const linSeat = heros[HERO.LIN_DAN_HAN]
-      const attackers = historyEntries
-        .filter(entry => entry.voterSeat !== linSeat && entry.targetSeat === linSeat
-          && linDanHanModule.hasPendingVoteAttack(heroState, entry.voterSeat))
-        .map(entry => entry.voterSeat)
+      for (const entry of historyEntries) {
+        if (entry.targetSeat !== null && entry.targetSeat !== undefined) {
+          weiZhongXianModule.recordAttack(heroState, entry.voterSeat, entry.targetSeat, weiSeat)
+        }
+      }
+      resolveWeiInquiry(session, historyEntries)
+    }
+    if (delegatedSeat) {
+      const { owner: ownerSeat, decider: successfulDelegateSeat } = delegatedSeat
+      const ownerIndex = order.indexOf(ownerSeat)
+      const delegateIndex = order.indexOf(successfulDelegateSeat)
+      if (ownerIndex !== -1 && delegateIndex !== -1) {
+        sumup += ownerSeat + "号玩家" + player_name[ownerIndex] + "将本次"
+          + (add_flag ? "加时" : "") + "投票交给" + successfulDelegateSeat
+          + "号玩家" + player_name[delegateIndex] + "代投。\n"
+        recordSkill(HERO.ZHU_YOU_XIAO, "放权给" + successfulDelegateSeat + "号玩家代投", [successfulDelegateSeat])
+      }
+    }
+    capture(r => r.vote(historyEntries, order.map((seat, i) => ({ seat, count: poll[i] })), true,
+      [...anonymousVoteContributions].map(([seat, count]) => ({ seat, count }))))
+    const linPrevented = historyEntries.filter(entry => entry.invalidReasons?.includes('lin-dan-han-protection'))
+    const linMutual = historyEntries.some(entry => entry.invalidReasons?.includes('lin-dan-han-mutual'))
+    if (linPrevented.length || linMutual) {
+      const attackers = linPrevented.map(entry => entry.voterSeat)
       recordSkill(HERO.LIN_DAN_HAN,
-        `避实抵消${heroState.linDanHan.preventedVotePower}票${linDanHanModule.isOwnVoteInvalidated(heroState) ? '；本人投票失效' : ''}`,
+        `避实抵消${linPrevented.reduce((sum, entry) => sum + entry.weight, 0)}票${linMutual ? '；本人投票失效' : ''}`,
         attackers)
     }
     gameTimers.cancel(timer_hurry)
     gameTimers.cancel(timer_vote)
     flag_just_vote = false
+    weiZhongXianModule.completeVotePhase(heroState, votePhaseSerial)
+    voteFactStage = 'published'
     notifyGroup(session, vstr, "投票结果通知")
     const outcome = classifyVoteOutcome({
       poll,
@@ -5915,9 +7046,215 @@ export function apply(ctx: Context, config: Config) {
     completeVoteResolutionState(session)
     return postEliminationControl
   }
+  ctx.exclude(ctx.guild()).middleware(async (session, next) => {//魏忠贤诬诽
+    if (game_off || !matchesActiveSession(session)) return next()
+    const weiSeat = weiZhongXianSeat()
+    const weiIndex = order.indexOf(weiSeat)
+    if (weiIndex === -1 || session.userId !== player[weiIndex]) return next()
+    if (!weiZhongXianModule.classifySlander(session.content)) return next()
+    if (!weiZhongXianModule.isSlanderAvailableForSeat(heroState, weiSeat, weiSeat)) {
+      return "诬诽已经发动过了；当前没有可用的“诬诽”次数。"
+    }
+    const beforeFa = fa[weiSeat - 1]
+    const previousRelations = new Set(heroState.weiZhongXian.slanderRelations)
+    const affectedSeats = weiZhongXianModule.activateSlanderForSeat(heroState, weiSeat, weiSeat)
+    if (affectedSeats === null) return "当前无法发动“诬诽”。"
+    const changedSeats = affectedSeats.filter(seat => !weiActualDifferent(weiSeat, seat) && !previousRelations.has(seat))
+    const retroactiveTargets = retroactivelyAwardWeiZhongXianCandidates(session, changedSeats)
+    const gainedFa = fa[weiSeat - 1] - beforeFa
+    const affectedText = affectedSeats.length
+      ? affectedSeats.map(seat => `${seat}号玩家${player_copy[seat - 1] ?? ""}`).join("、")
+      : "无"
+    const changedText = changedSeats.length
+      ? changedSeats.map(seat => `${seat}号玩家${player_copy[seat - 1] ?? ""}`).join("、")
+      : "无"
+    const retroactiveText = retroactiveTargets.length
+      ? `追溯第${retroactiveTargets.map(target => `${target.phaseSerial}次投票所投的${target.targetSeat}号玩家${player_copy[target.targetSeat - 1]}出局`).join("、")}，补足${retroactiveTargets.length}次“伐异”。`
+      : "没有追溯补足“伐异”。"
+    recordSkill(HERO.WEI_ZHONG_XIAN, `发动“诬诽”，影响范围：${affectedText}；其中视为异阵营：${changedText}。${retroactiveText}本次新增${gainedFa}个“伐”标记`, affectedSeats,
+      { kind: 'wei-slander', affectedSeats, changedSeats, retroactiveVotes: retroactiveTargets, gainedFa })
+    sumup += `${weiSeat}号玩家${player_copy[weiSeat - 1]}（魏忠贤）发动“诬诽”，影响范围：${affectedText}；其中视为异阵营：${changedText}。${retroactiveText}\n`
+    notifySession(
+      session,
+      weiZhongXianModule.formatSlanderNotice(
+        affectedSeats.map(seat => ({ seat, name: player_copy[seat - 1] ?? "" })),
+        gainedFa,
+        fa[weiSeat - 1],
+      ),
+      "魏忠贤诬诽私聊通知",
+    )
+    return
+  })
+  ctx.exclude(ctx.guild()).middleware(async (session, next) => {//魏忠贤缉访
+    if (game_off || !matchesActiveSession(session)) return next()
+    const inquiryInput = weiZhongXianModule.classifyInquiry(session.content)
+    if (inquiryInput.kind === "ignore") return next()
+    const weiSeat = weiZhongXianSeat()
+    const weiIndex = order.indexOf(weiSeat)
+    if (weiIndex === -1 || session.userId !== player[weiIndex]) return next()
+    if (!isWeiInquiryWindowOpen()) return voteFactStage === 'published' && heroState.weiZhongXian.phaseSerial === votePhaseSerial
+      ? "本次票数已公开，不能再使用“缉访”。" : "请在投票阶段使用“缉访”；票数公开前可修改或放弃。"
+    if (inquiryInput.kind === "invalid-option") return "请发送“缉访1”或“缉访2+座位号”，也可使用“缉1/访1/查1”和对应的2号格式。"
+    if (inquiryInput.kind === "invalid-target") return "缉访选项2需要附带一个有效的玩家序号。"
+    if (inquiryInput.kind === "abandon") {
+      weiZhongXianModule.clearInquiry(heroState.weiZhongXian)
+      recordSkill(HERO.WEI_ZHONG_XIAN, '放弃本次缉访')
+      return "已放弃本次缉访。"
+    }
+    if (heroState.weiZhongXian.phaseSerial !== votePhaseSerial) {
+      return "当前投票阶段还未建立缉访窗口，请稍后重试。"
+    }
+    if (inquiryInput.kind === "vote-target" && !weiCanVoteCurrentPhase()) {
+      return "你在本次投票阶段不能投票，无法使用缉访选项1；可以选择选项2。"
+    }
+    if (inquiryInput.kind === "voted-by") {
+      const targetSeat = inquiryInput.targetSeat
+      const targetIndex = order.indexOf(targetSeat)
+      if (targetIndex === -1) return "缉访对象必须是在场玩家。"
+      if (weiCurrentBallotTarget() === targetSeat) return "缉访选项2不能选择你本次投票的对象。"
+      const voterIds = add_flag ? add_voter : player
+      const targetIsVoter = voterIds.includes(player[targetIndex])
+      const targetIsOvertimeCandidate = add_flag && add_indices.includes(targetIndex)
+      if (!targetIsVoter && targetSeat !== weiSeat
+        && !(targetIsOvertimeCandidate && weiCanVoteCurrentPhase())) {
+        return "该玩家本次没有可查询的投票记录，请选择仍在本阶段投票名单中的玩家。"
+      }
+      if (add_flag && !weiCanVoteCurrentPhase() && targetIsOvertimeCandidate && targetSeat !== weiSeat) {
+        return "魏忠贤本次加时不能投票时，不能查询同样未参与投票的候选玩家。"
+      }
+    }
+    weiZhongXianModule.setInquiry(heroState, votePhaseSerial, inquiryInput)
+    recordSkill(HERO.WEI_ZHONG_XIAN, inquiryInput.kind === 'vote-target'
+      ? '选择缉访选项1，等待本次投票结算' : '选择缉访选项2，等待本次投票结算',
+      inquiryInput.kind === 'voted-by' ? [inquiryInput.targetSeat] : [])
+    if (inquiryInput.kind === "vote-target") return "已选择缉访选项1，投票结算时私聊告知结果。"
+    return `已选择缉访选项2，目标为${inquiryInput.targetSeat}号玩家；投票结算时私聊告知结果。`
+  })
+  ctx.exclude(ctx.guild()).middleware(async (session, next) => {//朱由校放权与代投
+    if (game_off || !matchesActiveSession(session)) return next()
+    const nativeOwnerSeat = heros[HERO.ZHU_YOU_XIAO]
+    const nativeOwner = session.userId === player_id_copy[nativeOwnerSeat - 1]
+    const explicitInput = normalizeHeroCommand(session.content)
+    if (nativeOwner && /^(?:(?:传弟|传|传弟选)[0-9]+|弃传弟)$/u.test(explicitInput)
+      && !pendingAction.matches('zhu-you-xiao-heir-target', { userId: session.userId, scope: 'private', gameEpoch: gameTimers.epoch })) {
+      return order.includes(nativeOwnerSeat) ? '传弟需在你出局后发动。' : '当前没有等待选择的“传弟”。'
+    }
+    const current = zhuYouXiaoVotes.current
+    if (nativeOwner && /^(?:(?:放权|放)[0-9]+|放弃放权|弃放权|弃放)$/u.test(explicitInput)
+      && (vote_off || current?.ownerSeat == null)) {
+      return vote_off ? ann_off && (voteFactStage === 'counting' || voteFactStage === 'published')
+        ? '本次投票已结束，不能再修改放权。' : '请在投票阶段使用“放权”。'
+        : '你在本次投票阶段无需投票，不能发动“放权”。'
+    }
+    if (vote_off) return next()
+    if (!current || current.serial !== votePhaseSerial || current.ownerSeat === null) return next()
+    const ownerSeat = current.ownerSeat
+    const ownerIndex = order.indexOf(ownerSeat)
+    const ownerUserId = ownerIndex === -1 ? undefined : player[ownerIndex]
+    if (session.userId === ownerUserId) {
+      const delegation = classifyDelegationInput({
+        content: session.content,
+        activeSeats: order,
+        ownerSeat,
+      })
+      if (delegation.kind === "ignore") return next()
+      if (voteSettlement.isRunning(currentVoteSettlementKey())) {
+        return "投票正在结算，请稍候。"
+      }
+      if (delegation.kind === "invalid-target") return "放权对象必须是在场的其他玩家。"
+      if (delegation.kind === "self-forbidden") return "朱由校不能将投票权交给自己。"
+      if (lockedVoteSeats.has(votePhaseKey(ownerSeat))) {
+        return "本次投票结果已经锁定，不能再修改放权或投票。"
+      }
+      const overtime = add_flag
+      if (delegation.kind === "abandon") {
+        const previous = current.delegateSeat
+        clearZhuYouXiaoBallot(ownerSeat, overtime, true, false)
+        setZhuYouXiaoDelegate(zhuYouXiaoVotes, null)
+        rebuildPollFromBallots()
+        recordSkill(HERO.ZHU_YOU_XIAO, '放弃本次放权')
+        pendingAction.clear("zhu-you-xiao-proxy-vote")
+        if (previous !== null && order.includes(previous)) {
+          notifyPrivate(session, player[order.indexOf(previous)], "本次代投已取消，之前的代投票已作废，无需再代投。"
+            + delegationOwnBallotText(previous, ownerSeat, true), "朱由校放弃放权通知")
+        }
+        await finishChangedProxyVote(session, overtime)
+        return "已放弃放权，请直接发送投票对象；本次投票仍可改票。"
+      }
+      const previous = current.delegateSeat
+      clearZhuYouXiaoBallot(ownerSeat, overtime, true, false)
+      setZhuYouXiaoDelegate(zhuYouXiaoVotes, delegation.seat)
+      rebuildPollFromBallots()
+      recordSkill(HERO.ZHU_YOU_XIAO, '指定放权对象，等待代投', [delegation.seat])
+      pendingAction.clear("zhu-you-xiao-proxy-vote")
+      if (previous !== null && previous !== delegation.seat && order.includes(previous)) {
+        notifyPrivate(session, player[order.indexOf(previous)], "本次代投已取消，之前的代投票已作废，无需再代投。"
+          + delegationOwnBallotText(previous, ownerSeat, true), "朱由校更改放权通知")
+      }
+      const delegateIndex = order.indexOf(delegation.seat)
+      const delegateUserId = player[delegateIndex]
+      if (voteResolutionStatus() !== 'pending') {
+        await finishChangedProxyVote(session, overtime)
+        return `已放权给${delegation.seat}号玩家${player_copy[delegation.seat - 1]}；本次投票已进入结算。`
+      }
+      const delegatePrompt = delegationPrompt(delegation.seat, ownerSeat, previous === delegation.seat)
+      pendingAction.open({
+        kind: "zhu-you-xiao-proxy-vote",
+        ownerSeat: delegation.seat,
+        ownerUserId: delegateUserId,
+        channel: { scope: "private" },
+        blocksRosterChanges: false,
+        gameEpoch: gameTimers.epoch,
+        timeoutMs: null,
+        resumeAt: ResolutionCursor.FinalizeVote,
+      })
+      sendRecoverablePrivatePrompt(session, {
+        kind: "zhu-you-xiao-proxy-vote",
+        userId: delegateUserId,
+        content: delegatePrompt,
+      })
+      return "已放权给" + delegation.seat + "号玩家" + player_name[delegateIndex] + "，等待对方代投；如需收回请发送“弃放权”或“弃放”。"
+    }
+
+    const proxyFaInput = normalizeHeroCommand(session.content)
+    if (proxyFaInput.startsWith('代伐')) {
+      if (current.delegateSeat === null || player[order.indexOf(current.delegateSeat)] !== session.userId) return '当前没有玩家将本阶段投票权交给你。'
+      if (zhuYouXiaoOwnerIsEligible(add_flag) === null) return '朱由校本阶段无需投票，不能使用代伐。'
+      if (voteSettlement.isRunning(currentVoteSettlementKey()) || lockedVoteSeats.has(votePhaseKey(ownerSeat))) return '本次投票正在结算或已锁定，不能再使用代伐。'
+      const amount = parseHeroNumber(proxyFaInput.slice(2))
+      if (!Number.isSafeInteger(amount) || amount <= 0) return '请发送“代伐+数字”指定使用数量。'
+      if (amount > fa[ownerSeat - 1]) return `朱由校当前只有${fa[ownerSeat - 1]}个“伐”，无法使用更多。`
+      fa[ownerSeat - 1] -= amount
+      flag_fa[ownerSeat - 1] += amount
+      vote_num[ownerSeat - 1] += amount
+      rebuildPollFromBallots()
+      notifySession(session, `本次朱由校的投票数将增加${flag_fa[ownerSeat - 1]}票，共投${vote_num[ownerSeat - 1]}票。\n剩余伐数：${fa[ownerSeat - 1]}`)
+      sumup += `${ownerSeat}号玩家${player_copy[ownerSeat - 1]}由${current.delegateSeat}号玩家代用${amount}个伐。\n`
+      recordSkill(HERO.ZHU_YOU_XIAO,
+        `发动“放权”，由${current.delegateSeat}号玩家${player_copy[current.delegateSeat - 1]}代为使用${amount}个“伐”标记，本次投票数增加${amount}票`)
+      await finishChangedProxyVote(session, add_flag)
+      return
+    }
+    const proxy = classifyProxyVoteInput({
+      content: session.content,
+      activeSeats: order,
+      ownerSeat,
+    })
+    if (proxy.kind === "ignore") return next()
+    const delegateIndex = player.indexOf(session.userId)
+    const delegateSeat = delegateIndex === -1
+      ? null
+      : order[delegateIndex]
+    if (current.delegateSeat === null || delegateSeat !== current.delegateSeat) {
+      return "当前没有玩家将本阶段投票权交给你。"
+    }
+    if (proxy.kind === "invalid-target") return "代投对象必须是在场且符合朱由校可投票范围的玩家。"
+    if (proxy.kind === "self-forbidden") return "朱由校不能投给自己，请重新发送代投对象。"
+    return await zhuYouXiaoRecordProxyBallot(session, proxy.kind === "abstain" ? 0 : proxy.seat)
+  })
   ctx.exclude(ctx.guild()).middleware(async (session, next) => {//投票阶段
     if (game_off || !matchesActiveSession(session)) return next()
-    if (session.userId === hostid) return next()
+    if (isGameHost(session.userId)) return next()
     if (pendingAction.matches("shi-ke-fa-gift", {
       userId: session.userId,
       scope: "private",
@@ -5939,12 +7276,20 @@ export function apply(ctx: Context, config: Config) {
       // notifySession(session, "未到投票阶段，bot暂不识别私信内容。如果你是玩家，请投票阶段再来。")
       return next()
     }
+    let str_vote = session.content.replace(/\s/g, "")
+    const heroVote = normalizeHeroCommand(session.content)
+    if (session.userId === player[order.indexOf(heros[HERO.YUAN_CHONG_HUAN])]
+      && /^(?:守|弃守|专镇)/u.test(heroVote) && !quan_continue && !mao_continue) return next()
     if (!quan_continue && !mao_continue && voteSettlement.isRunning(currentVoteSettlementKey())) {
       return "投票正在结算，请稍候。"
     }
-    let str_vote = session.content.replace(/\s/g, "")
-    if (session.userId === player[order.indexOf(heros[HERO.YUAN_CHONG_HUAN])] && str_vote.indexOf("守") === 0 && !quan_continue && !mao_continue) return next()
-    if (session.userId === player[order.indexOf(heros[HERO.DUO_ER_GUN])] && (str_vote.indexOf("立") === 0 || (str_vote.indexOf("保") !== -1 && str_vote.indexOf("弃") !== -1)) && !quan_continue && !mao_continue) return next()
+    const zhuYouXiaoOwner = zhuYouXiaoCurrentOwner()
+    if (zhuYouXiaoOwner !== null
+      && zhuYouXiaoVotes.current?.delegateSeat !== null
+      && player[order.indexOf(zhuYouXiaoOwner)] === session.userId) {
+      return "本次投票已放权给其他玩家，请等待对方发送“代投+序号”或“代+序号”；如需自行投票请先发送“弃放权”或“弃放”。"
+    }
+    if (session.userId === player[order.indexOf(heros[HERO.DUO_ER_GUN])] && (heroVote.startsWith("立") || /^(?:保|弃)/u.test(heroVote) && /保/u.test(heroVote) && /弃/u.test(heroVote)) && !quan_continue && !mao_continue) return next()
     // if(player.indexOf(session.userId) !== -1 && str_vote.indexOf("权") !== -1 && (!add_flag || add_indices.indexOf(player.indexOf(session.userId)) !== -1)){
     //   let o = order[player.indexOf(session.userId)]
     //   if(str_vote === "权") str_vote = "权1"
@@ -5962,314 +7307,69 @@ export function apply(ctx: Context, config: Config) {
     //   }
     //   else return next()
     // }
-    if (player.indexOf(session.userId) !== -1 && str_vote.indexOf("伐") !== -1 && (!add_flag || add_indices.indexOf(player.indexOf(session.userId)) === -1) && !quan_continue) {
+    if (player.indexOf(session.userId) !== -1 && /^伐[0-9]*$/u.test(heroVote) && (!add_flag || add_indices.indexOf(player.indexOf(session.userId)) === -1) && !quan_continue) {
       let o = order[player.indexOf(session.userId)]
-      if (str_vote === "伐") str_vote = "伐1"
-      let n_fa = Number(str_vote.replace("伐", ""))
+      let n_fa = parseHeroNumber(heroVote.slice(1) || "1")
       if (!isEmpty(n_fa) && n_fa > 0) {
+        if (lockedVoteSeats.has(votePhaseKey(o))) return ("本次投票结果已经锁定，不能再使用伐修改投票。")
         if (fa[o - 1] === 0) return ("你目前没有伐，无法使用伐。")
         if (n_fa > fa[o - 1]) return ("你目前只有" + fa[o - 1] + "个伐，无法使用更多的伐。")
         else {
           fa[o - 1] -= n_fa
           vote_num[o - 1] += n_fa
           flag_fa[o - 1] += n_fa
-          if ((add_flag && add_vote[round - 1][add_voter.indexOf(session.userId)] > 0) && !(linDanHanModule.hasPendingVoteAttack(heroState, order[player.indexOf(session.userId)]) && add_vote[round - 1][add_voter.indexOf(session.userId)] === heros[HERO.LIN_DAN_HAN])) poll[order.indexOf(add_vote[round - 1][add_voter.indexOf(session.userId)])] += n_fa
-          else if ((!add_flag && vote[round - 1][player.indexOf(session.userId)] > 0) && !(linDanHanModule.hasPendingVoteAttack(heroState, order[player.indexOf(session.userId)]) && vote[round - 1][player.indexOf(session.userId)] === heros[HERO.LIN_DAN_HAN])) poll[order.indexOf(vote[round - 1][player.indexOf(session.userId)])] += n_fa
+          if (!mao_continue) rebuildPollFromBallots()
           notifySession(session, "本次投票你的投票数将会增加" + flag_fa[o - 1] + "票。\n本次投票你投" + vote_num[o - 1] +"票。\n剩余伐数：" + fa[o - 1])
           sumup += o + "号玩家" + player_name[order.indexOf(o)] + "消耗" + n_fa + "个伐，使自己本次投票数增加" + n_fa + "。\n"
+          queueHostSkillNotice(o, `使用${n_fa}个“伐”标记，本次投票数增加${n_fa}票`, [])
+          if (!mao_continue) await finishChangedProxyVote(session, add_flag)
           return
         }
       }
     }
-    if (add_flag && !quan_continue && !mao_continue) {
-      let d = add_voter.indexOf(session.userId)
-      let q = player.indexOf(session.userId)
-      if (d == -1) return ("你未参加游戏，或已出局，或加时阶段与他人平票，无法投票。")
-      const firstBallot = isEmpty(add_vote[round - 1][d])
-      if (order[q] === heros[HERO.MAO_WEN_LONG]) return ("毛帅莫急，且待塘报至再做决断。")
-      if (vote_num[order[q] - 1] === 0) {
-        return ("因武将技能，你已跳过本次投票阶段。")
+    if (!quan_continue && !mao_continue) {
+      const overtime = add_flag
+      const voterIds = overtime ? add_voter : player
+      const ballots = overtime ? add_vote[round - 1] : vote[round - 1]
+      const activeIndex = player.indexOf(session.userId)
+      const ballotIndex = voterIds.indexOf(session.userId)
+      if (activeIndex === -1 || ballotIndex === -1) return overtime
+        ? "你未参加游戏，或已出局，或加时阶段与他人平票，无法投票。"
+        : "你未参加游戏或已出局，无法投票。"
+      const seat = order[activeIndex]
+      if (seat === heros[HERO.MAO_WEN_LONG]) return "毛帅莫急，且待塘报至再做决断。"
+      if (vote_num[seat - 1] === 0) return "因武将技能，你已跳过本次投票阶段。"
+      const target = str_vote === "弃" || str_vote === "弃权" ? 0 : Number(str_vote)
+      if (target === 0 && str_vote !== '弃' && str_vote !== '弃权') return "无效的投票语句，请重新输入。"
+      if (target !== 0 && !getVotableTargets(seat).includes(target)) {
+        if (seat === heros[HERO.LIN_DAN_HAN] && order.includes(target)
+          && !linDanHanModule.votableTargets(heroState, [target]).includes(target)) {
+          return "可汗，由于您之前西迁，不能再投票给" + target + "号玩家" + player_copy[target - 1] + "。"
+        }
+        return "无效的投票语句，请重新输入。"
       }
-      let v = Number(str_vote)
-      if (str_vote === "弃" || str_vote === "弃权") {
-        if (!isEmpty(add_vote[round - 1][d]) && add_vote[round - 1][d] !== 0) {
-          notifySession(session, "已改票。")
-          if (flag_notify) notifyPrivate(session, hostid, order[q] + "号玩家" + player_name[q] + "改票为弃权。", "实时改票通知")
-            if (add_vote[round - 1][d] === heros[HERO.LIN_DAN_HAN] && linDanHanModule.hasPendingVoteAttack(heroState, order[q])) {
-              linDanHanModule.undoVoteAttack(heroState, order[q])
-            }
-            else {
-              poll[order.indexOf(add_vote[round - 1][d])] -= vote_num[order[q] - 1]
-              if(add_vote[round - 1][d] === heros[HERO.SHI_KE_FA] && ((uc.indexOf(heros[HERO.SHI_KE_FA]) + 0.5) * (uc.indexOf(order[q]) + 0.5) > 0 && order[q]!==white)){
-                shiKeFaModule.removeTeammateAttacker(heroState, order[q])
-              }
-            }
-        }
-        else if (add_vote[round - 1][d] === 0) waiver -= 1
-        else if (flag_notify) notifyPrivate(session, hostid, order[q] + "号玩家" + player_name[q] + "弃权。", "实时弃票通知")
-        add_vote[round - 1][d] = 0
-        waiver += 1
+      if (!Number.isSafeInteger(target) || !str_vote) return "无效的投票语句，请重新输入。"
+      const firstBallot = isEmpty(ballots[ballotIndex])
+      ballots[ballotIndex] = target
+      rebuildPollFromBallots()
+      const invalidNotice = currentBallotEffects.find(effect => effect.voterSeat === seat)
+        ?.invalidReasons.includes('zhu-you-xiao-delegation')
+        ? "你的自有票已记录；因本次放权关系，这张投给朱由校的票将失效。" : ''
+      const receipt = firstBallot
+        ? notifications.voteFirstSuccessReceipt ? "投票已记录；在本轮结算开始前，你仍可改票。" : ''
+        : "已改票。"
+      if (receipt || invalidNotice) notifySession(session, [receipt, invalidNotice].filter(Boolean).join("\n"))
+      if (flag_notify) notifyPrivate(session, hostid,
+        seat + "号玩家" + player_name[activeIndex] + (firstBallot ? '' : '改票，')
+          + (target === 0 ? "弃权。" : "投给了" + target + "号玩家" + player_copy[target - 1] + "。"),
+        "实时投票通知")
+      if (target > 0) warnWeiInquiryConflict(session, target)
+      if (!overtime && seat === heros[HERO.HUANG_TAI_JI] && target > 0) {
+        notifySession(session, "谨遵陛下旨意，如果在第" + (round + 1) + "轮发言开始前，" + target
+          + "号玩家" + player_copy[target - 1] + "出局，则陛下可以获得一个“权”标记。")
       }
-      else if (add_indices.indexOf(order.indexOf(v)) !== -1 && v !== order[q]) {
-        if (heros[HERO.LIN_DAN_HAN] == order[q] && !linDanHanModule.votableTargets(heroState, [v]).includes(v)) {
-          return ("可汗，由于您之前西迁，不能再投票给" + v + "号玩家" + player_name[order.indexOf(v)] + "。")
-        }
-        if (isEmpty(add_vote[round - 1][d])) {
-          if (!(v === heros[HERO.LIN_DAN_HAN] && linDanHanModule.markVoteAttack(heroState, order[q]))) {
-            poll[order.indexOf(v)] += vote_num[order[q] - 1]
-          }
-          if(v === heros[HERO.SHI_KE_FA] && ((uc.indexOf(v) + 0.5) * (uc.indexOf(order[q]) + 0.5) > 0 && order[q]!==white)){
-            shiKeFaModule.addTeammateAttacker(heroState, order[q])
-          }
-          if (flag_notify) notifyPrivate(session, hostid, order[q] + "号玩家" + player_name[q] + "投给了" + v + "号玩家" + player_name[order.indexOf(v)] + "。", "实时投票通知")
-        }
-        else {
-          notifySession(session, "已改票。")
-          if (flag_notify) notifyPrivate(session, hostid, order[q] + "号玩家" + player_name[q] + "改票，投给了" + v + "号玩家" + player_name[order.indexOf(v)] + "。", "实时改票通知")
-          if (add_vote[round - 1][d] === heros[HERO.LIN_DAN_HAN] && linDanHanModule.hasPendingVoteAttack(heroState, order[q])) {
-            linDanHanModule.undoVoteAttack(heroState, order[q])
-          }
-          else if (add_vote[round - 1][d] !== 0){
-            poll[order.indexOf(add_vote[round - 1][d])] -= vote_num[order[q] - 1]
-            if(add_vote[round - 1][d] === heros[HERO.SHI_KE_FA] && ((uc.indexOf(heros[HERO.SHI_KE_FA]) + 0.5) * (uc.indexOf(order[q]) + 0.5) > 0 && order[q]!==white)){
-              shiKeFaModule.removeTeammateAttacker(heroState, order[q])
-            }
-          }
-          else waiver -= 1
-          if (!(v === heros[HERO.LIN_DAN_HAN] && linDanHanModule.markVoteAttack(heroState, order[q]))) {
-            poll[order.indexOf(v)] += vote_num[order[q] - 1]
-          }
-          if(v === heros[HERO.SHI_KE_FA] && ((uc.indexOf(v) + 0.5) * (uc.indexOf(order[q]) + 0.5) > 0 && order[q]!==white)){
-            shiKeFaModule.addTeammateAttacker(heroState, order[q])
-          }
-        }
-        add_vote[round - 1][d] = v
-      }
-      else return ("无效的投票语句，请重新输入。")
-      if (firstBallot && notifications.voteFirstSuccessReceipt) {
-        notifySession(session, "投票已记录；在本轮结算开始前，你仍可改票。")
-      }
-      flag = true
-      unvote = 0
-      fa_tot = 0
-      quan_tot = 0
-      skip = 0
-      let comp = 0
-      for (let i = 1; i <= add_voter.length; i++) {
-        if (isEmpty(add_vote[round - 1][i - 1]) && vote_num[order[player.indexOf(add_voter[i - 1])] - 1] !== 0) {
-          if(order[player.indexOf(add_voter[i - 1])] !== heros[HERO.MAO_WEN_LONG]){
-            flag = false
-            unvote += vote_num[order[player.indexOf(add_voter[i - 1])] - 1]
-          }
-          else comp += vote_num[order[player.indexOf(add_voter[i - 1])] - 1]
-        }
-        else if (vote_num[order[player.indexOf(add_voter[i - 1])] - 1] === 0) {
-          skip += 1
-        }
-        if (vote_num[order[player.indexOf(add_voter[i - 1])] - 1] !== 0) {
-          fa_tot += fa[order[player.indexOf(add_voter[i - 1])] - 1]
-        }
-      }
-      for (let j = 1; j <= player.length; j++) {
-        quan_tot += quan[order[j - 1] - 1]
-      }
-      if (flag === false) {
-        let max = poll.reduce((a, b) => Math.max(a, b), -Infinity)
-        let temp_max_idx = poll.indexOf(max)
-        if(order.indexOf(heros[HERO.SHI_KE_FA])!==-1 && shiKeFaModule.isResistanceAvailable(heroState) && shiKeFaModule.hasTeammateAttackers(heroState)){
-          poll[order.indexOf(heros[HERO.SHI_KE_FA])] -= 1
-        }
-        let flag_dorgun_val = false
-        const dorgonMark = duoErGunModule.strategyMark(heroState)
-        let d = dorgonMark.kind === "new" ? dorgonMark.seat : 0
-        if(dorgonMark.kind === "new" && poll[order.indexOf(d)] > 0){
-          poll[order.indexOf(d)] -= 1
-          flag_dorgun_val = true
-        }
-        if (poll.indexOf(max, temp_max_idx + 1) === -1) {
-          let poll_beheaded = poll.slice(0, temp_max_idx).concat(poll.slice(temp_max_idx + 1))
-          let max_2 = poll_beheaded.reduce((a, b) => Math.max(a, b), -Infinity)
-          if (max_2 + unvote + comp + fa_tot + quan_tot < max) {
-            flag = true
-            for (let i = 1; i <= add_voter.length; i++) {
-              if (isEmpty(add_vote[round - 1][i - 1]) && vote_num[order[player.indexOf(add_voter[i - 1])] - 1] !== 0) {
-                add_vote[round - 1][i - 1] = -1
-                lockedVoteSeats.add(votePhaseKey(order[player.indexOf(add_voter[i - 1])]))
-                notifyPrivate(session, add_voter[i - 1], "票数已够，无需你再进行投票。", "提前锁票通知")
-              }
-            }
-          }
-        }
-        if(order.indexOf(heros[HERO.SHI_KE_FA])!==-1 && shiKeFaModule.isResistanceAvailable(heroState) && shiKeFaModule.hasTeammateAttackers(heroState)){
-          poll[order.indexOf(heros[HERO.SHI_KE_FA])] += 1
-        }
-        if(flag_dorgun_val){
-          poll[order.indexOf(d)] += 1
-          flag_dorgun_val = false
-        }
-      }
-    }
-    else if (!quan_continue && !mao_continue) {
-      let d = player.indexOf(session.userId)
-      if (d == -1) return ("你未参加游戏或已出局，无法投票。")
-      const firstBallot = isEmpty(vote[round - 1][d])
-      let v_pre = vote[round - 1][d]
-      if (order[d] === heros[HERO.MAO_WEN_LONG]) return ("毛帅莫急，且待塘报至再做决断。")
-      if (vote_num[order[d] - 1] === 0) {
-        return ("因武将技能，你已跳过本次投票阶段。")
-      }
-      let v = Number(str_vote)
-      if (str_vote === "弃" || str_vote === "弃权") {
-        if (!isEmpty(vote[round - 1][d]) && vote[round - 1][d] !== 0) {
-          notifySession(session, "已改票。")
-          if (flag_notify) notifyPrivate(session, hostid, order[d] + "号玩家" + player_name[d] + "改票为弃权。", "实时加时改票通知")
-          if (vote[round - 1][d] === heros[HERO.LIN_DAN_HAN] && linDanHanModule.hasPendingVoteAttack(heroState, order[d])) {
-            linDanHanModule.undoVoteAttack(heroState, order[d])
-          }
-          else{
-            if (order[d] !== heros[HERO.LIN_DAN_HAN] || !linDanHanModule.isOwnVoteInvalidated(heroState)) {
-              poll[order.indexOf(vote[round - 1][d])] -= vote_num[order[d] - 1]
-            }
-            if(vote[round - 1][d] === heros[HERO.SHI_KE_FA] && ((uc.indexOf(heros[HERO.SHI_KE_FA]) + 0.5) * (uc.indexOf(order[d]) + 0.5) > 0 && order[d]!==white)){
-              shiKeFaModule.removeTeammateAttacker(heroState, order[d])
-            }
-          }
-        }
-        else if (vote[round - 1][d] === 0) waiver -= 1
-        else if (flag_notify) notifyPrivate(session, hostid, order[d] + "号玩家" + player_name[d] + "弃权。", "实时加时弃票通知")
-        vote[round - 1][d] = 0
-        waiver += 1
-      }
-      else if (order.indexOf(v) !== -1 && v !== order[d]) {
-        if (heros[HERO.LIN_DAN_HAN] == order[d] && !linDanHanModule.votableTargets(heroState, [v]).includes(v)) {
-          return ("可汗，由于您之前西迁，不能再投票给" + v + "号玩家" + player_name[order.indexOf(v)] + "。")
-        }
-        if (isEmpty(vote[round - 1][d])) {
-          if (!(v === heros[HERO.LIN_DAN_HAN] && linDanHanModule.markVoteAttack(heroState, order[d]))) {
-            poll[order.indexOf(v)] += vote_num[order[d] - 1]
-          }
-          if(v === heros[HERO.SHI_KE_FA] && ((uc.indexOf(v) + 0.5) * (uc.indexOf(order[d]) + 0.5) > 0 && order[d]!==white)){
-            shiKeFaModule.addTeammateAttacker(heroState, order[d])
-          }
-          if (flag_notify) notifyPrivate(session, hostid, order[d] + "号玩家" + player_name[d] + "投给了" + v + "号玩家" + player_name[order.indexOf(v)] + "。", "实时加时投票通知")
-        }
-        else {
-          notifySession(session, "已改票。")
-          if (flag_notify) notifyPrivate(session, hostid, order[d] + "号玩家" + player_name[d] + "改票，投给了" + v + "号玩家" + player_name[order.indexOf(v)] + "。", "实时加时改票通知")
-          if (vote[round - 1][d] === heros[HERO.LIN_DAN_HAN] && linDanHanModule.hasPendingVoteAttack(heroState, order[d])) {
-            linDanHanModule.undoVoteAttack(heroState, order[d])
-          }
-          else if (vote[round - 1][d] !== 0) {
-            if (order[d] !== heros[HERO.LIN_DAN_HAN] || !linDanHanModule.isOwnVoteInvalidated(heroState)) {
-              poll[order.indexOf(vote[round - 1][d])] -= vote_num[order[d] - 1]
-            }
-            if(vote[round - 1][d] === heros[HERO.SHI_KE_FA] && ((uc.indexOf(heros[HERO.SHI_KE_FA]) + 0.5) * (uc.indexOf(order[d]) + 0.5) > 0 && order[d]!==white)){
-              shiKeFaModule.removeTeammateAttacker(heroState, order[d])
-            }
-          }
-          else waiver -= 1
-          if (!(v === heros[HERO.LIN_DAN_HAN] && linDanHanModule.markVoteAttack(heroState, order[d]))) {
-            poll[order.indexOf(v)] += vote_num[order[d] - 1]
-          }
-          if(v === heros[HERO.SHI_KE_FA] && ((uc.indexOf(v) + 0.5) * (uc.indexOf(order[d]) + 0.5) > 0 && order[d]!==white)){
-            shiKeFaModule.addTeammateAttacker(heroState, order[d])
-          }
-        }
-        vote[round - 1][d] = v
-      }
-      else return ("无效的投票语句，请重新输入。")
-      if (firstBallot && notifications.voteFirstSuccessReceipt) {
-        notifySession(session, "投票已记录；在本轮结算开始前，你仍可改票。")
-      }
-      if (linDanHanModule.isAwakened(heroState) && (order[d] === heros[HERO.LIN_DAN_HAN] || v === heros[HERO.LIN_DAN_HAN] || (!isEmpty(v_pre) && v_pre!==0 && v_pre === heros[HERO.LIN_DAN_HAN]))) {
-        if (vote[round - 1][order.indexOf(v)] === order[d]) {
-          if (!linDanHanModule.isOwnVoteInvalidated(heroState) || order[d] === heros[HERO.LIN_DAN_HAN]) {
-            linDanHanModule.invalidateOwnVote(heroState)
-            poll[order.indexOf(vote[round - 1][order.indexOf(heros[HERO.LIN_DAN_HAN])])] -= vote_num[heros[HERO.LIN_DAN_HAN] - 1]
-            shiKeFaModule.removeTeammateAttacker(heroState, heros[HERO.LIN_DAN_HAN])
-          }
-        }
-        else {
-          if (linDanHanModule.isOwnVoteInvalidated(heroState) && v_pre === heros[HERO.LIN_DAN_HAN]) {
-            poll[order.indexOf(vote[round - 1][order.indexOf(heros[HERO.LIN_DAN_HAN])])] += vote_num[heros[HERO.LIN_DAN_HAN] - 1]
-          }
-          if (heros[HERO.LIN_DAN_HAN] !== vote[round - 1][order.indexOf(vote[round - 1][order.indexOf(heros[HERO.LIN_DAN_HAN])])]) {
-            linDanHanModule.restoreOwnVote(heroState)
-          }
-        }
-      }
-      if (order[d] === heros[HERO.HUANG_TAI_JI]) {
-        const trackedTarget = vote[round - 1][d] || null
-        huangTaiJiModule.recordVoteTarget(heroState, trackedTarget)
-        if (trackedTarget !== null) notifySession(session, "谨遵陛下旨意，如果在第" + (round + 1) + "轮发言开始前，" + trackedTarget + "号玩家" + player_name[order.indexOf(trackedTarget)] + "出局，则陛下可以获得一个“权”标记。")
-      }
-      flag = true
-      unvote = 0
-      fa_tot = 0
-      quan_tot = 0
-      skip = 0
-      let comp = 0
-      for (let i = 1; i <= player.length; i++) {
-        if (isEmpty(vote[round - 1][i - 1]) && vote_num[order[i - 1] - 1] !== 0) {
-          if(order[i - 1] !== heros[HERO.MAO_WEN_LONG]){
-            flag = false
-            unvote += vote_num[order[i - 1] - 1]
-          }
-          else comp += vote_num[order[i - 1] - 1]
-        }
-        else if (vote_num[order[i - 1] - 1] === 0) {
-          skip += 1
-        }
-        if (vote_num[order[i - 1] - 1] !== 0) {
-          fa_tot += fa[order[i - 1] - 1]
-        }
-        quan_tot += quan[order[i - 1] - 1]
-      }
-      if (flag === false) {
-        let flag_skf_val = true
-        if(order.indexOf(heros[HERO.SHI_KE_FA])!==-1 && shiKeFaModule.isResistanceAvailable(heroState)){
-          let v_skf = vote[round - 1][order.indexOf(heros[HERO.SHI_KE_FA])]
-          if(!isEmpty(v_skf) && order.indexOf(v_skf)!==-1 && ((uc.indexOf(heros[HERO.SHI_KE_FA]) + 0.5) * (uc.indexOf(v_skf) + 0.5) > 0 && v_skf!==white)){
-            flag_skf_val = false
-          }
-        }
-        else{
-          flag_skf_val = false
-        }
-        if(flag_skf_val && shiKeFaModule.hasTeammateAttackers(heroState)){
-          poll[order.indexOf(heros[HERO.SHI_KE_FA])] -= 1
-        }
-        let flag_dorgun_val = false
-        const dorgonMark = duoErGunModule.strategyMark(heroState)
-        let d = dorgonMark.kind === "new" ? dorgonMark.seat : 0
-        if(dorgonMark.kind === "new" && poll[order.indexOf(d)] > 0){
-          poll[order.indexOf(d)] -= 1
-          flag_dorgun_val = true
-        }
-        let max = poll.reduce((a, b) => Math.max(a, b), -Infinity)
-        let temp_max_idx = poll.indexOf(max)
-        if (poll.indexOf(max, temp_max_idx + 1) === -1) {
-          let poll_beheaded = poll.slice(0, temp_max_idx).concat(poll.slice(temp_max_idx + 1))
-          let max_2 = poll_beheaded.reduce((a, b) => Math.max(a, b), -Infinity)
-          if (max_2 + unvote + comp + fa_tot + quan_tot < max) {
-            flag = true
-            for (let i = 1; i <= player.length; i++) {
-              if (isEmpty(vote[round - 1][i - 1]) && vote_num[order[i - 1] - 1] !== 0) {
-                vote[round - 1][i - 1] = -1
-                lockedVoteSeats.add(votePhaseKey(order[i - 1]))
-                notifyPrivate(session, player[i - 1], "票数已够，无需你再进行投票。", "普通轮提前锁票通知")
-              }
-            }
-          }
-        }
-        if(flag_skf_val && shiKeFaModule.hasTeammateAttackers(heroState)){
-          poll[order.indexOf(heros[HERO.SHI_KE_FA])] += 1
-        }
-        if(flag_dorgun_val){
-          poll[order.indexOf(d)] += 1
-          flag_dorgun_val = false
-        }
-      }
+      await finishChangedProxyVote(session, overtime)
+      return
     }
     if (flag || quan_continue || mao_continue) {
       if (quan_continue) {
@@ -6296,6 +7396,7 @@ export function apply(ctx: Context, config: Config) {
           sumup += huangSeat + "号玩家" + player_copy[huangSeat - 1] + "使用" + choice.cost + "个权，为" + choice.targetSeat + "号玩家" + player_name[targetIndex] + "减少" + choice.reduction + "票。\n"
           recordSkill(HERO.HUANG_TAI_JI, '消耗' + choice.cost + '个权，减票' + choice.reduction, [choice.targetSeat])
         }
+        else recordSkill(HERO.HUANG_TAI_JI, '放弃本次减票')
         await resumeHuangTaiJiQuan(session, "input", choice.kind === "apply")
         return
       }
@@ -6332,14 +7433,35 @@ export function apply(ctx: Context, config: Config) {
     const out_player = player[out_index]
     const out_name = player_name[out_index]
     const voteSnapshot = !vote_off ? captureVoteRoster() : null
+    // `player_out()` clears a live delegated ballot when its delegate leaves.
+    // The roster snapshot is intentionally captured before that mutation so
+    // ordinary ballots can be retained across the seat removal, but replaying
+    // it must not resurrect the proxy ballot that was just invalidated. Keep
+    // the owner identity while the fixed-seat roster still contains it and
+    // remove only that owner's ballot from the snapshot before reconciliation.
+    const delegatedOwnerUserId = (() => {
+      const delegation = zhuYouXiaoVotes.current
+      if (!delegation || delegation.delegateSeat !== outcast || delegation.ownerSeat === null) return null
+      const ownerIndex = order.indexOf(delegation.ownerSeat)
+      return ownerIndex === -1 ? null : player[ownerIndex]
+    })()
+    const reconciliationSnapshot = voteSnapshot && delegatedOwnerUserId !== null
+      ? {
+          voterIds: voteSnapshot.voterIds.slice(),
+          ballots: voteSnapshot.ballots.map((ballot, index) =>
+            voteSnapshot.voterIds[index] === delegatedOwnerUserId
+              ? undefined as unknown as number
+              : ballot),
+        }
+      : voteSnapshot
     kickout.push(outcast)
     const reason = cause === "host"
       ? "被主持人踢出"
       : cause === "selection-timeout"
         ? "选人超时，被自动踢出"
-        : "主动退出游戏"
+        : cause === 'makeup-timeout' ? '补发言超时，被自动踢出' : "主动退出游戏"
     sumup += outcast + "号玩家" + out_name + reason + "。\n"
-    historyDepartureReasons.set(outcast, cause === 'host' ? 'kick' : cause === 'selection-timeout' ? 'timeout' : 'self-exit')
+    historyDepartureReasons.set(outcast, cause === 'host' ? 'kick' : cause === 'selection-timeout' || cause === 'makeup-timeout' ? 'timeout' : 'self-exit')
     await player_out(session, outcast, true, true)
     if (modeInteraction.mode === "deer") syncDeerHostReviewClock(session, false)
     await sendGroupNotice(session, outcast + "号玩家" + out_name + reason + "。", "玩家离场通知", guildId)
@@ -6386,7 +7508,7 @@ export function apply(ctx: Context, config: Config) {
           for (let i = 0; i < add_indices.length; i++) {
             if (out_index < add_indices[i]) add_indices[i] -= 1
           }
-          await reconcileVoteAfterRosterChange(session, outcast + "号玩家已被踢出", voteSnapshot!)
+          await reconcileVoteAfterRosterChange(session, outcast + "号玩家已被踢出", reconciliationSnapshot!)
         }
         else {
           gameTimers.cancel(timer_htj)
@@ -6425,7 +7547,7 @@ export function apply(ctx: Context, config: Config) {
         }
       }
       else {
-        await reconcileVoteAfterRosterChange(session, outcast + "号玩家已被踢出", voteSnapshot!)
+        await reconcileVoteAfterRosterChange(session, outcast + "号玩家已被踢出", reconciliationSnapshot!)
       }
     }
     else {
@@ -6469,7 +7591,7 @@ export function apply(ctx: Context, config: Config) {
     if (game_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
     let str_host = session.content.replace(/\s/g, "")
     if (session.user.authority >= 2 && (str_host === "停止卧底" || str_host === "中止卧底" || str_host === "终止卧底" || str_host === "结束卧底")) {
-      if (session.userId === hostid) {
+      if (isGameHost(session.userId)) {
         const outcome = "卧底被主持人终止。"
         end_game({ kind: 'aborted', reason: 'host-stop' }, outcome)
         sumup += "卧底被主持人终止。"
@@ -6483,7 +7605,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
     }
-    if (session.userId !== hostid) return next()
+    if (!isGameHost(session.userId)) return next()
     if (str_host === "停止卧底" || str_host === "中止卧底" || str_host === "终止卧底" || str_host === "结束卧底") {
       const outcome = "卧底被主持人终止。"
       end_game({ kind: 'aborted', reason: 'host-stop' }, outcome)
@@ -6506,7 +7628,7 @@ export function apply(ctx: Context, config: Config) {
     let str_nos = session.content.replace(/\s/g, "")
     if (str_nos !== "1") return next()
     const applicantName = await ensurePlayerNickname(session)
-    if (session.userId === hostid || personAlreadyRecorded(applicantName)) return next()
+    if (isGameHost(session.userId) || personAlreadyRecorded(applicantName)) return next()
     if (hasPendingReplacement()) return ("当前已有玩家正在申请补位，请等待该申请结束。")
     if (isRosterChangeBlocked()) return ("正在等待武将技能或主持人判定，暂时无法申请补位。")
     if (isEmpty(kickout)) return ("游戏已经开始且暂无人跳车，无法加人。")
@@ -6530,16 +7652,16 @@ export function apply(ctx: Context, config: Config) {
   ctx.guild().middleware(async (session, next) => {
     if (game_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
     let str_nos = session.content.replace(/\s/g, "")
-    if (session.userId === hostid && hasPendingReplacement() && replacementCancelCommands.has(str_nos)) {
+    if (isGameHost(session.userId) && hasPendingReplacement() && replacementCancelCommands.has(str_nos)) {
       const cancelledName = replacementRequest.applicant!.nickname
       resetReplacementRequest()
       return ("已取消" + cancelledName + "的补位申请。")
     }
     const pendingApplicant = replacementRequest.applicant
-    if (session.userId !== hostid && session.userId !== pendingApplicant?.userId) return next()
+    if (!isGameHost(session.userId) && session.userId !== pendingApplicant?.userId) return next()
 
     if (replacementRequest.phase === "awaiting-host") {
-      if (session.userId !== hostid) return next()
+      if (!isGameHost(session.userId)) return next()
       if (str_nos === "否") {
         const rejectedName = replacementRequest.applicant!.nickname
         resetReplacementRequest()
@@ -6605,6 +7727,7 @@ export function apply(ctx: Context, config: Config) {
         j += 1
       }
       player.splice(j, 0, applicant.userId)
+      hostSupport.recordParticipant(applicant.userId); hostParticipantKeys.add(personKey(applicant.nickname))
       player_name.splice(j, 0, applicant.nickname)
       order.splice(j, 0, replacementSeat)
       stalemate.reset()
@@ -6624,17 +7747,36 @@ export function apply(ctx: Context, config: Config) {
         if (isEmpty(uc) && flag_white && (!add_flag || add_indices.some(index => order[index] === white))) white_only = true
       }
       if (modeInteraction.mode === "deer") modeInteraction.syncDeerRoster(currentModeRoster(), white)
+      if (modeInteraction.mode === 'deer') {
+        const selection = modeInteraction.deerSelectionForSeat(replacementSeat)
+        if (selection && deerRevisions.restore(replacementSeat, selection.identityKey ?? selection.userId,
+          selection.userId, selection.approvedVersion ?? selection.version, Date.now())) {
+          const review = deerRevisions.review(replacementSeat)
+          if (review) await armDeerSpeechReview(session, review)
+          const makeup = deerRevisions.makeup(replacementSeat)
+          if (makeup) {
+            makeup.round = round
+            if (!ann_off) deerRevisions.noteSpeechDeadline(deerSpeechPhaseSerial, deerPhaseDeadline)
+            scheduleDeerMakeups(session)
+            notifyPrivate(session, selection.userId, '你仍需补一次发言，请发送自己的序号加发言内容。', '鹿补发言恢复')
+          }
+        }
+      }
       capture(r => {
         r.join(replacementSeat, historyIdentity(applicant.userId, applicant.nickname), historyCamp(replacementSeat),
           heros.includes(replacementSeat) ? heros.indexOf(replacementSeat) : null, Date.now())
         if (!add_flag) r.allowSpeakers([replacementSeat])
-        if (modeInteraction.mode === 'deer') r.choice(replacementSeat, null)
+        if (modeInteraction.mode === 'deer') r.choice(replacementSeat, modeInteraction.deerApprovedCandidate(replacementSeat) ?? null)
       })
       const needsBackfill = !add_flag && ann_off && !vote_off && !speechHistory.bySeat(replacementSeat)
         .some(record => record.round === round && !record.overtime)
       const replacementFailures: DealItem[] = []
       try {
         await sendTopicAssignment(session, player[j], replacementSeat, modeInteraction.mode === "deer")
+        if (modeInteraction.mode === 'deer' && modeInteraction.deerSelectionForSeat(replacementSeat)?.status === 'pending-host') {
+          syncDeerHostReviewClock(session, false)
+          await sendDeerSelectionRequest(session, replacementSeat)
+        }
       }
       catch (error) {
         replacementFailures.push("题面")
@@ -6749,56 +7891,31 @@ export function apply(ctx: Context, config: Config) {
   })
   ctx.guild().middleware(async (session: Session, next) => {//结束投票
     if (vote_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
-    if (session.userId !== hostid) return next()
+    if (!isGameHost(session.userId)) return next()
     let str_nos = session.content.replace(/\s/g, "")
     if (str_nos !== "结束投票" && str_nos !== "跳过投票" && str_nos !== "终止投票" && str_nos !== "中止投票" && str_nos !== "停止投票") return next()
-    let drag = 0
-    let novote = "目前，还有"
-    if (add_flag) {
-      for (let i = 0; i < add_voter.length; i++) {
-        let d = player.indexOf(add_voter[i])
-        if (isEmpty(add_vote[round - 1][i]) && vote_num[order[d] - 1] !== 0 && order[d] !== heros[HERO.MAO_WEN_LONG]) {
-          drag += 1
-          novote += order[d] + "号玩家" + player_name[d] + "，"
-        }
-      }
+    const voterIds = add_flag ? add_voter : player
+    const ballots = add_flag ? add_vote[round - 1] : vote[round - 1]
+    const missing = voterIds.map((id, index) => ({ index, seat: order[player.indexOf(id)] }))
+      .filter(({ index, seat }) => isEmpty(ballots[index]) && vote_num[seat - 1] !== 0 && seat !== heros[HERO.MAO_WEN_LONG])
+    const reporters = outstandingVoteReporters()
+    const novote = reporters.length ? "目前，还有" + reporters.map(reporter => reporter.seat + "号玩家" + reporter.name).join('，')
+      + "共" + reporters.length + "位玩家未完成投票，" : '目前没有尚待完成的投票，'
+    // Keep the established fixed-seat ballot threshold, not the number of
+    // people in the de-duplicated notification list.
+    if (missing.length >= voterIds.length / 3) {
+      return novote + "还请" + resolvePlayerNickname(session) + "大人不要心急，等大家再投一会票吧！"
     }
-    else {
-      for (let i = 0; i < player.length; i++) {
-        if (isEmpty(vote[round - 1][i]) && vote_num[order[i] - 1] !== 0 && order[i] !== heros[HERO.MAO_WEN_LONG]) {
-          drag += 1
-          novote += order[i] + "号玩家" + player_name[i] + "，"
-        }
-      }
+    for (const { index, seat } of missing) {
+      zhuYouXiaoAutoVoteReporter(seat, add_flag)
+      ballots[index] = -1
     }
-    novote = novote.slice(0, -1)
-    novote += "共" + drag + "位玩家未投票，"
-    if (drag >= (add_flag ? add_voter.length : player.length) / 3) {
-      novote += "人数有点多呢，还请" + resolvePlayerNickname(session) + "大人不要心急，等大家再投一会票吧！"
-      return (novote)
-    }
-    else {
-      if (add_flag) {
-        for (let i = 0; i < add_voter.length; i++) {
-          let d = player.indexOf(add_voter[i])
-          if (isEmpty(add_vote[round - 1][i]) && vote_num[order[d] - 1] !== 0 && order[d] !== heros[HERO.MAO_WEN_LONG]) {
-            add_vote[round - 1][i] = -1
-            notifyPrivate(session, add_voter[i], "你投票太慢啦，主持人已经结束了投票阶段~", "主持结束加时投票通知")
-          }
-        }
-      }
-      else {
-        for (let i = 0; i < player.length; i++) {
-          if (isEmpty(vote[round - 1][i]) && vote_num[order[i] - 1] !== 0 && order[i] !== heros[HERO.MAO_WEN_LONG]) {
-            vote[round - 1][i] = -1
-            notifyPrivate(session, player[i], "你投票太慢啦，主持人已经结束了投票阶段~", "主持结束投票通知")
-          }
-        }
-      }
-      novote += "不等他" + (drag === 1 ? "" : "们") + "投票了，已跳过投票阶段！"
-      notifySession(session, novote)
-      await timeout_vote(session)
-    }
+    for (const reporter of reporters) notifyPrivate(session, reporter.userId,
+      "你投票太慢啦，主持人已经结束了投票阶段~"
+        + (pendingSkillsFor(reporter.userId).length ? '\n你的待选技能仍按原期限处理，可发送“我的待处理”查看；本次投票不会重开。' : ''),
+      '主持结束投票通知')
+    notifySession(session, novote + '本次投票阶段结束。')
+    await timeout_vote(session)
   })
   ctx.guild().middleware((session, next) => {//谁没投
     if (vote_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
@@ -6807,20 +7924,13 @@ export function apply(ctx: Context, config: Config) {
       if (flag_just_vote) {
         return ("开始投票到现在还没到" + formatConfiguredDuration(config.hurryTimeout) + "呢，别着急嘛~")
       }
-      let novote = "目前，还有"
-      if (add_flag) {
-        for (let i = 0; i < add_voter.length; i++) {
-          let d = player.indexOf(add_voter[i])
-          if (isEmpty(add_vote[round - 1][i]) && vote_num[order[d] - 1] !== 0 && order[d] !== heros[HERO.MAO_WEN_LONG]) novote += order[d] + "号玩家" + player_name[d] + h('at', { id: player[d] }) + "，"
-        }
+      const reporters = outstandingVoteReporters()
+      if (!reporters.length) return "目前没有需要投票的玩家。"
+      for (const reporter of reporters) {
+        const details = privateVoteReminderDetails(reporter.userId)
+        if (details.length) notifyPrivate(session, reporter.userId, details.join('\n'), '待办催票提醒')
       }
-      else {
-        for (let i = 0; i < player.length; i++) {
-          if (isEmpty(vote[round - 1][i]) && vote_num[order[i] - 1] !== 0 && order[i] !== heros[HERO.MAO_WEN_LONG]) novote += order[i] + "号玩家" + player_name[i] + h('at', { id: player[i] }) + "，"
-        }
-      }
-      if (novote === "目前，还有") return "目前没有需要投票的玩家。"
-      return novote.slice(0, -1) + "未投票。"
+      return '目前，还有' + reporters.map(reporter => reporter.seat + '号玩家' + reporter.name + h('at', { id: reporter.userId })).join('，') + '未投票。'
     }
     else return next()
   })
@@ -6844,6 +7954,104 @@ export function apply(ctx: Context, config: Config) {
     }
     else return next()
   })
+  async function handleZhuYouXiaoHeirTarget(session: Session, next: () => any) {
+    if (game_off || !matchesActiveSession(session)) return next()
+    if (!pendingAction.matches("zhu-you-xiao-heir-target", {
+      userId: session.userId,
+      scope: "private",
+      gameEpoch: gameTimers.epoch,
+    })) return next()
+    const action = classifyHeirTargetInput({ content: session.content, activeSeats: order })
+    if (action.kind === "invalid-target") return "请选择当前仍在场的玩家序号。"
+    if (action.kind === "abandon") {
+      pendingAction.complete("zhu-you-xiao-heir-target")
+      recoverablePendingPrompts.delete("zhu-you-xiao-heir-target")
+      zhuYouXiaoHeirOwnerSeat = null
+      recordSkill(HERO.ZHU_YOU_XIAO, '放弃发动“传弟”')
+      notifySession(session, "您已放弃发动“传弟”。")
+      return
+    }
+    pendingAction.complete("zhu-you-xiao-heir-target")
+    recoverablePendingPrompts.delete("zhu-you-xiao-heir-target")
+    zhuYouXiaoHeirTargetSeat = action.seat
+    recordSkill(HERO.ZHU_YOU_XIAO, '指定传弟对象，等待其选择', [action.seat])
+    beginZhuYouXiaoHeirChoice(session, action.seat)
+    return "已选择" + action.seat + "号玩家作为传弟对象，请等待其私聊选择。"
+  }
+  async function handleZhuYouXiaoHeirChoice(session: Session, next: () => any) {
+    if (game_off || !matchesActiveSession(session)) return next()
+    if (!pendingAction.matches("zhu-you-xiao-heir-choice", {
+      userId: session.userId,
+      scope: "private",
+      gameEpoch: gameTimers.epoch,
+    })) return next()
+    if (zhuYouXiaoHeirTargetSeat === null || !order.includes(zhuYouXiaoHeirTargetSeat)) {
+      pendingAction.clear("zhu-you-xiao-heir-choice")
+      recoverablePendingPrompts.delete("zhu-you-xiao-heir-choice")
+      gameTimers.cancel(timer_zhu_you_xiao_heir)
+      return "传弟对象已离场，本次选择失效。"
+    }
+    const targetSeat = zhuYouXiaoHeirTargetSeat
+    const targetHeroId = heros.indexOf(targetSeat)
+    const options = zhuYouXiaoHeirOptions(targetHeroId === -1 ? null : targetHeroId)
+    const choice = classifyHeirChoiceInput({ content: session.content, options })
+    if (choice.kind === "invalid-option") return "请输入提示中的选项序号，或发送“弃”。"
+    pendingAction.complete("zhu-you-xiao-heir-choice")
+    recoverablePendingPrompts.delete("zhu-you-xiao-heir-choice")
+    gameTimers.cancel(timer_zhu_you_xiao_heir)
+    const targetIndex = order.indexOf(targetSeat)
+    const targetName = player_name[targetIndex]
+    let resultText = ""
+    if (choice.kind === "abandon") {
+      resultText = targetSeat + "号玩家" + targetName + "放弃接受朱由校的传弟。"
+      sumup += resultText + "\n"
+      recordSkill(HERO.ZHU_YOU_XIAO, "传弟被放弃", [targetSeat])
+      notifySession(session, "您已放弃接受“传弟”。")
+    }
+    else if (choice.kind === "reset") {
+      const previousGuard = targetHeroId === HERO.YUAN_CHONG_HUAN
+        ? heroState.yuanChongHuan.guard
+        : null
+      resetNativeHeroState(heroState, targetHeroId === -1 ? null : targetHeroId, {
+        activeSeats: order,
+        heroSeat: targetSeat,
+      })
+      if (previousGuard?.kind === "guarding") shield[previousGuard.seat - 1] = false
+      if (targetHeroId === HERO.WU_SAN_GUI && vote_num[targetSeat - 1] === 0) vote_num[targetSeat - 1] = 1
+      if (!vote_off && (targetHeroId !== -1)) rebuildPollFromBallots()
+      resultText = targetSeat + "号玩家" + targetName + "接受传弟，" + zhuYouXiaoResetDescription(targetHeroId)
+      sumup += resultText + "\n"
+      recordSkill(HERO.ZHU_YOU_XIAO, "传弟：" + targetName + "恢复原生技能", [targetSeat])
+      notifySession(session, "您已接受传弟。" + zhuYouXiaoResetDescription(targetHeroId))
+    }
+    else if (choice.kind === "grant-execution") {
+      zhuYouJianModule.grantExtraExecution(heroState, targetSeat)
+      resultText = targetSeat + "号玩家" + targetName + "接受传弟，获得技能“处决”。"
+      sumup += resultText + "\n"
+      recordSkill(HERO.ZHU_YOU_XIAO, "传弟：获得处决", [targetSeat])
+      notifySession(session, "您已获得技能“处决”，可在发言阶段按原规则使用。")
+    }
+    else {
+      const skillName = nativeLimitedSkillName(targetHeroId)
+      if (targetHeroId === HERO.WEI_ZHONG_XIAN) {
+        weiZhongXianModule.grantExtraSlander(heroState, targetSeat)
+      }
+      else if (targetHeroId === HERO.YUAN_CHONG_HUAN) {
+        yuanChongHuanModule.grantExtraSelfGuard(heroState, targetSeat)
+      }
+      else {
+        zhuYouJianModule.grantExtraExecution(heroState, targetSeat)
+      }
+      resultText = targetSeat + "号玩家" + targetName + "接受传弟，增加一次“" + skillName + "”发动次数。"
+      sumup += resultText + "\n"
+      recordSkill(HERO.ZHU_YOU_XIAO, "传弟：" + skillName + "次数+1", [targetSeat])
+      notifySession(session, "您已增加一次“" + skillName + "”发动次数。")
+    }
+    if (choice.kind !== "abandon") revealZhuYouXiaoDelegates(session)
+    zhuYouXiaoHeirTargetSeat = null
+    zhuYouXiaoHeirOwnerSeat = null
+    return
+  }
   //武将判定阶段
   ctx.guild().middleware(async (session: Session, next) => {//张献忠
     if (game_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
@@ -6879,6 +8087,7 @@ export function apply(ctx: Context, config: Config) {
       let out_index = order.indexOf(n_zxz)
       let out_player = player[out_index]
       if (out_index !== -1) {
+        weiZhongXianModule.recordAttack(heroState, heros[HERO.ZHANG_XIAN_ZHONG], n_zxz, weiZhongXianSeat())
         gameTimers.cancel(timer_zxz)
         zhangXianZhongModule.finishTargetSelection(heroState)
         const action = pendingAction.complete("zhang-xian-zhong-target")
@@ -6970,46 +8179,55 @@ export function apply(ctx: Context, config: Config) {
       else return ("不识别的语句，请张献忠发送目前还在场的玩家序号。")
     }
   })
-  ctx.guild().middleware(async (session, next) => {//朱由检
+  ctx.guild().middleware(async (session, next) => {//朱由检及传弟获得的处决
     if (ann_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
-    if (!zhuYouJianModule.isAvailable(heroState) || order.indexOf(heros[HERO.ZHU_YOU_JIAN]) === -1) return next()
-    if (session.userId !== player[order.indexOf(heros[HERO.ZHU_YOU_JIAN])]) return next()
+    const nativeZhuSeat = heros[HERO.ZHU_YOU_JIAN]
+    const actorIndex = player.indexOf(session.userId)
+    if (actorIndex === -1) return next()
+    const actorSeat = order[actorIndex]
+    if (!zhuYouJianModule.isAvailableForSeat(heroState, actorSeat, nativeZhuSeat)) return next()
     const zhuAction = zhuYouJianModule.onSpeechAction({
       content: session.content,
-      actorSeat: heros[HERO.ZHU_YOU_JIAN],
+      actorSeat,
       activeSeats: order,
       undercoverSeats: uc,
       whiteSeat: white,
+      // Execution treats a white actor as good; slander only overlays that
+      // skill-specific base rule, not the general three-camp comparison.
+      isDifferentFaction: (actor, target) => weiFactionOverride(actor, target,
+        uc.includes(actor) !== uc.includes(target)),
     })
     if (zhuAction.kind === "ignore") return next()
     if (!isEligibleSpeechSeat({
-      seat: heros[HERO.ZHU_YOU_JIAN],
+       seat: actorSeat,
       activeSeats: order,
       overtime: add_flag,
       overtimeSeats: add_indices.map(index => order[index]),
     })) {
       return "你不属于本次加时的发言玩家，不能发动处决。"
     }
-    if (modeInteraction.mode === "deer" && deerSeatNeedsSelection(heros[HERO.ZHU_YOU_JIAN])) {
+    if (modeInteraction.mode === "deer" && deerSeatNeedsSelection(actorSeat)) {
       return "你需要先完成鹿模式选人并通过主持人审核，才能发动处决。"
     }
     // if (round <= uc_num && player_copy.length - player.length - kickout.length < uc_num) {
     //   return
     // }
     if(boom_pending){
-      notifyPrivate(session, player[order.indexOf(heros[HERO.ZHU_YOU_JIAN])], "陛下，有玩家自爆了，恕臣无法将旨意送达。", "朱由检自爆期间处决拒绝通知")
+       notifyPrivate(session, player[actorIndex], "陛下，有玩家自爆了，恕臣无法将旨意送达。", "朱由检自爆期间处决拒绝通知")
       return
     }
     if (zhuAction.kind === "invalid-target") {
-      notifyPrivate(session, player[order.indexOf(heros[HERO.ZHU_YOU_JIAN])], "陛下，您要处决的对象似乎查无此人。", "朱由检无效处决目标通知")
+       notifyPrivate(session, player[actorIndex], "陛下，您要处决的对象似乎查无此人。", "朱由检无效处决目标通知")
       return
     }
     const kill = zhuAction.chosenSeat
-    const zhuIdentity = publicHeroIdentity(heros[HERO.ZHU_YOU_JIAN], true)
+    weiZhongXianModule.recordAttack(heroState, actorSeat, kill, weiZhongXianSeat())
+    const zhuIdentity = publicHeroIdentity(actorSeat, true)
     notifySession(session, zhuIdentity + "，并选择处决" + kill + "号玩家" + player_name[order.indexOf(kill)] + "!")
     sumup += zhuIdentity + "，并选择处决" + kill + "号玩家" + player_name[order.indexOf(kill)] + ";"
-    recordSkill(HERO.ZHU_YOU_JIAN, '处决：' + ({ success: '命中异阵营', 'self-execution': '自裁', backlash: '同阵营反噬' }[zhuAction.verdict] ?? '同阵营反噬'), [kill])
-    zhuYouJianModule.activate(heroState)
+    recordActorSkill(actorSeat, HERO.ZHU_YOU_JIAN,
+      '处决：' + ({ success: '命中异阵营', 'self-execution': '自裁', backlash: '同阵营反噬' }[zhuAction.verdict] ?? '同阵营反噬'), [kill])
+    zhuYouJianModule.activateForSeat(heroState, actorSeat, nativeZhuSeat)
     const outcast = zhuAction.eliminatedSeat
     if (zhuAction.verdict === "success") {
       notifySession(session, "处决成功！")
@@ -7022,28 +8240,28 @@ export function apply(ctx: Context, config: Config) {
           notifySession(session, "陛下————😭")
           break
         case 2:
-          notifySession(session, player_name[order.indexOf(heros[HERO.ZHU_YOU_JIAN])] + "：任贼分裂朕尸，勿伤百姓一人😰")
+           notifySession(session, player_name[actorIndex] + "：任贼分裂朕尸，勿伤百姓一人😰")
           break
         case 3:
-          notifySession(session, player_name[order.indexOf(heros[HERO.ZHU_YOU_JIAN])] + "：皆诸臣误朕也😡")
+           notifySession(session, player_name[actorIndex] + "：皆诸臣误朕也😡")
           break
         default:
           notifySession(session, "出错了。")
       }
-      sumup += "朱由检自裁，"
+       sumup += zhuIdentity + "自裁，"
     }
     else {
       notifySession(session, "处决失败。")
       sumup += "处决失败，"
     }
     const linProtection = outcast === heros[HERO.LIN_DAN_HAN] && !shield[outcast - 1]
-      ? linDanHanModule.protectFromSkill(heroState, heros[HERO.ZHU_YOU_JIAN])
+      ? linDanHanModule.protectFromSkill(heroState, actorSeat)
       : { protected: false, awakenedNow: false }
     if (shield[outcast - 1] || linProtection.protected) {
       if (linProtection.awakenedNow) announceLinDanHanAwakening(session)
-      notifySession(session, outcast + "号玩家" + player_name[order.indexOf(outcast)] + "受武将技能保护，不出局，朱由检技能发动失效。")
-      recordSkill(HERO.ZHU_YOU_JIAN, '处决被保护抵消', [outcast])
-      sumup += (outcast + "号玩家" + player_name[order.indexOf(outcast)] + "受武将技能保护，不出局，朱由检技能发动失效。\n")
+      notifySession(session, outcast + "号玩家" + player_name[order.indexOf(outcast)] + "受武将技能保护，不出局，处决未能使其出局。")
+      recordActorSkill(actorSeat, HERO.ZHU_YOU_JIAN, '处决被保护抵消', [outcast])
+      sumup += (outcast + "号玩家" + player_name[order.indexOf(outcast)] + "受武将技能保护，不出局，处决未能使其出局。\n")
       return
     }
     const executionText = zhuAction.verdict === "self-execution"
@@ -7178,6 +8396,7 @@ export function apply(ctx: Context, config: Config) {
       gameTimers.cancel(timer_wsg)
       const outcast = choice.seat
       let out_index = order.indexOf(outcast)
+      weiZhongXianModule.recordAttack(heroState, heros[HERO.WU_SAN_GUI], outcast, weiZhongXianSeat())
       const completion = wuSanGuiModule.completeChoice(heroState)
       pendingAction.complete("wu-san-gui-overtime-choice")
       if(completion.skipNextVote){
@@ -7245,8 +8464,8 @@ export function apply(ctx: Context, config: Config) {
     }
   })
   ctx.exclude(ctx.guild()).middleware(async (session, next) => {//袁崇焕
-    if (vote_off || add_flag || !matchesActiveSession(session)) return next()
-    if (order.indexOf(heros[HERO.YUAN_CHONG_HUAN]) === -1 || yuanChongHuanModule.retaliationTarget(heroState) !== null) return next()
+    if (game_off || !matchesActiveSession(session)) return next()
+    if (order.indexOf(heros[HERO.YUAN_CHONG_HUAN]) === -1) return next()
     if (session.userId !== player[order.indexOf(heros[HERO.YUAN_CHONG_HUAN])]) return next()
     const action = yuanChongHuanModule.classifyGuardInput(heroState, {
       content: session.content,
@@ -7255,9 +8474,21 @@ export function apply(ctx: Context, config: Config) {
       whiteSeat: white,
     })
     if (action.kind === "ignore") return next()
+    if (add_flag) return '守卫和专镇只能在普通投票阶段使用。'
+    if (!yuanChongHuanModule.isVoteWindowOpen(heroState, votePhaseSerial)) return '请在普通投票阶段使用“守卫”或“专镇”；票数公开前可修改或放弃。'
+    if (action.kind === "abandon") {
+      const previous = yuanChongHuanModule.abandonGuard(heroState)
+      if (previous === null) return "督师，您本轮尚未设置守卫。"
+      shield[previous - 1] = false
+      notifySession(session, "得令！已放弃对" + previous + "号玩家" + player_name[order.indexOf(previous)] + "的守卫。")
+      sumup += "第" + heros[HERO.YUAN_CHONG_HUAN] + "号玩家" + player_name[order.indexOf(heros[HERO.YUAN_CHONG_HUAN])] + "（袁崇焕）放弃对" + previous + "号玩家" + player_name[order.indexOf(previous)] + "的守卫。\n"
+      recordSkill(HERO.YUAN_CHONG_HUAN, "放弃守卫", [previous])
+      return
+    }
     if (action.kind === "invalid-target") return ("督师，恕卑职找不到您要守的对象，还请重新选择。")
     if (action.kind === "previous-target-forbidden") return ("督师，您上一轮便守卫了" + action.seat + "号玩家" + player_name[order.indexOf(action.seat)] + "，陛下有令，还请您另作选择！")
-    if (action.kind === "self-forbidden") return ("督师，您不是白板，无法守卫自己，还请您另作选择！")
+    if (action.kind === "self-forbidden") return "督师，守卫自己请发送“专镇”。"
+    if (action.kind === "self-unavailable") return "督师，您已没有可用的“专镇”。"
     const guard = action.seat
     if (action.replacedSeat !== null) {
       notifySession(session, "得令！已放弃对" + action.replacedSeat + "号玩家" + player_name[order.indexOf(action.replacedSeat)] + "的守卫；" + guard + "号玩家" + player_name[order.indexOf(guard)] + "会得到守卫。")
@@ -7271,11 +8502,11 @@ export function apply(ctx: Context, config: Config) {
       recordSkill(HERO.YUAN_CHONG_HUAN, '设置守卫目标', [guard])
     }
     yuanChongHuanModule.selectGuard(heroState, guard)
-    shield[guard - 1] = true
+    shield[guard - 1] = !heroState.yuanChongHuan.voteAttackerSeats.includes(guard)
   })
 
   ctx.exclude(ctx.guild()).middleware(async (session, next) => {//多尔衮
-    if (vote_off || add_flag || !matchesActiveSession(session)) return next()
+    if (game_off || !matchesActiveSession(session)) return next()
     if (order.indexOf(heros[HERO.DUO_ER_GUN]) === -1) return next()
     if (session.userId !== player[order.indexOf(heros[HERO.DUO_ER_GUN])]) return next()
     const action = duoErGunModule.classifyStrategyInput(heroState, {
@@ -7284,6 +8515,7 @@ export function apply(ctx: Context, config: Config) {
       heroSeat: heros[HERO.DUO_ER_GUN],
     })
     if (action.kind === "ignore") return next()
+    if (vote_off || add_flag) return '定策只能在普通投票阶段使用。'
     if (action.kind === "skill-spent") return ("您已失去“定策”技能。")
     if (action.kind === "invalid-target") return ("王爷，恕奴才找不到您要立的对象，还请重新选择。")
     if (action.kind === "established-target-unchanged") return ("王爷，" + action.seat + "号玩家" + player_name[order.indexOf(action.seat)] + "已有“定策”标记了，本次操作无效。")
@@ -7356,6 +8588,7 @@ export function apply(ctx: Context, config: Config) {
     if (action.kind === "abandon"){
       shiKeFaModule.abandonGift(heroState)
       pendingAction.complete("shi-ke-fa-gift")
+      recordSkill(HERO.SHI_KE_FA, '放弃发动“落梅”')
       notifySession(session, "您已放弃发动技能。")
     }
     else if(action.kind === "target"){

@@ -108,6 +108,7 @@ export interface HarnessXpPointsService {
   ): Promise<{ profileId: number, accountId?: string, nickname: string, automatic: boolean }>
   getManagedIdentity?(platform: string, userId: string): Promise<{ profileId: number, accountId: string, nickname: string } | null>
   resolveCanonicalProfileId?(profileId: number): Promise<number>
+  getPeriodWindow?(systemKey: string, options: { kind: 'day' | 'week' | 'month' | 'year' | 'season'; offset?: number }): Promise<{ start: number; end: number } | undefined>
   registerAccountConsumer?(name: string): {
     acquire(targets: readonly { platform: string, userId: string }[]): Promise<{
       accounts: Array<{ accountId: string, profileId: number, nickname: string }>, release(): void
@@ -266,7 +267,6 @@ export class UndercoverGameHarness {
   failNextGroupMessages(count = 1, error = new Error("group message failed"), channelId = this.guildId): void {
     this.bot.groupMessageFailures.set(channelId, Array.from({ length: count }, () => error))
   }
-
   async emitGuildMemberAdded(userId: string): Promise<void> {
     const members = this.bot.guildMembers.get(this.guildId) ?? new Set<string>()
     members.add(userId)

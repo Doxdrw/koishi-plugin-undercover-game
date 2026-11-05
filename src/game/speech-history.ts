@@ -1,4 +1,4 @@
-import type { HistorySpeechSegment } from './history-snapshot'
+import type { HistorySpeechSegment, InvalidatedSpeech } from './history-snapshot'
 
 export interface SpeechHistoryRecord {
   round: number
@@ -7,6 +7,9 @@ export interface SpeechHistoryRecord {
   nickname: string
   text: string
   segments?: HistorySpeechSegment[]
+  identityKey?: string
+  invalidReason?: string
+  previousInvalid?: InvalidatedSpeech[]
 }
 
 export interface SpeechHistoryPhase {
@@ -24,7 +27,18 @@ export class SpeechHistory {
   record(input: SpeechHistoryRecord): void {
     const text = input.text.trim()
     if (!text) return
-    this.records.set(recordKey(input), { ...input, text, segments: input.segments ? structuredClone(input.segments) : undefined })
+    const previous = this.records.get(recordKey(input))
+    const previousInvalid = previous?.previousInvalid ? structuredClone(previous.previousInvalid) : []
+    if (previous?.invalidReason) previousInvalid.push({ text: previous.text, reason: previous.invalidReason, segments: previous.segments })
+    this.records.set(recordKey(input), { ...input, text, segments: input.segments ? structuredClone(input.segments) : undefined,
+      ...(previousInvalid.length ? { previousInvalid } : {}) })
+  }
+
+  invalidate(records: readonly SpeechHistoryRecord[], reason: string): void {
+    for (const input of records) {
+      const record = this.records.get(recordKey(input))
+      if (record && record.text === input.text && record.identityKey === input.identityKey) record.invalidReason = reason
+    }
   }
 
   bySeat(seat: number): SpeechHistoryRecord[] {

@@ -1,5 +1,7 @@
 import { HERO, HERO_NUM, createHeroState } from "../heroes"
 import type { HeroState } from "../heroes"
+import { createWeiZhongXianState } from "./wei-zhong-xian-state"
+import type { WeiZhongXianState } from "./wei-zhong-xian-state"
 
 export type Seat = number
 
@@ -43,6 +45,8 @@ export interface HeroStateStore {
   readonly zhuYouJian: {
     executionUsed: boolean
   }
+  /** Extra uses granted by a transfer skill; native uses are reset separately. */
+  readonly grantedLimitedUses: Record<string, number>
   readonly wuSanGui: {
     authorityPhase: WuSanGuiAuthorityPhase
     progress: WuSanGuiProgress
@@ -56,12 +60,17 @@ export interface HeroStateStore {
   readonly yuanChongHuan: {
     guard: YuanChongHuanGuardState
     previousGuardTarget: Seat | null
+    windowSerial: number | null
+    windowLocked: boolean
+    voteAttackerSeats: Seat[]
+    selfGuardUsed: boolean
   }
   readonly linDanHan: {
     ownVoteInvalidated: boolean
     awakened: boolean
     realityRecords: number[]
     preventedVotePower: number
+    pendingVoteAwakening: { phaseSerial: number; qualified: boolean } | null
   }
   readonly shiKeFa: {
     mode: ShiKeFaMode
@@ -77,6 +86,7 @@ export interface HeroStateStore {
     regencySeats: Seat[]
     regencyState: DuoErGunRegencyState
   }
+  readonly weiZhongXian: WeiZhongXianState
 }
 
 function readBoolean(value: number): boolean {
@@ -88,6 +98,7 @@ function writeBoolean(value: boolean): number {
 }
 
 export function adaptHeroState(legacy: HeroState): HeroStateStore {
+  const grantedLimitedUses: Record<string, number> = Object.create(null) as Record<string, number>
   return {
     legacy,
     zhangXianZhong: {
@@ -114,6 +125,7 @@ export function adaptHeroState(legacy: HeroState): HeroStateStore {
         legacy.flag1[HERO.ZHU_YOU_JIAN] = writeBoolean(value)
       },
     },
+    grantedLimitedUses,
     wuSanGui: {
       get authorityPhase() {
         return legacy.flag1[HERO.WU_SAN_GUI] as WuSanGuiAuthorityPhase
@@ -157,6 +169,10 @@ export function adaptHeroState(legacy: HeroState): HeroStateStore {
       },
     },
     yuanChongHuan: {
+      windowSerial: null,
+      windowLocked: true,
+      voteAttackerSeats: [],
+      selfGuardUsed: false,
       get guard(): YuanChongHuanGuardState {
         const value = legacy.flag1[HERO.YUAN_CHONG_HUAN]
         if (value < 0) return { kind: "retaliation-pending", seat: -value }
@@ -176,6 +192,7 @@ export function adaptHeroState(legacy: HeroState): HeroStateStore {
       },
     },
     linDanHan: {
+      pendingVoteAwakening: null,
       get ownVoteInvalidated() {
         return readBoolean(legacy.flag1[HERO.LIN_DAN_HAN])
       },
@@ -270,6 +287,7 @@ export function adaptHeroState(legacy: HeroState): HeroStateStore {
             : value.kind === "armed" ? 2 : value.encodedVoteDifference
       },
     },
+    weiZhongXian: createWeiZhongXianState(),
   }
 }
 

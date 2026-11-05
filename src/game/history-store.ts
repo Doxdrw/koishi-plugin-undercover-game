@@ -96,14 +96,18 @@ export class HistoryStore {
       if ((marker && snapshot.endedAt < marker.cutoff) || this.mediaRetention.mode === 'days'
         && snapshot.endedAt < Date.now() - Math.max(1, this.mediaRetention.days) * 86400000) {
         for (const phase of sanitized.phases) for (const speech of phase.speeches) {
-          if (speech.segments?.some(s => s.kind === 'media')) speech.segments = speech.segments.filter(s => s.kind !== 'media')
+          for (const item of [speech, ...(speech.previousInvalid ?? [])]) {
+            if (item.segments?.some(s => s.kind === 'media')) item.segments = item.segments.filter(s => s.kind !== 'media')
+          }
         }
       }
       const { phases, deerChoices, ...header } = sanitized
+      const departureReasons = phases.flatMap(phase => phase.events.flatMap(event => event.kind === 'departure'
+        ? [{ tenureId: event.tenureId, reason: event.reason }] : []))
       const row = await db.create('undercover_history_game', {
         gameId: snapshot.gameId, platform: snapshot.platform, selfId: snapshot.selfId, guildId: snapshot.guildId,
         mode: snapshot.mode, disposition, startedAt: snapshot.startedAt, endedAt: snapshot.endedAt,
-        digest, payload: JSON.stringify(header),
+        digest, payload: JSON.stringify({ ...header, departureReasons }),
       })
       for (const phase of phases) await db.create('undercover_history_phase', {
         gameId: snapshot.gameId, sequence: phase.sequence, payload: JSON.stringify(phase),
@@ -154,16 +158,18 @@ export class HistoryStore {
       if (row.endedAt >= cutoff) continue
       const phases = await db.get('undercover_history_phase', { gameId: row.gameId })
       for (const phaseRow of phases) {
-        const phase = JSON.parse(phaseRow.payload) as { speeches?: Array<{ segments?: Array<{ kind: string }> }> }
+        const phase = JSON.parse(phaseRow.payload) as { speeches?: Array<{ segments?: Array<{ kind: string }>; previousInvalid?: Array<{ segments?: Array<{ kind: string }> }> }> }
         let phaseChanged = false
         if (Array.isArray(phase.speeches)) {
           for (const speech of phase.speeches) {
-            if (!Array.isArray(speech.segments)) continue
-            const retainedSegments = speech.segments.filter(segment => segment.kind !== 'media')
-            if (retainedSegments.length === speech.segments.length) continue
-            phaseChanged = true
-            if (retainedSegments.length) speech.segments = retainedSegments
-            else delete speech.segments
+            for (const item of [speech, ...(speech.previousInvalid ?? [])]) {
+              if (!Array.isArray(item.segments)) continue
+              const retainedSegments = item.segments.filter(segment => segment.kind !== 'media')
+              if (retainedSegments.length === item.segments.length) continue
+              phaseChanged = true
+              if (retainedSegments.length) item.segments = retainedSegments
+              else delete item.segments
+            }
           }
         }
         if (phaseChanged) {

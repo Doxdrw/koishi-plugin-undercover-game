@@ -7,6 +7,9 @@ export type PendingActionKind =
   | "wu-san-gui-overtime-choice"
   | "zhang-xian-zhong-target"
   | "shi-ke-fa-gift"
+  | "zhu-you-xiao-heir-target"
+  | "zhu-you-xiao-heir-choice"
+  | "zhu-you-xiao-proxy-vote"
   | "host-adjudication"
 
 export type PendingActionChannel =

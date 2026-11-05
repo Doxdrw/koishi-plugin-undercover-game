@@ -1,4 +1,5 @@
 import type { DuoErGunStrategyMark, ShiKeFaMode } from "./hero-state"
+import type { BallotEffect } from './vote-ballots'
 
 export type VoteResolutionStatus = "complete" | "locked" | "pending"
 
@@ -20,6 +21,8 @@ export interface VoteResolutionStatusInput {
     whiteSeat: number
   }
   duoErGunStrategyMark: DuoErGunStrategyMark
+  isSameFaction?: (firstSeat: number, secondSeat: number) => boolean
+  zhuYouXiao?: { ownerSeat: number, ballotEffects?: readonly BallotEffect[] }
 }
 
 function isPendingBallot(ballot: number | null | undefined): boolean {
@@ -59,6 +62,30 @@ export function getVoteResolutionStatus(input: VoteResolutionStatusInput): VoteR
   // Mao Wenlong acts separately after the regular voters have finished.
   if (pendingPower === 0) return "complete"
 
+  // A still-pending owner can change which existing ballot against him is
+  // invalidated. Bound that additional influence without reopening completed
+  // voters' general right to change votes or disabling early locks globally.
+  let delegationDecrease = 0
+  let delegationIncrease = 0
+  const owner = input.zhuYouXiao?.ownerSeat
+  const ownerIndex = owner === undefined ? -1 : input.playerOrder.indexOf(owner)
+  const ownerVoter = ownerIndex === -1 ? -1 : input.voterIds.indexOf(input.playerIds[ownerIndex])
+  if (ownerVoter !== -1 && isPendingBallot(input.ballots[ownerVoter])) {
+    const effects = input.zhuYouXiao?.ballotEffects
+    delegationIncrease = effects?.filter(effect => effect.invalidReasons.length === 1
+      && effect.invalidReasons[0] === 'zhu-you-xiao-delegation').reduce((sum, effect) => sum + effect.weight, 0) ?? 0
+    for (let i = 0; i < input.voterIds.length; i++) {
+      if (input.ballots[i] !== owner) continue
+      const index = input.playerIds.indexOf(input.voterIds[i])
+      if (index === -1) continue
+      const seat = input.playerOrder[index]
+      const effect = effects?.find(effect => effect.voterSeat === seat)
+      if (effect && effect.invalidReasons.length) continue
+      delegationDecrease = Math.max(delegationDecrease, input.votePower[seat - 1] + input.fa[seat - 1])
+    }
+    delegationDecrease = Math.max(0, delegationDecrease - delegationIncrease)
+  }
+
   const adjustedPoll = input.poll.slice()
   const shiKeFaPlayerIndex = input.playerOrder.indexOf(input.shiKeFa.seat)
   if (shiKeFaPlayerIndex !== -1
@@ -68,8 +95,10 @@ export function getVoteResolutionStatus(input: VoteResolutionStatusInput): VoteR
     const shiKeFaTarget = shiKeFaVoterIndex === -1 ? 0 : input.ballots[shiKeFaVoterIndex]
     const votedForTeammate = typeof shiKeFaTarget === "number"
       && input.playerOrder.indexOf(shiKeFaTarget) !== -1
-      && (input.shiKeFa.undercoverSeats.indexOf(input.shiKeFa.seat) + 0.5)
-        * (input.shiKeFa.undercoverSeats.indexOf(shiKeFaTarget) + 0.5) > 0
+      && (input.isSameFaction
+        ? input.isSameFaction(input.shiKeFa.seat, shiKeFaTarget)
+        : (input.shiKeFa.undercoverSeats.indexOf(input.shiKeFa.seat) + 0.5)
+          * (input.shiKeFa.undercoverSeats.indexOf(shiKeFaTarget) + 0.5) > 0)
       && shiKeFaTarget !== input.shiKeFa.whiteSeat
     if (!votedForTeammate) adjustedPoll[shiKeFaPlayerIndex] -= 1
   }
@@ -93,7 +122,8 @@ export function getVoteResolutionStatus(input: VoteResolutionStatusInput): VoteR
     (value, current, index) => index === maxIndex ? value : Math.max(value, current),
     -Infinity,
   )
-  return runnerUp + pendingPower + maoPower + availableFa + availableQuan < max
+  const delegationInfluence = input.playerOrder[maxIndex] === owner ? delegationDecrease : delegationIncrease
+  return runnerUp + pendingPower + maoPower + availableFa + availableQuan + delegationInfluence < max
     ? "locked"
     : "pending"
 }

@@ -17,7 +17,11 @@ export interface DeerSelectionState {
   readonly seat: number
   userId: string
   nickname: string
+  identityKey?: string
   status: DeerSelectionStatus
+  version: number
+  approvedCandidate?: string
+  approvedVersion?: number
   candidate?: string
   requestMessageIds?: string[]
   requestMessageContent?: string
@@ -35,6 +39,7 @@ export interface ModeRosterMember {
   readonly seat: number
   readonly userId: string
   readonly nickname: string
+  readonly identityKey?: string
 }
 
 export interface ModeMessageReference {
@@ -60,7 +65,7 @@ export type DeerSubmissionResult =
   | { readonly kind: "empty" | "common-term" | "not-player" | "pending" | "approved" }
 
 export type DeerReviewResult =
-  | { readonly kind: "approved" | "rejected", readonly selection: DeerSelectionState, readonly reason?: string }
+  | { readonly kind: "approved" | "rejected", readonly selection: DeerSelectionState, readonly reason?: string, readonly previousCandidate?: string }
   | { readonly kind: "not-found" }
   | { readonly kind: "not-pending" }
 
@@ -301,6 +306,16 @@ export function parseTurtleHostInput(content: string, quotedSeat?: number): Turt
 
 export class ModeInteractionCoordinator {
   private currentState: GameModeState = createGameModeState("classic")
+  private deerArchive = new Map<string, DeerSelectionState>()
+  private deerIdentityKey(member: Pick<ModeRosterMember, 'seat' | 'userId' | 'identityKey'>): string {
+    return JSON.stringify([member.seat, member.identityKey ?? member.userId])
+  }
+  private archiveDeer(selection: DeerSelectionState): void {
+    const saved = structuredClone(selection)
+    delete saved.requestMessageIds; delete saved.requestMessageContent
+    delete saved.selectionDeadlineAt
+    this.deerArchive.set(this.deerIdentityKey(saved), saved)
+  }
 
   get state(): GameModeState {
     return this.currentState
@@ -315,6 +330,7 @@ export class ModeInteractionCoordinator {
   }
 
   reset(mode: GameMode): GameModeState {
+    this.deerArchive.clear()
     this.currentState = createGameModeState(mode)
     return this.currentState
   }
@@ -333,27 +349,35 @@ export class ModeInteractionCoordinator {
       .map(member => [member.seat, member]))
 
     for (const seat of state.selections.keys()) {
-      if (!expected.has(seat)) state.selections.delete(seat)
+      if (!expected.has(seat)) this.removeDeerSeat(seat)
     }
 
     for (const member of expected.values()) {
       const current = state.selections.get(member.seat)
-      if (!current || current.userId !== member.userId) {
-        state.selections.set(member.seat, {
+      if (!current || this.deerIdentityKey(current) !== this.deerIdentityKey(member)) {
+        if (current) this.archiveDeer(current)
+        const saved = this.deerArchive.get(this.deerIdentityKey(member))
+        state.selections.set(member.seat, saved ? { ...structuredClone(saved), ...member } : {
           seat: member.seat,
           userId: member.userId,
           nickname: member.nickname,
+          identityKey: member.identityKey,
           status: "waiting-player",
+          version: 0,
         })
       }
       else {
         current.nickname = member.nickname
+        current.userId = member.userId
       }
     }
   }
 
   removeDeerSeat(seat: number): boolean {
-    return this.requireDeer().selections.delete(seat)
+    const state = this.requireDeer()
+    const selection = state.selections.get(seat)
+    if (selection) this.archiveDeer(selection)
+    return state.selections.delete(seat)
   }
 
   beginDeerSelectionClock(seat: number, deadlineAt: number): DeerSelectionState | null {
@@ -367,8 +391,7 @@ export class ModeInteractionCoordinator {
     const state = this.requireDeer()
     const selection = [...state.selections.values()].find(value => value.userId === userId)
     if (!selection) return { kind: "not-player" }
-    if (selection.status === "pending-host") return { kind: "pending" }
-    if (selection.status === "approved") return { kind: "approved" }
+    if (selection.approvedCandidate && !/^(?:选人|选词)/u.test(input.trim())) return { kind: "approved" }
 
     // “选词” is the neutral public wording; keep “选人” as a compatibility
     // alias for historical games and commands.  Store only the candidate so
@@ -380,17 +403,18 @@ export class ModeInteractionCoordinator {
     }
 
     selection.status = "pending-host"
+    selection.version++
     selection.candidate = candidate
-    selection.submittedAt = now
+    selection.submittedAt ??= now
     delete selection.selectionDeadlineAt
     delete selection.requestMessageIds
     delete selection.requestMessageContent
     return { kind: "accepted", selection }
   }
 
-  recordDeerRequestMessage(seat: number, messageIds?: readonly string[], messageContent?: string): boolean {
+  recordDeerRequestMessage(seat: number, messageIds?: readonly string[], messageContent?: string, version?: number): boolean {
     const selection = this.requireDeer().selections.get(seat)
-    if (!selection || selection.status !== "pending-host") return false
+    if (!selection || selection.status !== "pending-host" || (version !== undefined && selection.version !== version)) return false
     selection.requestMessageIds = messageIds?.map(String).filter(Boolean)
     selection.requestMessageContent = messageContent?.trim() || undefined
     return true
@@ -402,6 +426,7 @@ export class ModeInteractionCoordinator {
     readonly requestMessageContent?: string
     readonly approved: boolean
     readonly reason?: string
+    readonly version?: number
   }): DeerReviewResult {
     const state = this.requireDeer()
     const seatSelection = input.seat === undefined ? undefined : state.selections.get(input.seat)
@@ -422,19 +447,22 @@ export class ModeInteractionCoordinator {
       return { kind: "not-found" }
     }
     const selection = referencedSelection ?? seatSelection
-    if (!selection) return { kind: "not-found" }
+    if (!selection || (input.version !== undefined && selection.version !== input.version)) return { kind: "not-found" }
     if (selection.status !== "pending-host") return { kind: "not-pending" }
 
     if (input.approved) {
+      const previousCandidate = selection.approvedCandidate
+      selection.approvedCandidate = selection.candidate
+      selection.approvedVersion = selection.version
       selection.status = "approved"
       delete selection.submittedAt
       delete selection.requestMessageIds
       delete selection.requestMessageContent
-      return { kind: "approved", selection }
+      return { kind: "approved", selection, previousCandidate }
     }
 
-    selection.status = "waiting-player"
-    delete selection.candidate
+    selection.status = selection.approvedCandidate ? "approved" : "waiting-player"
+    selection.candidate = selection.approvedCandidate
     delete selection.selectionDeadlineAt
     delete selection.submittedAt
     delete selection.requestMessageIds
@@ -450,6 +478,9 @@ export class ModeInteractionCoordinator {
     const selection = this.requireDeer().selections.get(seat)
     if (!selection) return null
     selection.status = "waiting-player"
+    selection.version++
+    delete selection.approvedCandidate
+    delete selection.approvedVersion
     delete selection.candidate
     delete selection.selectionDeadlineAt
     delete selection.submittedAt
@@ -462,14 +493,18 @@ export class ModeInteractionCoordinator {
     return this.requireDeer().selections.get(seat)
   }
 
+  deerApprovedCandidate(seat: number): string | undefined {
+    return this.requireDeer().selections.get(seat)?.approvedCandidate
+  }
+
   deerAllApproved(): boolean {
     const selections = [...this.requireDeer().selections.values()]
-    return selections.length > 0 && selections.every(value => value.status === "approved")
+    return selections.length > 0 && selections.every(value => !!value.approvedCandidate)
   }
 
   deerPendingSeats(): number[] {
     return [...this.requireDeer().selections.values()]
-      .filter(value => value.status !== "approved")
+      .filter(value => !value.approvedCandidate)
       .map(value => value.seat)
       .sort((left, right) => left - right)
   }

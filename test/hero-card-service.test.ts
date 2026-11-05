@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, it } from "node:test"
-import { HERO } from "../src/heroes"
+import { HERO, HEROES } from "../src/heroes"
 import {
   HeroCardService,
   HeroCardValidationError,
@@ -62,6 +62,25 @@ describe("hero card storage", () => {
       assert.equal(await reloaded.restoreDefault(HERO.ZHU_YOU_JIAN), false)
       assert.equal((await reloaded.resolve(HERO.ZHU_YOU_JIAN)).source, "default")
       assert.equal((await game.app.database.get("undercover_hero_card", {})).length, 0)
+    })
+  })
+
+  it("loads an actual packaged default image for every registered hero", async () => {
+    await withService(async service => {
+      for (const [heroId, hero] of HEROES.entries()) {
+        const rendered = (await service.image(heroId)).toString()
+        assert.match(rendered, /^<img src="file:/)
+        assert.ok(rendered.includes(encodeURIComponent(`${hero.cardImageBase ?? `${hero.name}卡面`}.png`)))
+        assert.doesNotMatch(rendered, /暂未提供默认卡面/)
+      }
+    })
+  })
+
+  it("uses a text fallback when a packaged default card is unavailable", async () => {
+    await withService(async (_service, game, baseDir) => {
+      const missingPackage = new HeroCardService(game.app, join(baseDir, "missing-package", "lib"), { maxBytes: 1024 })
+      const rendered = (await missingPackage.image(HERO.WEI_ZHONG_XIAN)).toString()
+      assert.match(rendered, /魏忠贤暂未提供默认卡面/)
     })
   })
 

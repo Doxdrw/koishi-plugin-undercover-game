@@ -1,4 +1,5 @@
 import { GameUserError } from './errors'
+import { projectHistoryParticipants } from './history-participants'
 import { $, type Context } from 'koishi'
 import type { HistorySnapshot, HistoryIdentity } from './history-snapshot'
 import type { HistoryViewer } from './history-query'
@@ -63,14 +64,18 @@ export class DeerHistoryControls {
         ...(isHost ? { hidden: false } : { tenureId: { $in: own } }) })
       const selected = new Map(choices.map(c => [c.tenureId, c]))
       const lines = []
-      for (const p of header.participants) {
-        // White players have no choice, but may have an explicit null record.
-        // Missing/hidden rows are not listed or named in the host response.
-        const choice = selected.get(p.tenureId)
-        if (!choice) continue
-        const camp = p.initialCamp === 'white' ? '白板' : p.initialCamp === 'undercover' ? '卧底' : '好人'
-        const rule = p.initialCamp === 'white' ? '仅易混' : p.initialCamp === 'undercover' ? header.topics!.undercover : header.topics!.good
-        lines.push(`${p.seat}号 ${p.identity.nickname}${p.replacedTenureId ? '（补位）' : ''}｜${camp}｜规则：${rule}｜选人：${p.initialCamp === 'white' ? '无需选人' : choice.choice ?? '未通过'}`)
+      const roster = await projectHistoryParticipants(header.participants, this.canonical)
+      for (const [isFormer, rows] of [[false, roster.current], [true, roster.former]] as const) {
+        const section: string[] = []
+        for (const p of rows) {
+          // Missing/hidden rows are not listed or named in the response.
+          const choice = selected.get(p.tenureId)
+          if (!choice) continue
+          const camp = p.initialCamp === 'white' ? '白板' : p.initialCamp === 'undercover' ? '卧底' : '好人'
+          const rule = p.initialCamp === 'white' ? '仅易混' : p.initialCamp === 'undercover' ? header.topics!.undercover : header.topics!.good
+          section.push(`${p.seat}号 ${p.identity.nickname}${p.replacedTenureId ? '（补位）' : ''}｜${camp}｜规则：${rule}｜选人：${p.initialCamp === 'white' ? '无需选人' : choice.choice ?? '未通过'}`)
+        }
+        if (section.length) lines.push(...(isFormer ? ['被替换的玩家：'] : []), ...section)
       }
       return lines.length ? `鹿模式选人公布 #${row.id}${row.disposition !== 'completed' ? '（中止局）' : ''}，易混：${header.topics!.publicText}\n` + lines.join('\n')
         : `对局#${row.id}当前没有可公布的选人。`

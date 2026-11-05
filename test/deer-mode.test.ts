@@ -44,9 +44,8 @@ describe("deer mode selection state", () => {
     })
     assert.equal(coordinator.deerSelectionForSeat(1)?.selectionDeadlineAt, undefined)
     assert.equal(coordinator.deerSelectionForSeat(1)?.submittedAt, 500)
-    assert.deepEqual(coordinator.submitDeerSelection("alice", "郭嘉"), {
-      kind: "pending",
-    })
+    assert.equal(coordinator.submitDeerSelection("alice", "郭嘉").kind, "accepted")
+    assert.equal(coordinator.deerSelectionForSeat(1)?.submittedAt, 500)
   })
 
   it("tracks independent player deadlines and reports only expired waiting seats", () => {
@@ -125,7 +124,9 @@ describe("deer mode selection state", () => {
       seat: 1,
       userId: "dave",
       nickname: "Dave",
+      identityKey: undefined,
       status: "waiting-player",
+      version: 0,
     })
   })
 

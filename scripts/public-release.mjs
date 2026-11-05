@@ -1,4 +1,5 @@
 import { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { dirname, isAbsolute, join, parse, relative, resolve } from 'node:path'
 import { inflateSync } from 'node:zlib'
 
@@ -133,8 +134,47 @@ export function privateReleaseValues() {
   return values
 }
 
+function auditHeroCardAssets(root) {
+  const dir = join(root, 'uc-pics')
+  const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8'))
+  if (manifest.schemaVersion !== 1 || manifest.status !== 'final'
+    || typeof manifest.setId !== 'string' || !manifest.setId
+    || !Number.isSafeInteger(manifest.width) || manifest.width < 1
+    || !Number.isSafeInteger(manifest.height) || manifest.height < 1
+    || !Array.isArray(manifest.cards) || !manifest.cards.length) {
+    throw new Error('卡面清单格式无效。')
+  }
+  const keys = new Set(), names = new Set(['manifest.json', 'ASSET-LICENSE.md'])
+  for (const [index, card] of manifest.cards.entries()) {
+    if (card.heroId !== index || typeof card.heroName !== 'string' || !card.heroName
+      || typeof card.heroKey !== 'string' || !/^[a-z]+(?:-[a-z]+)*$/.test(card.heroKey)
+      || keys.has(card.heroKey)) throw new Error('卡面清单身份映射无效。')
+    if (typeof card.fileName !== 'string' || !/^[^/\\:]+\.png$/.test(card.fileName)
+      || names.has(card.fileName)) throw new Error('卡面清单文件名无效。')
+    keys.add(card.heroKey)
+    names.add(card.fileName)
+  }
+  const actual = readdirSync(dir).sort()
+  if (actual.join('\n') !== [...names].sort().join('\n')) throw new Error('卡面目录与清单不一致。')
+  for (const card of manifest.cards) {
+    const path = join(dir, card.fileName)
+    if (!lstatSync(path).isFile()) throw new Error('卡面必须为普通文件：' + card.fileName)
+    const image = readFileSync(path)
+    if (!/^[a-f0-9]{64}$/.test(card.sha256)
+      || createHash('sha256').update(image).digest('hex') !== card.sha256) {
+      throw new Error('卡面哈希校验失败：' + card.fileName)
+    }
+    if (image.length < 24 || image.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a'
+      || image.subarray(12, 16).toString('ascii') !== 'IHDR'
+      || image.readUInt32BE(16) !== manifest.width || image.readUInt32BE(20) !== manifest.height) {
+      throw new Error('卡面PNG尺寸与清单不符：' + card.fileName)
+    }
+  }
+}
+
 export function auditPublicFiles(root, files, privateValues = privateReleaseValues()) {
   for (const name of files) assertPublicContent(name, readFileSync(join(root, name)), privateValues)
+  if (files.includes('uc-pics/manifest.json')) auditHeroCardAssets(root)
 }
 
 export function exportPublicTree(root, rawTarget, config) {

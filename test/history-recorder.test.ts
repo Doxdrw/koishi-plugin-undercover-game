@@ -12,6 +12,33 @@ function recorder(mode: 'classic' | 'deer' | 'turtle' = 'classic') {
 }
 const identity = (id: string) => ({ platform: 'onebot', userId: id, nickname: id, accountId: 'account-' + id })
 
+it('persists unfinished ballot facts and invalidation reasons without inventing a timeout', () => {
+  const r = recorder()
+  r.join(1, identity('one'), 'good', null, 10); r.join(2, identity('two'), 'undercover', null, 10)
+  r.beginPhase('one', 1, 'regular', [1, 2])
+  r.vote([{ voterSeat: 1, targetSeat: 2, weight: 3, status: 'vote', countedWeight: 0,
+    invalidReasons: ['zhu-you-xiao-delegation'] }, { voterSeat: 2, targetSeat: null, weight: 1, status: 'pending' }],
+  [{ seat: 1, count: 0 }, { seat: 2, count: 0 }], false)
+  const result = r.finish({ kind: 'aborted', reason: 'host-stop' }, 20)
+  assert.equal(result.phases[0].voteSettled, false)
+  assert.equal(result.phases[0].ballots[1].status, 'pending')
+  assert.equal(result.phases[0].ballots[0].countedWeight, 0)
+  assert.deepEqual(result.phases[0].ballots[0].invalidReasons, ['zhu-you-xiao-delegation'])
+})
+
+it('backfills an explicit previous regular phase without moving the current overtime cursor', () => {
+  const r = recorder('deer')
+  r.join(1, identity('one'), 'good', null, 10); r.join(2, identity('two'), 'undercover', null, 10)
+  r.beginPhase('one', 1, 'regular', [1, 2]); r.speech(1, '原发言')
+  r.invalidateSpeech(1, 1, false, '原发言', '更换选词后复核未通过')
+  r.beginPhase('ot', 1, 'overtime', [1, 2]); r.speechAt(1, 1, '补发言')
+  r.outcome('加时结果')
+  const result = r.finish({ kind: 'aborted', reason: 'host-stop' }, 30)
+  assert.equal(result.phases[0].speeches[0].text, '补发言')
+  assert.equal(result.phases[0].speeches[0].previousInvalid?.[0].text, '原发言')
+  assert.deepEqual(result.phases[1].outcomes, ['加时结果'])
+})
+
 it('records sequential occupants in the same phase without transferring their speech or deer choices', () => {
   const r = recorder('deer')
   const first = r.join(1, identity('first'), 'good', 0, 10)
@@ -27,6 +54,19 @@ it('records sequential occupants in the same phase without transferring their sp
   assert.equal(result.phases[0].ballots[0].voterTenureId, next)
   assert.equal(result.participants[2].replacedTenureId, first)
   assert.deepEqual(result.phases[0].events.find(e => e.kind === 'replacement'), { kind: 'replacement', tenureId: next })
+})
+
+it('records the fixed-seat voter and the separate proxy decider', () => {
+  const r = recorder()
+  const owner = r.join(1, identity('owner'), 'good', null, 10)
+  const decider = r.join(2, identity('decider'), 'good', null, 10)
+  r.beginPhase('one', 1, 'regular', [1, 2])
+  r.vote([
+    { voterSeat: 1, deciderSeat: 2, targetSeat: 2, targetNickname: '代投对象', weight: 1, status: 'vote' },
+  ], [{ seat: 1, count: 0 }, { seat: 2, count: 1 }])
+  const result = r.finish({ kind: 'completed', reason: 'elimination', winner: 'good' }, 20)
+  assert.equal(result.phases[0].ballots[0].voterTenureId, owner)
+  assert.equal(result.phases[0].ballots[0].deciderTenureId, decider)
 })
 
 it('overwrites only the final answer in one phase and retains multiple overtime windows independently', () => {
@@ -61,6 +101,17 @@ it('keeps account-targeted award receipts and post-elimination skill authors sep
   assert.equal(result.awards[0].journalId, 22)
   assert.equal(result.phases[0].events[1].tenureId, a)
 })
+it('replaces anonymous contributions when a phase vote is recorded again', () => {
+  const r = recorder()
+  r.join(1, identity('one'), 'good', null, 10)
+  r.beginPhase('one', 1, 'regular', [1])
+  r.vote([], [{ seat: 1, count: 1 }], false, [{ seat: 1, count: 1 }])
+  r.vote([], [], true)
+  const result = r.finish({ kind: 'completed', reason: 'elimination', winner: 'good' }, 20)
+  assert.equal(result.phases[0].anonymousVotes, undefined)
+  assert.equal(result.phases[0].voteSettled, true)
+})
+
 it('archives the same final reward outcomes used by the retry failure notice', async () => {
   const r = recorder(), first = r.join(1, identity('one'), 'good', null, 10), second = r.join(2, identity('two'), 'good', null, 10)
   r.beginPhase('one', 1, 'regular', [1, 2])

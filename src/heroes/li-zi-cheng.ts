@@ -10,6 +10,7 @@ export const LiZiChengBallotOutcome = {
   Abandoned: "abandoned",
   SkippedOrTimedOut: "skipped-or-timed-out",
   InvalidatedByLinDanHan: "invalidated-by-lin-dan-han",
+  InvalidatedByDelegation: "invalidated-by-delegation",
 } as const
 
 export type LiZiChengBallotOutcome =
@@ -18,11 +19,13 @@ export type LiZiChengBallotOutcome =
 export interface LiZiChengBallotInput {
   readonly ballot: number | undefined
   readonly invalidatedByLinDanHan: boolean
+  readonly invalidatedByDelegation?: boolean
 }
 
 export function classifyLiZiChengBallot(
   input: LiZiChengBallotInput,
 ): LiZiChengBallotOutcome {
+  if (input.invalidatedByDelegation) return LiZiChengBallotOutcome.InvalidatedByDelegation
   if (input.invalidatedByLinDanHan) {
     return LiZiChengBallotOutcome.InvalidatedByLinDanHan
   }

@@ -20,6 +20,30 @@ function input(overrides: Partial<RebuildVoteStateInput> = {}): RebuildVoteState
 }
 
 describe("vote state rebuilt from raw ballots", () => {
+  it('keeps a delegated voter raw ballot and weight while excluding it from the owner poll', () => {
+    const result = rebuildVoteState(input({
+      ballots: [3, 1, 1, 0], votePower: [1, 3, 1, 1],
+      zhuYouXiao: { ownerSeat: 1, delegateSeat: 2 },
+    }))
+    assert.deepEqual(result.poll, [1, 0, 1, 0])
+    assert.deepEqual(result.ballotEffects.find(b => b.voterSeat === 2), {
+      voterSeat: 2, targetSeat: 1, weight: 3, countedWeight: 0,
+      invalidReasons: ['zhu-you-xiao-delegation'],
+    })
+    const restored = rebuildVoteState(input({ ballots: [3, 1, 1, 0], votePower: [1, 3, 1, 1],
+      zhuYouXiao: { ownerSeat: 1, delegateSeat: 3 } }))
+    assert.deepEqual(restored.poll, [3, 0, 1, 0])
+  })
+  it('unions mutual-vote and delegation invalidation without subtracting twice', () => {
+    const result = rebuildVoteState(input({ ballots: [2, 1, 0, 0],
+      heroes: { linDanHanSeat: 2, shiKeFaSeat: 0, huangTaiJiSeat: 0 },
+      linDanHan: { awakened: true, realityRecords: [1, 3, 4] },
+      zhuYouXiao: { ownerSeat: 1, delegateSeat: 2 },
+    }))
+    assert.deepEqual(result.poll, [0, 0, 0, 0])
+    assert.deepEqual(result.ballotEffects.find(b => b.voterSeat === 2)?.invalidReasons,
+      ['lin-dan-han-mutual', 'zhu-you-xiao-delegation'])
+  })
   it("rebuilds regular poll, waiver, and Huang Taiji's target", () => {
     const result = rebuildVoteState(input())
     assert.deepEqual(result.poll, [0, 3, 0, 0])

@@ -1,4 +1,5 @@
 import { HERO, HEROES } from "../heroes"
+import { normalizeHeroCommand, parseHeroNumber } from "../game/hero-command"
 import { HeroWindow } from "../game/hero-module"
 import type { HeroModule } from "../game/hero-module"
 import type { HeroStateStore, Seat } from "../game/hero-state"
@@ -51,9 +52,9 @@ export const maoWenLongModule = {
     return decideMaoWenLongLateVote(input)
   },
   classifyTargetInput(input) {
-    const normalized = input.content.replace(/\s/g, "")
+    const normalized = normalizeHeroCommand(input.content)
     if (normalized === "弃" || normalized === "弃权") return { kind: "abandon" }
-    const chosenSeat = Number(normalized)
+    const chosenSeat = parseHeroNumber(normalized)
     if (!input.activeSeats.includes(chosenSeat)) return { kind: "invalid-target", chosenSeat }
     if (input.overtime && !input.overtimeCandidateSeats.includes(chosenSeat)) {
       return { kind: "invalid-target", chosenSeat }

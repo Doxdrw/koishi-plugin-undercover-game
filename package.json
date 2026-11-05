@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-undercover-game",
-  "description": "支持经典、群雄逐鹿、海龟汤与十名武将机制的 Koishi 谁是卧底插件",
-  "version": "0.3.3",
+  "description": "支持经典、群雄逐鹿、海龟汤与十二名武将机制的 Koishi 谁是卧底插件",
+  "version": "0.4.0",
   "author": "Doxdrw <272593690@qq.com>",
   "repository": {
     "type": "git",
@@ -67,7 +67,7 @@
   },
   "koishi": {
     "description": {
-      "zh": "支持经典、群雄逐鹿、海龟汤与十名武将机制的谁是卧底游戏；含固定座位、踢人补位及可选统一积分。"
+      "zh": "支持经典、群雄逐鹿、海龟汤与十二名武将机制的谁是卧底游戏；含固定座位、踢人补位及可选统一积分。"
     },
     "service": {
       "required": [
@@ -75,6 +75,7 @@
       ],
       "optional": [
         "xpPoints",
+        "puppeteer",
         "chatluna"
       ]
     }

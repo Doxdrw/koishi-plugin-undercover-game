@@ -4,6 +4,7 @@ import { GameUserError, safeErrorSummary } from './errors'
 import { HistoryQueries, historyTextPages, historyContentPages, type HistoryViewer } from './history-query'
 import type { DeerHistoryControls } from './history-deer'
 import type { HistoryStore } from './history-store'
+import type { ReportImages } from './report-images'
 
 const viewer = (s: Session): HistoryViewer => ({ platform: s.platform, selfId: s.selfId, userId: s.userId,
   guildId: s.guildId, isDirect: s.isDirect })
@@ -20,7 +21,7 @@ const date = (value?: string) => {
 }
 export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, deer: DeerHistoryControls,
   store: HistoryStore, flush: () => Promise<void>, ephemeralDeer?: (session: Session, op: 'hide' | 'reveal') => Promise<string | undefined>,
-  afterErase?: () => Promise<void>) {
+  afterErase?: () => Promise<void>, images?: ReportImages) {
   const confirmations = new Map<string, { actor: string; expires: number; rows: Array<{ gameId: string; digest: string }> }>()
   const safe = async (action: () => Promise<string | void>) => {
     try { await flush(); const result = await action(); return result === undefined ? undefined : h.text(result).toString() }
@@ -43,7 +44,7 @@ export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, d
         + result.entries.map(row => `#${row.id} ${new Date(row.startedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })} ${row.mode}｜${row.host}｜${row.result}`).join('\n')
         + '\n用“复盘 编号”查看；历史对局 [页码] -k 关键词 -m deer --from 2026-01-01 --until 2026-02-01；历史对局 --aborted 查看中止局。'
     }))
-  const render = async (session: Session, id: number | undefined, options: { round?: number; phase?: number; page?: number }, forward: boolean) => {
+  const render = async (session: Session, id: number | undefined, options: { round?: number; phase?: number; page?: number; text?: boolean }, forward: boolean) => {
     const result = await queries.replay(viewer(session), id, { round: options.round, sequence: options.phase })
     if (!result) return '没有可访问的历史对局；请在原群查询，私聊仅限主持人或参赛玩家。'
     const pages = historyTextPages([result.introduction, ...result.phases.map(p => p.text)].join('\n\n'))
@@ -80,6 +81,9 @@ export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, d
       const structured = historyContentPages(h('template', {}, h.text(result.introduction + '\n\n'),
         ...result.phases.flatMap(p => [p.content ?? h.text(p.text), h.text('\n\n')])))
       if (page > structured.length) return `当前只有${structured.length}页。`
+      if (!options.text && await images?.send(session, `对局 #${result.id} 复盘`, structured[page - 1])) {
+        return page < structured.length ? `下一页：复盘 ${result.id}${options.round ? ' --round ' + options.round : ''}${options.phase ? ' --phase ' + options.phase : ''} --page ${page + 1}` : undefined
+      }
       try {
         await sendHistoryMessage(structured[page - 1])
         return structured.length > page ? `下一页：复盘 ${result.id}`
@@ -102,6 +106,9 @@ export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, d
       }
     }
     if (page > pages.length) return `当前只有${pages.length}页。`
+    if (!options.text && await images?.send(session, `对局 #${result.id} 复盘`, h.text(pages[page - 1]))) {
+      return page < pages.length ? `下一页：复盘 ${result.id}${options.round ? ' --round ' + options.round : ''}${options.phase ? ' --phase ' + options.phase : ''} --page ${page + 1}` : undefined
+    }
     return pages[page - 1] + `\n第${page}/${pages.length}页` + (page < pages.length ? `；下一页：复盘 ${result.id}${options.round ? ' --round ' + options.round : ''}${options.phase ? ' --phase ' + options.phase : ''} --page ${page + 1}` : '')
   }
   for (const name of ['复盘', '回放']) {
@@ -109,6 +116,7 @@ export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, d
       .option('round', '--round <round:posint> 指定轮次')
       .option('phase', '--phase <phase:posint> 指定历史阶段编号')
       .option('page', '--page <page:posint> 文本页码或转发批次')
+      .option('text', '-t 本次仅使用文字，不渲染图片')
       .action(({ session, options }, id) => safe(() => render(session, id, options, name === '回放')))
     if (name === '复盘') command.alias('总结').alias('上局总结').alias('总结上局')
   }
@@ -121,9 +129,12 @@ export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, d
     }))
   for (const [name, op] of [['公布选人', 'reveal'], ['隐藏选人', 'hide']] as const)
     ctx.command(`${name} [id:posint]`, '在原群维护已结束鹿局的选人公开状态')
-      .action(({ session }, id) => safe(async () => {
-        if (id === undefined) { const text = await ephemeralDeer?.(session, op); if (text !== undefined) return text }
-        return deer.change(viewer(session), op, id)
+      .option('text', '-t 本次仅使用文字，不渲染图片')
+      .action(({ session, options }, id) => safe(async () => {
+        const ephemeral = id === undefined ? await ephemeralDeer?.(session, op) : undefined
+        const text = ephemeral ?? await deer.change(viewer(session), op, id)
+        if (op === 'reveal' && text.startsWith('鹿模式选人公布') && !options.text && await images?.send(session, '鹿模式选词公布', h.text(text))) return
+        return text
       }))
   ctx.command('历史清理 [id:posint]', 'authority 5：预览删除当前群指定对局', { authority: 5 }).userFields(['authority'])
     .action(({ session }, id) => safe(async () => {

@@ -54,8 +54,13 @@ it('projects a bounded public timeline without media markup or hidden fields', (
   for (let i = 1; i <= 10; i++) store.record({ round: i <= 5 ? 1 : 2, phase: 'voting', overtime: false,
     text: `第${i}条 <img src="https://private.example/${i}?token=secret"/>` })
   const state = projectPublicGameState({ ...snapshot, publicEvents: store.snapshot() }, session)!
-  assert.equal(state.timeline.events.length, 8)
-  assert.equal(state.timeline.events[0].id, 3)
+  assert.equal(state.timeline.events.length, 2)
+  assert.equal(state.timeline.events[0].id, 9)
+  assert.equal(state.timeline.page, 2)
+  assert.equal(state.timeline.hasEarlier, true)
+  assert.equal(state.timeline.hasNewer, false)
+  const earlier = projectPublicGameState({ ...snapshot, publicEvents: store.snapshot() }, session, { page: 1 })!
+  assert.deepEqual(earlier.timeline.events.map(event => event.id), [1, 2, 3, 4, 5, 6, 7, 8])
   assert.match(state.timeline.events[0].text, /\[媒体\]/)
   assert.doesNotMatch(JSON.stringify(state), /private\.example|token=secret|<img/)
   const filtered = projectPublicGameState({ ...snapshot, publicEvents: store.snapshot() }, session,

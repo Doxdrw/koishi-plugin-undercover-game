@@ -15,3 +15,30 @@ Thumbs.db
 # 临时文件
 *.tmp
 release.local.json
+
+# 本地实例数据与维护文件
+/data/
+/backups/
+/cache/
+/downloads/
+/logs/
+/skills/
+/*.tgz
+/koishi.yml
+/koishi.yaml
+/yakumo.yml
+/yakumo.yaml
+
+# 环境变量与本机认证
+.env
+.env.*
+!.env.example
+.npmrc
+
+# SQLite 数据库及运行时旁文件
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*

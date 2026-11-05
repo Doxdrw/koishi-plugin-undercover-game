@@ -26,6 +26,8 @@ export interface PublicGameTimeline {
   page: number
   pages: number
   hasMore: boolean
+  hasEarlier: boolean
+  hasNewer: boolean
 }
 export interface PublicGameStateInput {
   route: { platform: string, selfId: string, guildId: string }
@@ -72,12 +74,12 @@ const projectTimeline = (events: PublicGameEvent[] | undefined, query: PublicGam
     .map(event => ({ ...event, text: publicMessageText(event.text) }))
     .filter(event => event.text.length > 0)
   const limit = Math.min(20, Math.max(1, Math.floor(query.limit ?? 8)))
-  const page = Math.max(1, Math.floor(query.page ?? 1))
   const pages = Math.max(1, Math.ceil(filtered.length / limit))
-  const start = query.page === undefined && query.round === undefined && query.phase === undefined
-    ? Math.max(0, filtered.length - limit) : (page - 1) * limit
+  const page = Math.min(pages, Math.max(1, Math.floor(query.page
+    ?? (query.round === undefined && query.phase === undefined ? pages : 1))))
+  const start = (page - 1) * limit
   return { events: filtered.slice(start, start + limit).map(event => ({ ...event })), total: filtered.length,
-    page, pages, hasMore: page < pages }
+    page, pages, hasMore: page < pages, hasEarlier: page > 1, hasNewer: page < pages }
 }
 
 /** Current public facts only. Final speeches are not a real chat timeline. */

@@ -12,11 +12,22 @@ export interface RebuildVoteStateInput {
     readonly shiKeFaSeat: number
     readonly huangTaiJiSeat: number
   }
+  readonly isSameFaction?: (firstSeat: number, secondSeat: number) => boolean
   readonly linDanHan: {
     readonly awakened: boolean
     readonly realityRecords: readonly number[]
   }
   readonly huangTaiJiRegularTarget: number
+  readonly zhuYouXiao?: { readonly ownerSeat: number, readonly delegateSeat: number | null }
+}
+
+export type BallotInvalidReason = 'lin-dan-han-protection' | 'lin-dan-han-mutual' | 'zhu-you-xiao-delegation'
+export interface BallotEffect {
+  readonly voterSeat: number
+  readonly targetSeat: number
+  readonly weight: number
+  readonly countedWeight: number
+  readonly invalidReasons: BallotInvalidReason[]
 }
 
 export interface RebuiltVoteState {
@@ -29,13 +40,23 @@ export interface RebuiltVoteState {
   readonly linDanHanPreventedVotePower: number
   readonly shiKeFaTeammateAttackers: number[]
   readonly huangTaiJiRegularTarget: number
+  readonly ballotEffects: BallotEffect[]
 }
 
 export function rebuildVoteState(input: RebuildVoteStateInput): RebuiltVoteState {
   const poll = Array(input.playerIds.length).fill(0)
   const linRealityRecords = input.linDanHan.realityRecords.map(seat => Math.abs(seat))
   const shiTeammateAttackers: number[] = []
+  const ballotEffects: BallotEffect[] = []
   let waiver = 0
+  const linSeat = input.heroes.linDanHanSeat
+  const linPlayerIndex = input.playerOrder.indexOf(linSeat)
+  const linVoterIndex = linPlayerIndex === -1 ? -1 : input.voterIds.indexOf(input.playerIds[linPlayerIndex])
+  const linTarget = linVoterIndex === -1 ? 0 : input.ballots[linVoterIndex]
+  const linTargetIndex = input.playerOrder.indexOf(linTarget)
+  const targetVoterIndex = linTargetIndex === -1 ? -1 : input.voterIds.indexOf(input.playerIds[linTargetIndex])
+  const linOwnVoteInvalidated = input.linDanHan.awakened && linTargetIndex !== -1
+    && targetVoterIndex !== -1 && input.ballots[targetVoterIndex] === linSeat
 
   for (let index = 0; index < input.voterIds.length; index++) {
     const playerIndex = input.playerIds.indexOf(input.voterIds[index])
@@ -52,38 +73,29 @@ export function rebuildVoteState(input: RebuildVoteStateInput): RebuiltVoteState
     const linProtectedIndex = targetSeat === input.heroes.linDanHanSeat
       ? linRealityRecords.indexOf(voterSeat)
       : -1
+    const invalidReasons: BallotInvalidReason[] = []
     if (linProtectedIndex !== -1) {
       linRealityRecords[linProtectedIndex] *= -1
+      invalidReasons.push('lin-dan-han-protection')
     }
-    else {
-      poll[targetIndex] += input.votePower[voterSeat - 1]
+    if (linOwnVoteInvalidated && voterSeat === linSeat) invalidReasons.push('lin-dan-han-mutual')
+    if (voterSeat === input.zhuYouXiao?.delegateSeat && targetSeat === input.zhuYouXiao.ownerSeat) {
+      invalidReasons.push('zhu-you-xiao-delegation')
     }
+    const weight = input.votePower[voterSeat - 1]
+    const countedWeight = invalidReasons.length ? 0 : weight
+    poll[targetIndex] += countedWeight
+    ballotEffects.push({ voterSeat, targetSeat, weight, countedWeight, invalidReasons })
 
-    const sameShiFaction = (input.undercoverSeats.indexOf(input.heroes.shiKeFaSeat) + 0.5)
-      * (input.undercoverSeats.indexOf(voterSeat) + 0.5) > 0
+    const sameShiFaction = input.isSameFaction
+      ? input.isSameFaction(input.heroes.shiKeFaSeat, voterSeat)
+      : (input.undercoverSeats.indexOf(input.heroes.shiKeFaSeat) + 0.5)
+        * (input.undercoverSeats.indexOf(voterSeat) + 0.5) > 0
     if (targetSeat === input.heroes.shiKeFaSeat
       && sameShiFaction
-      && voterSeat !== input.whiteSeat
+      && voterSeat !== input.whiteSeat && !(voterSeat === linSeat && linOwnVoteInvalidated)
       && !shiTeammateAttackers.includes(voterSeat)) {
       shiTeammateAttackers.push(voterSeat)
-    }
-  }
-
-  let linOwnVoteInvalidated = false
-  const linSeat = input.heroes.linDanHanSeat
-  const linPlayerIndex = input.playerOrder.indexOf(linSeat)
-  const linVoterIndex = linPlayerIndex === -1
-    ? -1
-    : input.voterIds.indexOf(input.playerIds[linPlayerIndex])
-  const linTarget = linVoterIndex === -1 ? 0 : input.ballots[linVoterIndex]
-  const linTargetIndex = input.playerOrder.indexOf(linTarget)
-  if (input.linDanHan.awakened && linTargetIndex !== -1) {
-    const targetVoterIndex = input.voterIds.indexOf(input.playerIds[linTargetIndex])
-    if (targetVoterIndex !== -1 && input.ballots[targetVoterIndex] === linSeat) {
-      linOwnVoteInvalidated = true
-      poll[linTargetIndex] -= input.votePower[linSeat - 1]
-      const shiAttackerIndex = shiTeammateAttackers.indexOf(linSeat)
-      if (shiAttackerIndex !== -1) shiTeammateAttackers.splice(shiAttackerIndex, 1)
     }
   }
 
@@ -111,5 +123,6 @@ export function rebuildVoteState(input: RebuildVoteStateInput): RebuiltVoteState
     linDanHanPreventedVotePower: 0,
     shiKeFaTeammateAttackers: shiTeammateAttackers,
     huangTaiJiRegularTarget: huangTarget,
+    ballotEffects,
   }
 }

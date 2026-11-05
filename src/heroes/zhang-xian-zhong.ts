@@ -1,4 +1,5 @@
 import { HERO, HEROES } from "../heroes"
+import { normalizeHeroCommand, parseHeroNumber } from "../game/hero-command"
 import { HeroWindow } from "../game/hero-module"
 import type { HeroModule } from "../game/hero-module"
 import type { HeroStateStore, Seat } from "../game/hero-state"
@@ -40,11 +41,11 @@ export const zhangXianZhongModule = {
     return state.zhangXianZhong.awaitingTarget
   },
   classifyTargetInput(input) {
-    const content = input.content.replace(/\s/g, "")
+    const content = normalizeHeroCommand(input.content)
     if (content === "弃" || content === "弃权") {
       return { kind: "abandon" } as const
     }
-    const chosenSeat = Number(content)
+    const chosenSeat = parseHeroNumber(content)
     if (!input.activeSeats.includes(chosenSeat)) {
       return { kind: "invalid-target", chosenSeat } as const
     }

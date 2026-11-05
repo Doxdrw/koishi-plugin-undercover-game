@@ -4,6 +4,7 @@ import type { Seat } from "./hero-state"
 export type PostEliminationHero =
   | "zhang-xian-zhong"
   | "shi-ke-fa"
+  | "zhu-you-xiao"
   | null
 
 export type PostEliminationCause = 'vote' | 'skill' | 'kick' | 'self-exit' | 'timeout'
@@ -23,6 +24,9 @@ export function postEliminationHero(
   }
   if (eliminatedSeat === heroSeats[HERO.SHI_KE_FA]) {
     return "shi-ke-fa"
+  }
+  if (eliminatedSeat === heroSeats[HERO.ZHU_YOU_XIAO]) {
+    return "zhu-you-xiao"
   }
   return null
 }

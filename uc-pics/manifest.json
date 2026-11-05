@@ -45,7 +45,7 @@
       "heroKey": "yuan-chong-huan",
       "heroName": "袁崇焕",
       "fileName": "袁崇焕卡面.png",
-      "sha256": "243e144988b50c3c5b57ae5cd193fe68a7fe47781a6610ce1754391a1e6dce56"
+      "sha256": "1f7f5ff45f752f845bc9cf1df91af0aae0fd82421a2fff45bb805f7d00180817"
     },
     {
       "heroId": 6,
@@ -74,6 +74,20 @@
       "heroName": "多尔衮",
       "fileName": "多尔衮卡面.png",
       "sha256": "0030f27d54bf14ae7143c3cb3780f69c638678ffda53eee8892cf9dcbb3753a8"
+    },
+    {
+      "heroId": 10,
+      "heroKey": "zhu-you-xiao",
+      "heroName": "朱由校",
+      "fileName": "朱由校卡面.png",
+      "sha256": "ebbe477bc41f473613fd04d1bb7a0b24bb1a76cb252b4d53d19b2d079ee20268"
+    },
+    {
+      "heroId": 11,
+      "heroKey": "wei-zhong-xian",
+      "heroName": "魏忠贤",
+      "fileName": "魏忠贤卡面.png",
+      "sha256": "2868c485f47d5e1f251e427eb59988e3cb2f13d5537813640701eef75dd01369"
     }
   ]
 }

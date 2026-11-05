@@ -188,6 +188,8 @@ describe("hero module registry", () => {
     assert.equal(yuanChongHuanModule.currentGuardTarget(state), null)
     yuanChongHuanModule.selectGuard(state, 3)
     assert.equal(yuanChongHuanModule.recordGuardedAttack(state, 3, 1, 1), true)
+    assert.equal(yuanChongHuanModule.retaliationTarget(state), null)
+    yuanChongHuanModule.lockVoteWindow(state, state.yuanChongHuan.windowSerial!, 1)
     assert.equal(yuanChongHuanModule.retaliationTarget(state), 3)
     assert.equal(state.legacy.flag1[HERO.YUAN_CHONG_HUAN], -3)
     assert.equal(yuanChongHuanModule.consumeRetaliationTarget(state), 3)
@@ -231,6 +233,10 @@ describe("hero module registry", () => {
       ...input,
       whiteSeat: 1,
       content: "守1",
+    }), { kind: "self-forbidden", seat: 1 })
+    assert.deepEqual(yuanChongHuanModule.classifyGuardInput(state, {
+      ...input,
+      content: "专镇",
     }), { kind: "guard", seat: 1, replacedSeat: 3 })
   })
 

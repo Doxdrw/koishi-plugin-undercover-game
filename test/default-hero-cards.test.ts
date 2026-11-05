@@ -51,6 +51,11 @@ describe("default hero card release assets", () => {
       "cards", "height", "schemaVersion", "setId", "status", "width",
     ])
     assert.equal(manifest.cards.length, HEROES.length)
+    assert.deepEqual(manifest.cards.map(card => card.heroKey), [
+      "zhang-xian-zhong", "li-zi-cheng", "zhu-you-jian", "wu-san-gui",
+      "huang-tai-ji", "yuan-chong-huan", "lin-dan-han", "shi-ke-fa",
+      "mao-wen-long", "duo-er-gun", "zhu-you-xiao", "wei-zhong-xian",
+    ], "公开卡面身份顺序保持稳定，不采用制卡目录的排列顺序")
     assert.equal(new Set(manifest.cards.map((card) => card.heroKey)).size, HEROES.length)
     assert.equal(new Set(manifest.cards.map((card) => card.fileName)).size, HEROES.length)
     assert.deepEqual((await readdir(assetDir)).sort(), [

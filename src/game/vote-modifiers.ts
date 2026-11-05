@@ -12,6 +12,7 @@ export interface ResolveShiKeFaResistanceInput {
   readonly shiKeFaSeat: number
   readonly mode: ShiKeFaResistanceMode
   readonly teammateAttackers: readonly number[]
+  readonly isSameFaction?: (firstSeat: number, secondSeat: number) => boolean
 }
 
 export type ShiKeFaResistanceNotice = "none" | "no-teammate" | "reduced" | "unavailable"
@@ -24,8 +25,10 @@ export interface ShiKeFaResistanceResult {
 }
 
 function sameFaction(input: ResolveShiKeFaResistanceInput, first: number, second: number): boolean {
-  return (input.undercoverSeats.indexOf(first) + 0.5)
-    * (input.undercoverSeats.indexOf(second) + 0.5) > 0
+  return input.isSameFaction
+    ? input.isSameFaction(first, second)
+    : (input.undercoverSeats.indexOf(first) + 0.5)
+      * (input.undercoverSeats.indexOf(second) + 0.5) > 0
 }
 
 export function resolveShiKeFaResistance(

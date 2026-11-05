@@ -1,8 +1,44 @@
 import { HERO, HEROES } from "../heroes"
+import { normalizeHeroCommand, parseHeroNumber } from "../game/hero-command"
 import { HeroWindow } from "../game/hero-module"
 import type { HeroModule } from "../game/hero-module"
+import type { HeroStateStore } from "../game/hero-state"
 
 const metadata = HEROES[HERO.ZHU_YOU_JIAN]
+const EXTRA_EXECUTION_KEY = "zhu-you-jian.execution"
+const extraExecutionKey = (seat: number) => `${EXTRA_EXECUTION_KEY}:${seat}`
+
+function extraExecutions(state: HeroStateStore, seat?: number): number {
+  return state.grantedLimitedUses[seat === undefined ? EXTRA_EXECUTION_KEY : extraExecutionKey(seat)] ?? 0
+}
+
+function grantExtraExecution(state: HeroStateStore, seat?: number): void {
+  const key = seat === undefined ? EXTRA_EXECUTION_KEY : extraExecutionKey(seat)
+  state.grantedLimitedUses[key] = extraExecutions(state, seat) + 1
+}
+
+function isAvailableForSeat(state: HeroStateStore, actorSeat: number, nativeHeroSeat: number): boolean {
+  return actorSeat === nativeHeroSeat && !state.zhuYouJian.executionUsed
+    || extraExecutions(state, actorSeat) > 0
+}
+
+function activateForSeat(state: HeroStateStore, actorSeat: number, nativeHeroSeat: number): boolean {
+  if (actorSeat === nativeHeroSeat && !state.zhuYouJian.executionUsed) {
+    state.zhuYouJian.executionUsed = true
+    return true
+  }
+  const extra = extraExecutions(state, actorSeat)
+  if (extra <= 0) return false
+  state.grantedLimitedUses[extraExecutionKey(actorSeat)] = extra - 1
+  return true
+}
+
+interface ZhuYouJianModule extends HeroModule {
+  extraExecutions(state: HeroStateStore): number
+  grantExtraExecution(state: HeroStateStore, seat?: number): void
+  isAvailableForSeat(state: HeroStateStore, actorSeat: number, nativeHeroSeat: number): boolean
+  activateForSeat(state: HeroStateStore, actorSeat: number, nativeHeroSeat: number): boolean
+}
 
 export const zhuYouJianModule = {
   id: HERO.ZHU_YOU_JIAN,
@@ -14,18 +50,26 @@ export const zhuYouJianModule = {
   ],
   initializeState(state) {
     state.zhuYouJian.executionUsed = false
+    delete state.grantedLimitedUses[EXTRA_EXECUTION_KEY]
   },
   isAvailable(state) {
-    return !state.zhuYouJian.executionUsed
+    return !state.zhuYouJian.executionUsed || extraExecutions(state) > 0
   },
   activate(state) {
+    if (state.zhuYouJian.executionUsed && extraExecutions(state) > 0) {
+      state.grantedLimitedUses[EXTRA_EXECUTION_KEY] = extraExecutions(state) - 1
+    }
     state.zhuYouJian.executionUsed = true
   },
+  extraExecutions,
+  grantExtraExecution,
+  isAvailableForSeat,
+  activateForSeat,
   onSpeechAction(context) {
-    const content = context.content.replace(/\s/g, "")
+    const content = normalizeHeroCommand(context.content)
     if (!content.startsWith("处决")) return { kind: "ignore" } as const
 
-    const chosenSeat = Number(content.replace("处决", ""))
+    const chosenSeat = parseHeroNumber(content.slice(2))
     if (!context.activeSeats.includes(chosenSeat)) {
       return { kind: "invalid-target", chosenSeat } as const
     }
@@ -43,9 +87,10 @@ export const zhuYouJianModule = {
       } as const
     }
 
-    const actorIsUndercover = context.undercoverSeats.includes(context.actorSeat)
-    const targetIsUndercover = context.undercoverSeats.includes(chosenSeat)
-    if (actorIsUndercover !== targetIsUndercover || chosenSeat === context.whiteSeat) {
+    const actualDifferent = context.undercoverSeats.includes(context.actorSeat)
+      !== context.undercoverSeats.includes(chosenSeat)
+    const different = context.isDifferentFaction?.(context.actorSeat, chosenSeat) ?? actualDifferent
+    if (different || chosenSeat === context.whiteSeat) {
       return {
         kind: "eliminate",
         source: "zhu-you-jian-execution",
@@ -62,4 +107,4 @@ export const zhuYouJianModule = {
       verdict: "backlash",
     } as const
   },
-} satisfies HeroModule
+} satisfies ZhuYouJianModule

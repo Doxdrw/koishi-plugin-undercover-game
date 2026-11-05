@@ -142,6 +142,18 @@ export class HeroCardService {
 
   async image(heroId: number) {
     const status = await this.resolve(heroId)
+    // A newly added hero may be enabled before its formal packaged card is
+    // supplied.  Keep the game and private deal messages usable in that
+    // interim instead of emitting an image element that points at a missing
+    // file.  Custom cards have already been validated by resolve().
+    if (status.source === "default") {
+      try {
+        await access(status.path)
+      }
+      catch {
+        return h.text(`（${status.heroName}暂未提供默认卡面）`)
+      }
+    }
     return h.image(pathToFileURL(status.path).href)
   }
 

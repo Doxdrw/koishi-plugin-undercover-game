@@ -266,6 +266,55 @@ describe("pending action coordinator", () => {
     assert.equal(coordinator.activeActions.length, 0)
   })
 
+  it("keeps Zhu Youxiao's private heir choice independent from Wu Sangui's group timer", () => {
+    const coordinator = new PendingActionCoordinator()
+    coordinator.open({
+      kind: "zhu-you-xiao-heir-choice",
+      ownerSeat: 3,
+      ownerUserId: "player-3",
+      channel: { scope: "private" },
+      blocksRosterChanges: false,
+      gameEpoch: 13,
+      timeoutMs: 120_000,
+      resumeAt: ResolutionCursor.PostElimination,
+    }, 1_000)
+    coordinator.open({
+      kind: "wu-san-gui-overtime-choice",
+      ownerSeat: 3,
+      ownerUserId: "player-3",
+      channel: { scope: "group", guildId: "guild-1" },
+      blocksRosterChanges: true,
+      gameEpoch: 13,
+      timeoutMs: 60_000,
+      resumeAt: ResolutionCursor.WuSanGuiOvertimeChoice,
+    }, 2_000)
+
+    assert.equal(coordinator.activeActions.length, 2)
+    assert.equal(coordinator.remainingMs(1_000, "zhu-you-xiao-heir-choice"), 120_000)
+    assert.equal(coordinator.remainingMs(2_000, "wu-san-gui-overtime-choice"), 60_000)
+    assert.equal(coordinator.matches("zhu-you-xiao-heir-choice", {
+      userId: "player-3",
+      scope: "private",
+      gameEpoch: 13,
+    }), true)
+    assert.equal(coordinator.matches("wu-san-gui-overtime-choice", {
+      userId: "player-3",
+      scope: "group",
+      guildId: "guild-1",
+      gameEpoch: 13,
+    }), true)
+
+    coordinator.complete("zhu-you-xiao-heir-choice")
+    assert.equal(coordinator.matches("wu-san-gui-overtime-choice", {
+      userId: "player-3",
+      scope: "group",
+      guildId: "guild-1",
+      gameEpoch: 13,
+    }), true)
+    coordinator.clear("wu-san-gui-overtime-choice")
+    assert.equal(coordinator.activeActions.length, 0)
+  })
+
   it("rejects negative timeouts", () => {
     const coordinator = new PendingActionCoordinator()
     assert.throws(() => coordinator.open({
