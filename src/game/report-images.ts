@@ -12,6 +12,7 @@ export interface ReportBrowserPage {
   close(): Promise<void>
 }
 export interface ReportBrowser { page(): Promise<ReportBrowserPage> }
+export interface ReportTable { caption?: string; headers: string[]; rows: string[][] }
 const escapeHtml = (text: string) => text.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]!)
 
 /** Text and attachments come from the already-authorized, already-paginated view. */
@@ -53,18 +54,40 @@ export function reportImagePages(text: string, rowsPerPage = 40): string[] {
 
 export function reportHtml(title: string, body: string, page: number, pages: number) {
   const lines = body.split('\n').map(line => {
-    const cells = line.split('｜')
-    return cells.length >= 3
-      ? '<div class="row">' + cells.map(cell => '<div>' + escapeHtml(cell) + '</div>').join('') + '</div>'
-      : '<div class="line">' + (line ? escapeHtml(line) : '&nbsp;') + '</div>'
+    return '<div class="line">' + (line ? escapeHtml(line) : '&nbsp;') + '</div>'
   }).join('')
   return '<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'">'
     + '<style>*{box-sizing:border-box}body{margin:0;background:#fff;font-family:system-ui,"Microsoft YaHei","Noto Sans CJK SC",sans-serif;color:#182334}'
     + '#report{width:960px;padding:32px 40px;border-top:8px solid #335b82}h1{font-size:30px;margin:0 0 24px;color:#254f75}'
-    + '.line{font-size:24px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}.row{display:flex;border:1px solid #dce4ed;background:#f6f8fb;margin:5px 0}'
-    + '.row>div{flex:1;min-width:0;padding:10px;font-size:22px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;border-right:1px solid #dce4ed}'
+    + '.line{font-size:24px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}'
     + 'footer{margin-top:24px;border-top:1px solid #dce4ed;padding-top:14px;font-size:18px;color:#65758a}</style></head><body><main id="report">'
     + '<h1>' + escapeHtml(title) + '</h1>' + lines + '<footer>谁是卧底' + (pages > 1 ? ` · 第${page}/${pages}张` : '') + '</footer></main></body></html>'
+}
+
+/** Cell boundaries are data, never inferred from punctuation or newlines. */
+export function reportTableHtml(title: string, table: ReportTable, page: number, pages: number): string {
+  const html = reportHtml(title, '', page, pages)
+  const rows = (table.caption ? '<p class="line">' + escapeHtml(table.caption) + '</p>' : '')
+    + '<table><thead><tr>' + table.headers.map(c => '<th>' + escapeHtml(c) + '</th>').join('') + '</tr></thead><tbody>'
+    + table.rows.map(row => '<tr>' + row.map(c => '<td>' + escapeHtml(c) + '</td>').join('') + '</tr>').join('') + '</tbody></table>'
+  return html.replace('</style>', 'table{width:100%;border-collapse:collapse;table-layout:fixed}th,td{border:1px solid #dce4ed;padding:9px;font-size:22px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;vertical-align:top}th{background:#eaf0f6}th:first-child{width:22%}th:nth-child(2){width:12%}</style>')
+    .replace('<div class="line">&nbsp;</div>', rows)
+}
+
+function splitTableRow(row: string[]): string[][] {
+  // Repeat the seat/identity labels; split only data cells, and retain every
+  // original character (including line breaks) in the two ordered pieces.
+  if (!row.slice(2).some(cell => Array.from(cell).length > 1)) throw new Error('report table label exceeds layout budget')
+  const cells = row.map(cell => Array.from(cell))
+  const cuts = cells.map(cell => {
+    if (cell.length <= 40 && cell.filter(char => char === '\n').length < 4) return cell.length
+    const middle = Math.ceil(cell.length / 2)
+    const newline = cell.lastIndexOf('\n', middle)
+    return newline >= cell.length / 4 ? newline + 1 : middle
+  })
+  return [0, 1].map(part => cells.map((cell, column) => column < 2
+    ? row[column] + (column === 0 && part === 1 && !row[column].endsWith('（续）') ? '（续）' : '')
+    : cell.slice(part === 0 ? 0 : cuts[column], part === 0 ? cuts[column] : undefined).join('')))
 }
 
 export class ReportImages {
@@ -72,7 +95,7 @@ export class ReportImages {
   constructor(private readonly browser: () => ReportBrowser | undefined, private readonly options: { enabled: boolean; timeoutMs: number },
     private readonly onFailure: (error: unknown) => void) {}
 
-  async send(session: Pick<Session, 'send'>, title: string, content: h.Fragment): Promise<boolean> {
+  async send(session: Pick<Session, 'send'>, title: string, content: h.Fragment, table?: ReportTable): Promise<boolean> {
     if (!this.options.enabled || this.busy) return false
     this.busy = true
     let page: ReportBrowserPage | undefined, timer: ReturnType<typeof setTimeout> | undefined, expired = false
@@ -81,6 +104,7 @@ export class ReportImages {
       if (!browser) return false
       const parts = reportParts(content)
       if (parts.attachments.length > 16) return false
+      if (parts.text.length > 30_000) throw new Error('report content exceeds image budget')
       const operation = (async () => {
         page = await browser.page()
         if (expired) { await page.close(); throw new Error('report image timeout') }
@@ -88,10 +112,32 @@ export class ReportImages {
         await page.setRequestInterception(true)
         page.on('request', request => { void request.abort().catch(() => undefined) })
         await page.setViewport({ width: 960, height: 100, deviceScaleFactor: 1 })
-        const pages = reportImagePages(parts.text), images: Uint8Array[] = []
+        let pages = table ? [] : reportImagePages(parts.text)
+        let tablePages: string[][][] | undefined
+        if (table) {
+          const pending = [table.rows], fitted: string[][][] = []
+          while (pending.length) {
+            if (expired || pending.length + fitted.length > 6) throw new Error('report table page budget exceeded')
+            const rows = pending.shift()!
+            await page.setContent(reportTableHtml(title, { ...table, rows }, 1, 1), { timeout: this.options.timeoutMs, waitUntil: 'load' })
+            const clip = await (await page.$('#report'))?.boundingBox()
+            if (!clip) throw new Error('report table layout unavailable')
+            if (clip.height <= 2200) fitted.push(rows)
+            else {
+              if (rows.length === 1) pending.unshift(...splitTableRow(rows[0]).map(row => [row]))
+              else {
+                const middle = Math.ceil(rows.length / 2)
+                pending.unshift(rows.slice(0, middle), rows.slice(middle))
+              }
+            }
+          }
+          tablePages = fitted
+          pages = fitted.map(() => '')
+        }
+        const images: Uint8Array[] = []
         for (const [index, text] of pages.entries()) {
           if (expired) throw new Error('report image timeout')
-          await page.setContent(reportHtml(title, text, index + 1, pages.length), { timeout: this.options.timeoutMs, waitUntil: 'load' })
+          await page.setContent(tablePages ? reportTableHtml(title, { ...table!, rows: tablePages[index] }, index + 1, pages.length) : reportHtml(title, text, index + 1, pages.length), { timeout: this.options.timeoutMs, waitUntil: 'load' })
           const element = await page.$('#report'), clip = await element?.boundingBox()
           if (!clip || clip.width > 1000 || clip.height > 2200 || clip.width * clip.height > 2_200_000) throw new Error('report image dimensions exceed budget')
           const bytes = await page.screenshot({ type: 'png', clip })

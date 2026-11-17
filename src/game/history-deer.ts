@@ -3,6 +3,9 @@ import { projectHistoryParticipants } from './history-participants'
 import { $, type Context } from 'koishi'
 import type { HistorySnapshot, HistoryIdentity } from './history-snapshot'
 import type { HistoryViewer } from './history-query'
+import type { ReportTable } from './report-images'
+
+export interface DeerPublication { text: string; table?: ReportTable }
 type Header = Omit<HistorySnapshot, 'phases' | 'deerChoices'>
 
 /** Staged original-group disclosure boundary; no dependence on the active game. */
@@ -41,7 +44,10 @@ export class DeerHistoryControls {
     return { page, pages, total, entries: rows.map(row => ({ id: row.id, endedAt: row.endedAt, aborted: row.disposition !== 'completed' })) }
   }
   private serial<T>(task: () => Promise<T>) { const result = this.tail.then(task); this.tail = result.catch(() => undefined); return result }
-  change(viewer: HistoryViewer, operation: 'hide' | 'reveal', id?: number) {
+  async change(viewer: HistoryViewer, operation: 'hide' | 'reveal', id?: number): Promise<string> {
+    return (await this.changeView(viewer, operation, id)).text
+  }
+  changeView(viewer: HistoryViewer, operation: 'hide' | 'reveal', id?: number): Promise<DeerPublication> {
     const copy = { ...viewer }
     return this.serial(async () => {
       this.scope(copy)
@@ -56,7 +62,7 @@ export class DeerHistoryControls {
       if (operation === 'reveal' && !isHost && !own.length) throw new GameUserError('只有该局主持人或参赛玩家可以公布选人。')
       if (operation === 'hide') {
         for (const tenureId of own) await db.set('undercover_history_choice', { gameId: row.gameId, tenureId }, { hidden: true })
-        return `已隐藏对局#${row.id}中你的选人；仅影响主持人之后的公布，不能撤回已发送内容。`
+        return { text: `已隐藏对局#${row.id}中你的选人；仅影响主持人之后的公布，不能撤回已发送内容。` }
       }
       // Host publication never unhides anyone; participant self-publication does.
       if (!isHost) for (const tenureId of own) await db.set('undercover_history_choice', { gameId: row.gameId, tenureId }, { hidden: false })
@@ -64,6 +70,7 @@ export class DeerHistoryControls {
         ...(isHost ? { hidden: false } : { tenureId: { $in: own } }) })
       const selected = new Map(choices.map(c => [c.tenureId, c]))
       const lines = []
+      const tableRows: string[][] = []
       const roster = await projectHistoryParticipants(header.participants, this.canonical)
       for (const [isFormer, rows] of [[false, roster.current], [true, roster.former]] as const) {
         const section: string[] = []
@@ -74,11 +81,13 @@ export class DeerHistoryControls {
           const camp = p.initialCamp === 'white' ? '白板' : p.initialCamp === 'undercover' ? '卧底' : '好人'
           const rule = p.initialCamp === 'white' ? '仅易混' : p.initialCamp === 'undercover' ? header.topics!.undercover : header.topics!.good
           section.push(`${p.seat}号 ${p.identity.nickname}${p.replacedTenureId ? '（补位）' : ''}｜${camp}｜规则：${rule}｜选人：${p.initialCamp === 'white' ? '无需选人' : choice.choice ?? '未通过'}`)
+          tableRows.push([`${p.seat}号 ${p.identity.nickname}${isFormer ? '（被替换）' : ''}`, camp, rule, p.initialCamp === 'white' ? '无需选人' : choice.choice ?? '未通过'])
         }
         if (section.length) lines.push(...(isFormer ? ['被替换的玩家：'] : []), ...section)
       }
-      return lines.length ? `鹿模式选人公布 #${row.id}${row.disposition !== 'completed' ? '（中止局）' : ''}，易混：${header.topics!.publicText}\n` + lines.join('\n')
-        : `对局#${row.id}当前没有可公布的选人。`
+      return { text: lines.length ? `鹿模式选人公布 #${row.id}${row.disposition !== 'completed' ? '（中止局）' : ''}，易混：${header.topics!.publicText}\n` + lines.join('\n')
+        : `对局#${row.id}当前没有可公布的选人。`,
+        ...(lines.length ? { table: { caption: `对局#${row.id}${row.disposition !== 'completed' ? '（中止局）' : ''}，易混：${header.topics!.publicText}`, headers: ['玩家', '身份', '选词规则', '选词'], rows: tableRows } } : {}) }
       })
     })
   }

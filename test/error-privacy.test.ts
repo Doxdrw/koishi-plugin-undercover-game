@@ -61,4 +61,6 @@ it('error summaries ignore arbitrary properties, text, stack and hostile getters
     get code() { return ++codeReads < 3 ? 'ECONNRESET' : secret },
   }), 'Error [ECONNRESET]')
   assert.deepEqual([nameReads, codeReads], [1, 1])
+  assert.equal(safeErrorSummary(Object.assign(failure(), { code: 1200, url: 'send_private_msg' })), 'Error [OneBot send_private_msg 1200]')
+  assert.equal(safeErrorSummary({ code: 1200, url: secret }), 'Error')
 })

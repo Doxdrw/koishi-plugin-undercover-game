@@ -35,6 +35,7 @@ class TranscriptBot extends Bot<Context, TestBotConfig> {
   guildMemberListError: Error | null = null
   readonly groupMessageFailures = new Map<string, Error[]>()
   readonly privateMessageFailures = new Map<string, Error[]>()
+  readonly privateMessagePostFailures = new Map<string, Error[]>()
 
   constructor(ctx: Context, config: TestBotConfig) {
     super(ctx, config, "sandbox")
@@ -79,7 +80,10 @@ class TranscriptBot extends Bot<Context, TestBotConfig> {
       if (failures.length === 0) this.privateMessageFailures.delete(userId)
       throw failure
     }
-    return this.sendMessage("@" + userId, content)
+    const ids = await this.sendMessage("@" + userId, content)
+    const post = this.privateMessagePostFailures.get(userId)?.shift()
+    if (post) throw post
+    return ids
   }
 
   async getGuildMemberList(guildId: string) {
@@ -138,6 +142,7 @@ export interface UndercoverGameHarnessOptions {
   readonly platform?: string
   readonly xpPoints?: HarnessXpPointsService
   readonly baseDir?: string
+  readonly observeResolution?: boolean
   /** Private workspace gates may load real consumer services without a fake. */
   readonly configureApp?: (app: App) => void
 }
@@ -220,7 +225,7 @@ export class UndercoverGameHarness {
     if (options.baseDir) app.baseDir = options.baseDir
     const resolutionTrace: RuntimeResolutionTraceEvent[] = []
     if (options.xpPoints) app.provide("xpPoints", options.xpPoints, true)
-    app.provide("undercoverGameResolutionTrace", event => resolutionTrace.push(event), true)
+    if (options.observeResolution !== false) app.provide("undercoverGameResolutionTrace", event => resolutionTrace.push(event), true)
     app.plugin(SQLiteDriver, { path: ":memory:" })
     options.configureApp?.(app)
     app.plugin(undercoverGame, { ...TEST_CONFIG, ...config })

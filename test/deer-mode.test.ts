@@ -78,7 +78,7 @@ describe("deer mode selection state", () => {
     assert.equal(coordinator.reviewDeerSelection({
       requestMessageId: "request-1-part-2",
       approved: true,
-    }).kind, "not-found")
+    }).kind, "processed")
 
     assert.equal(coordinator.submitDeerSelection("alice", "郭嘉").kind, "accepted")
     coordinator.recordDeerRequestMessage(1, undefined, "鹿模式1号玩家Alice提交选人：郭嘉")
@@ -86,7 +86,7 @@ describe("deer mode selection state", () => {
       seat: 1,
       requestMessageId: "request-1",
       approved: true,
-    }).kind, "not-found")
+    }).kind, "processed")
     assert.equal(coordinator.reviewDeerSelection({
       requestMessageContent: "鹿模式1号玩家Alice提交选人：荀彧",
       approved: true,

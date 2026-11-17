@@ -14,7 +14,7 @@ it('replaces an unreviewed proposal and rejects stale review references', () => 
   assert.equal(mode.submitDeerSelection('alice', '草莓').kind, 'accepted')
   mode.recordDeerRequestMessage(1, ['old'], 'old request')
   assert.equal(mode.submitDeerSelection('alice', '樱桃').kind, 'accepted')
-  assert.equal(mode.reviewDeerSelection({ requestMessageId: 'old', approved: true }).kind, 'not-found')
+  assert.equal(mode.reviewDeerSelection({ requestMessageId: 'old', approved: true }).kind, 'superseded')
   assert.equal(mode.reviewDeerSelection({ seat: 1, approved: true }).kind, 'approved')
   assert.equal(mode.deerApprovedCandidate(1), '樱桃')
 })

@@ -12,10 +12,12 @@ const codes = new Set(['EACCES', 'EPERM', 'ENOENT', 'EEXIST', 'ENOSPC', 'EIO', '
 export function safeErrorSummary(error: unknown): string {
   try {
     if (!error || typeof error !== 'object') return 'UnknownError'
-    const value = error as { name?: unknown; code?: unknown; status?: unknown }
+    const value = error as { name?: unknown; code?: unknown; status?: unknown; url?: unknown }
     const nameValue = value.name, codeValue = value.code, statusValue = value.status
     const name = typeof nameValue === 'string' && names.has(nameValue) ? nameValue : 'Error'
-    const code = typeof codeValue === 'string' && codes.has(codeValue) ? ` [${codeValue}]` : ''
+    const onebotAction = typeof value.url === 'string' && ['send_private_msg', 'send_group_msg', 'send_msg', 'send_private_forward_msg', 'send_group_forward_msg'].includes(value.url) ? value.url : undefined
+    const code = typeof codeValue === 'string' && codes.has(codeValue) ? ` [${codeValue}]`
+      : onebotAction && typeof codeValue === 'number' && Number.isSafeInteger(codeValue) ? ` [OneBot ${onebotAction} ${codeValue}]` : ''
     const status = typeof statusValue === 'number' && Number.isInteger(statusValue)
       && statusValue >= 100 && statusValue <= 599 ? ` [HTTP ${statusValue}]` : ''
     return name + code + status

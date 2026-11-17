@@ -18,4 +18,18 @@ describe("game message delivery boundaries", () => {
       /offline/,
     )
   })
+
+  it('does not claim a rejected or empty API receipt proves non-delivery', async () => {
+    const delivery = new GameMessageDelivery(() => undefined)
+    const visible: string[] = []
+    const result = await delivery.outcome('private prompt', async () => {
+      visible.push('prompt')
+      throw Object.assign(new Error('private request body'), { code: 1200, url: 'send_private_msg' })
+    })
+    assert.equal(result.status, 'unknown')
+    assert.deepEqual(visible, ['prompt'])
+    assert.equal((await delivery.outcome('empty', async () => [])).status, 'unknown')
+    assert.equal((await delivery.outcome('empty id', async () => [''])).status, 'unknown')
+    assert.equal((await delivery.outcome('receipt', async () => ['message'])).status, 'confirmed')
+  })
 })

@@ -142,8 +142,9 @@ export class HistoryQueries {
       }
     }
     const sentence = (text: string) => /[。！？!?…]$/u.test(text) ? text : text + '。'
-    const eventLines: string[] = []
+    const openingLines: string[] = [], beforeVoteLines: string[] = [], resolutionLines: string[] = []
     for (const event of phase.events) {
+      const eventLines = event.timing === 'round-start' ? openingLines : event.timing === 'before-vote' ? beforeVoteLines : resolutionLines
       if (event.kind === 'self-explosion') {
         eventLines.push(`${who(event.tenureId)}自爆，发言为：${event.text}`)
         if (event.adjudicated) eventLines.push(`主持人判定自爆${event.outcome === 'undercover-win' || event.outcome === 'white-win' ? '成功' : '失败'}。`)
@@ -199,6 +200,11 @@ export class HistoryQueries {
           return `${seat}号玩家${target?.identity.nickname ?? ''}`
         }).join('、')
         const effect = event.effect.replace(/；本人投票未失效/g, '')
+        if (effect === '指定放权对象，等待代投') {
+          const next = phase.events.slice(phase.events.indexOf(event) + 1).find(e => e.kind === 'skill' && e.tenureId === event.tenureId)
+          if (next?.kind === 'skill' && /^放权给\d+号玩家代投$/.test(next.effect)
+            && JSON.stringify(next.targetSeats) === JSON.stringify(event.targetSeats)) continue
+        }
         const natural: Record<string, string> = {
           '出局带走': `带走${targets}`,
           '权计指定出局': `发动“权计”，指定${targets}出局`,
@@ -224,6 +230,7 @@ export class HistoryQueries {
           '传弟被放弃': `发动“传弟”，但${targets}放弃接受`,
           '传弟选择超时，放弃接受': `发动“传弟”，但${targets}选择超时，未接受`,
           '指定放权对象，等待代投': `将本次投票交给${targets}决定`,
+          '指定传弟对象，等待其选择': `选择将技能传给${targets}，等待对方选择`,
           '选择缉访选项1，等待本次投票结算': '选择查看本次所投玩家的投票情况',
           '选择缉访选项2，等待本次投票结算': `选择查看${targets}本次的被投票情况`,
         }
@@ -258,16 +265,17 @@ export class HistoryQueries {
       }
     }
     const nonZeroVotes = phase.effectiveVotes.filter(v => v.count > 0)
-    const speechLines = this.orderedSpeeches(header, phase).flatMap(s => header.mode === 'turtle'
+    const speechLines = [...openingLines, ...this.orderedSpeeches(header, phase).flatMap(s => header.mode === 'turtle'
       ? [`${who(s.tenureId)}：问：${s.question}`, `答：${s.answer}`]
-      : [`${who(s.tenureId)}：${s.text}`])
+      : [`${who(s.tenureId)}：${s.text}`])]
     const tailLines = [
+      ...beforeVoteLines,
       ...(phase.ballots.length ? [phase.voteSettled === false ? '投票尚未结算，以下为中止前已记录的投票：' : '投票结果：', ...phase.ballots.map(ballotText)] : []),
       ...(nonZeroVotes.length ? [phase.voteSettled === false ? '中止时的票况（尚未结算）：' : '最终票数：', ...nonZeroVotes.map(v => `${v.seat}号玩家${header.participants.find(p => p.seat === v.seat)?.identity.nickname ?? ''}获得${v.count}票。`)] : []),
       ...(phase.anonymousVotes ?? []).map(v => `${v.seat}号玩家有${v.count}票无来源。`),
       ...(phase.outcomes ?? []),
-      ...eventLines]
-    return { headerLine: `第${phase.round}轮${phase.kind === 'overtime' ? '加时' : ''}`, speechLines, tailLines }
+      ...resolutionLines]
+    return { headerLine: `第${phase.round}轮${phase.kind === 'overtime' ? '加时' : ''}`, openingLines, speechLines, tailLines }
   }
   private phaseText(header: Header, phase: HistoryPhase) {
     const lines = this.phaseLines(header, phase)
@@ -292,6 +300,7 @@ export class HistoryQueries {
   private phaseContent(header: Header, phase: HistoryPhase): h.Fragment {
     const lines = this.phaseLines(header, phase)
     const nodes: any[] = [h.text(lines.headerLine + '\n')]
+    if (lines.openingLines.length) nodes.push(h.text(lines.openingLines.join('\n') + '\n'))
     for (const speech of this.orderedSpeeches(header, phase)) {
       const who = header.participants.find(p => p.tenureId === speech.tenureId)
       const prefix = `${who?.seat ?? ''}号玩家${who?.identity.nickname ?? '已移除玩家'}：`

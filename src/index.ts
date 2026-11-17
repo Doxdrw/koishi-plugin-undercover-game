@@ -403,7 +403,7 @@ export function apply(ctx: Context, config: Config) {
   }
   const enabledSpecialModes = new Set(config.enabledSpecialModes ?? ['deer', 'turtle'])
   const messages = new GameMessageDelivery((label, error) => {
-    ctx.logger.warn("%s发送失败：%s", label, safeErrorSummary(error))
+    ctx.logger.warn("%s发送结果未确认：%s", label, safeErrorSummary(error))
   })
   registerSubscriptionModel(ctx)
   registerHistoryModels(ctx)
@@ -425,8 +425,21 @@ export function apply(ctx: Context, config: Config) {
   const reportImages = new ReportImages(() => ctx.get('puppeteer') as ReportBrowser | undefined,
     { enabled: config.reportImages?.enabled ?? true, timeoutMs: Math.max(1, config.reportImages?.timeout ?? 15) * 1000 },
     error => ctx.logger.warn('图片输出未完成，使用文字回退：%s', safeErrorSummary(error)))
+  const deerHiddenChoices = new Set<string>()
+  const deerHiddenKey = (seat: number, userId: string) => JSON.stringify([seat, profileIdByNickname.get(player_copy?.[seat - 1]) ?? userId])
   registerHistoryCommands(ctx, historyQueries, deerHistory, historyStore, async () => { await Promise.allSettled([...pendingHistoryWrites]) },
     async (session, op) => {
+      if (!game_off && modeInteraction.mode === 'deer' && matchesActiveSession(session)) {
+        if (session.isDirect || !session.guildId) return '请在本局所在群使用该指令。'
+        if (op === 'reveal') return '本局仍在进行，结束后才能公布选词；查看旧局请附对局编号。'
+        const index = player.indexOf(session.userId)
+        const seat = index < 0 ? player_id_copy.indexOf(session.userId) + 1 : order[index]
+        const person = await historyPerson(session.platform, session.userId)
+        const count = historyRecorder?.hideChoices(session.platform, session.userId, person) ?? 0
+        if (!(seat > 0) && !count) return '只有本局玩家可以隐藏自己的选词。'
+        if (seat > 0) deerHiddenChoices.add(deerHiddenKey(seat, session.userId))
+        return '已隐藏本局中你的选词；结束后主持人的批量公布不会包含它。'
+      }
       if (historyOptions.enabled && (!session.platform.startsWith('sandbox') || historyOptions.sandbox)) return
       const snapshot = lastDeerReveal
       if (!snapshot) return '当前没有可操作的上局鹿模式选人记录。'
@@ -437,10 +450,10 @@ export function apply(ctx: Context, config: Config) {
         own.hidden = true
         return '已隐藏你的上局鹿模式选人；这只影响主持人之后的批量公布，无法撤回已经发送的消息。'
       }
-      if (session.userId === snapshot.hostId) return formatDeerRevealRows(snapshot, snapshot.rows.filter(r => !r.hidden))
+      if (session.userId === snapshot.hostId) return deerRevealView(snapshot, snapshot.rows.filter(r => !r.hidden))
       if (!own) return '只有上一把鹿模式的主持人或玩家可以公布选人。'
       own.hidden = false
-      return formatDeerRevealRows(snapshot, [own])
+      return deerRevealView(snapshot, [own])
     }, async () => {
       const result = await historyPersistence.retry()
       if (result.failed) throw new Error('历史数据库清理已完成，但部分本地待重试文件未清理，请检查日志。')
@@ -576,18 +589,22 @@ export function apply(ctx: Context, config: Config) {
     catch (error) { historyCaptureFailed = true; ctx.logger.error('历史采集失败，游戏继续但不报告存档成功：%s', safeErrorSummary(error)) }
   }
   const recordActorSkill = (seat: number, heroId: number, effect: string, targetSeats: number[] = [],
-    details?: Extract<import('./game/history-snapshot').HistoryPhase['events'][number], { kind: 'skill' }>['details']) => {
+    details?: Extract<import('./game/history-snapshot').HistoryPhase['events'][number], { kind: 'skill' }>['details'],
+    position?: { sequence?: number; timing?: import('./game/history-snapshot').HistoryPhase['events'][number]['timing'] }) => {
     if (!(seat > 0)) return
-    capture(r => r.event(seat, { kind: 'skill', heroId, effect, targetSeats, ...(details ? { details } : {}) }))
+    capture(r => r.event(seat, { kind: 'skill', heroId, effect, targetSeats, ...(details ? { details } : {}) },
+      position ?? { timing: voteFactStage === 'published' ? 'resolution' : 'before-vote' }))
     queueHostSkillNotice(seat, effect, targetSeats)
   }
   const recordSkill = (heroId: number, effect: string, targetSeats: number[] = [],
-    details?: Extract<import('./game/history-snapshot').HistoryPhase['events'][number], { kind: 'skill' }>['details']) =>
-    recordActorSkill(heros?.[heroId], heroId, effect, targetSeats, details)
+    details?: Extract<import('./game/history-snapshot').HistoryPhase['events'][number], { kind: 'skill' }>['details'],
+    position?: { sequence?: number; timing?: import('./game/history-snapshot').HistoryPhase['events'][number]['timing'] }) =>
+    recordActorSkill(heros?.[heroId], heroId, effect, targetSeats, details, position)
   const historyCamp = (seat: number): HistoryCamp => flag_white && seat === white ? 'white' : uc.includes(seat) ? 'undercover' : 'good'
   const historyIdentity = (userId: string, nickname: string) => ({ platform: gameRoute.platform, userId, nickname,
     personId: profileIdByNickname.get(nickname), accountId: identityByUserId.get(userId)?.accountId ?? accountIdByNickname.get(nickname) })
   const startHistoryCapture = () => {
+    deerHiddenChoices.clear()
     historyRecorder = undefined; historyCaptureFailed = false; historyOvertime = 0
     if (!historyOptions.enabled || gameRoute.platform.startsWith('sandbox') && !historyOptions.sandbox) return
     const rules: Record<string, string | number | boolean | null> = { timeoutMode: timeout_mode }
@@ -707,6 +724,8 @@ export function apply(ctx: Context, config: Config) {
   let votePhaseSerial = 0
   let weiInquiryWindow: { epoch: number, serial: number } | null = null
   let voteFactStage: 'none' | 'open' | 'counting' | 'published' = 'none'
+  let liRewardSnapshot: { serial: number; weight: number; sequence?: number } | undefined
+  let liRewardedSerial = -1
   let frozenVoteFacts: VoteFact[] = []
   const anonymousVoteContributions = new Map<number, number>()
   const isWeiInquiryWindowOpen = () => !game_off && weiInquiryWindow?.epoch === gameTimers.epoch
@@ -857,7 +876,8 @@ export function apply(ctx: Context, config: Config) {
   var add_str_simp: string
   var add_str_at: string
   const traceResolution = (segment: ResolutionTraceSegment) => (cursor: ResolutionCursor) => {
-    ctx.undercoverGameResolutionTrace?.({
+    const observer = ctx.get('undercoverGameResolutionTrace') as RuntimeResolutionTraceSink | undefined
+    observer?.({
       segment,
       cursor,
       gameEpoch: gameTimers.epoch,
@@ -866,6 +886,8 @@ export function apply(ctx: Context, config: Config) {
     })
   }
   const createGameHeroState = () => {
+    liRewardSnapshot = undefined
+    liRewardedSerial = -1
     const state = createHeroStateStore(hero_num)
     heroRegistry.initializeState(state)
     return state
@@ -965,20 +987,7 @@ export function apply(ctx: Context, config: Config) {
       () => session.bot.sendPrivateMessage(prompt.userId, recorded.content
         + (prompt.kind !== 'zhu-you-xiao-proxy-vote' && unfinishedVoteFor(prompt.userId)
           ? '\n' + skillFirstNotice(prompt.userId) : '')),
-    ).then(delivered => {
-      if (delivered || game_off || recorded.gameEpoch !== gameTimers.epoch) return
-      const stillActive = pendingAction.activeActions.some(action =>
-        action.kind === prompt.kind && action.gameEpoch === recorded.gameEpoch,
-      )
-      if (!stillActive) return
-      notifyGroup(session,
-        `${actionSeatLabel(prompt.kind)}的私聊操作提示发送失败；流程仍在等待，请相关玩家发送“我的待处理”重新获取。`,
-        `${prompt.kind}群内补救提示`)
-    }).catch(error => ctx.logger.error("可恢复私聊提示后处理失败：%s", safeErrorSummary(error)))
-  }
-  const actionSeatLabel = (kind: import('./game/pending-action').PendingActionKind): string => {
-    const action = pendingAction.activeActions.find(item => item.kind === kind)
-    return action?.ownerSeat ? `${action.ownerSeat}号玩家` : '当前玩家'
+    ).catch(error => ctx.logger.error("可恢复私聊提示后处理失败：%s", safeErrorSummary(error)))
   }
   const pendingActionNames: Record<PendingActionKind, string> = {
     'mao-wen-long-late-vote': '塘报投票',
@@ -1674,7 +1683,7 @@ export function apply(ctx: Context, config: Config) {
       const approved = modeInteraction.deerApprovedCandidate(seat)
       return "你是" + seat + "号玩家。\n鹿模式易混：" + instr3 + "\n你的选人/选词规则：" + rule + "\n"
         + (approved ? '已批准选词：' + approved + '。' : replacement
-          ? "你不能继承原玩家的选人，请私聊我重新提交并等待主持人审核。"
+          ? "你不能继承原玩家的选人，请发送“选词＋内容”或“选人＋内容”提交，等待主持人审核。"
           : "请私聊我发送所选词条（可直接发送，或发送“选人 词条”）。不能选择易混本身；主持人审核通过后即可发言。")
     }
     if (modeInteraction.mode === "turtle") {
@@ -1810,14 +1819,15 @@ export function apply(ctx: Context, config: Config) {
   }
   const speechReviewUnlocked = () =>
     round > uc_num || player_copy.length - player.length - kickout.length >= uc_num
-  const publicHeroIdentity = (seat: number, ordinal = false, afterNickname = ""): string => {
+  const publicHeroIdentity = (seat: number, ordinal = false, afterNickname = "",
+    timing?: import('./game/history-snapshot').HistoryPhase['events'][number]['timing']): string => {
     const heroIndex = heros.indexOf(seat)
     const nickname = player_copy[seat - 1] || (order.indexOf(seat) === -1 ? "" : player_name[order.indexOf(seat)])
     const base = (ordinal ? "第" : "") + seat + "号玩家" + nickname + afterNickname
     if (heroIndex === -1) return base
     const hero = hero_name[heroIndex]
     const first = publicHeroReveals.reveal(seat)
-    if (first) capture(r => r.event(seat, { kind: 'hero-reveal', heroId: heroIndex }))
+    if (first) capture(r => r.event(seat, { kind: 'hero-reveal', heroId: heroIndex }, timing ? { timing } : undefined))
     return first ? base + "亮出武将牌：" + hero : base + "（" + hero + "）"
   }
   const publicHeroEliminationText = (seat: number, base: string, action: string): string => {
@@ -1857,7 +1867,7 @@ export function apply(ctx: Context, config: Config) {
         role,
         rule,
         choice,
-        hidden: false,
+        hidden: deerHiddenChoices.has(deerHiddenKey(seat, player_id_copy[seat - 1])),
       })
     }
     if (rows.length === 0) return
@@ -1875,6 +1885,10 @@ export function apply(ctx: Context, config: Config) {
     }
     return result.trimEnd()
   }
+  const deerRevealView = (snapshot: DeerRevealSnapshot, rows: readonly DeerRevealRow[]) => ({
+    text: formatDeerRevealRows(snapshot, rows),
+    table: { caption: '易混：' + snapshot.commonTerm, headers: ['玩家', '身份', '选词规则', '选词'], rows: rows.map(row => [`${row.seat}号 ${row.nickname}`, row.role, row.rule, row.choice]) },
+  })
   const findLastDeerRow = async (session: Session, snapshot: DeerRevealSnapshot): Promise<DeerRevealRow | undefined> => {
     if (ctx.xpPoints?.getManagedIdentity) {
       const identity = await ctx.xpPoints.getManagedIdentity(session.platform, session.userId)
@@ -2033,24 +2047,32 @@ export function apply(ctx: Context, config: Config) {
     const userId = index === -1 ? player_id_copy[seat - 1] : player[index]
     return seat + "号玩家" + name + (mention && userId ? String(h("at", { id: userId })) : "")
   }
-  const deerProgressText = (): string => {
+  const deerProgressPrivate = (): boolean => modeInteraction.mode === 'deer' && white_copy > 0
+  const deerProgressText = (mention = true): string => {
     const progress = modeInteraction.deerProgress()
     if (progress.waitingPlayer.length === 0 && progress.pendingHost.length === 0) {
       return "所有在场非白板玩家均已通过选人审核。"
     }
     const parts: string[] = []
     if (progress.waitingPlayer.length > 0) {
-      parts.push("尚未提交：" + progress.waitingPlayer.map(seat => deerSeatDisplay(seat, true)).join("，"))
+      parts.push("尚未提交：" + progress.waitingPlayer.map(seat => deerSeatDisplay(seat, mention)).join("，"))
     }
     if (progress.pendingHost.length > 0) {
       parts.push("待主持审核：" + progress.pendingHost.map(seat => deerSeatDisplay(seat)).join("，")
-        + (hostid ? "；请主持人" + String(h("at", { id: hostid })) + "尽快处理" : ""))
+        + (hostid && mention ? "；请主持人" + String(h("at", { id: hostid })) + "尽快处理" : ""))
     }
     return "鹿模式选人进度：" + parts.join("；") + "。"
   }
   const deerProgressSignature = (): string => {
     const progress = modeInteraction.deerProgress()
     return progress.waitingPlayer.join(",") + "|" + progress.pendingHost.join(",")
+  }
+  const remindDeerPrivately = (session: Session): void => {
+    for (const host of gameHostIds()) notifyPrivate(session, host, deerProgressText(false), '鹿模式私有选词进度')
+    for (const seat of modeInteraction.deerProgress().waitingPlayer) {
+      const selection = modeInteraction.deerSelectionForSeat(seat)
+      if (selection) notifyPrivate(session, selection.userId, '请完成鹿模式选词，发送“选词＋内容”或“选人＋内容”提交。', '鹿模式选词提醒')
+    }
   }
   const sendAutomaticDeerProgress = (session: Session): void => {
     const now = Date.now()
@@ -2061,7 +2083,8 @@ export function apply(ctx: Context, config: Config) {
       && now - deerLastSelectionReminderAt < 30_000) return
     deerLastSelectionReminderAt = now
     deerLastGroupProgressSignature = signature
-    notifyGroup(session, deerProgressText(), '鹿模式自动选人进度')
+    if (deerProgressPrivate()) remindDeerPrivately(session)
+    else notifyGroup(session, deerProgressText(), '鹿模式自动选人进度')
   }
   const cancelDeerSelectionClock = (seat: number) => {
     gameTimers.cancel(deerSelectionTimers.get(seat))
@@ -2132,7 +2155,7 @@ export function apply(ctx: Context, config: Config) {
     timer_deer_host_review_reminder = setGameTimeout(() => {
       if (modeInteraction.mode !== "deer" || deerHostReviewDeadlineAt !== expectedDeadline
         || modeInteraction.deerProgress().pendingHost.length === 0) return
-      notifyPrivate(session, hostid, "鹿模式仍有待审核选人，请尽快处理。\n" + deerProgressText(), '鹿模式主持审核过半提醒')
+      for (const host of gameHostIds()) notifyPrivate(session, host, "鹿模式仍有待审核选人，请尽快处理。\n" + deerProgressText(false), '鹿模式主持审核过半提醒')
     }, Math.max(1, Math.floor(total / 2)))
     timer_deer_host_review = setGameTimeout(async () => {
       if (modeInteraction.mode !== "deer" || deerHostReviewDeadlineAt !== expectedDeadline
@@ -2147,7 +2170,7 @@ export function apply(ctx: Context, config: Config) {
             const selection = modeInteraction.deerSelectionForSeat(proposal.seat)
             if (selection?.userId !== applicant || selection.status !== 'pending-host' || selection.version !== proposal.version) return
             await applyDeerSelectionReview(session, { ...proposal, approved: true })
-            notifyGroup(session, proposal.seat + '号玩家的选词审核超时，已自动通过。', '鹿模式选词自动通过')
+            for (const host of gameHostIds()) notifyPrivate(session, host, proposal.seat + '号玩家的选词审核超时，已按设置自动通过。', '鹿模式选词自动通过')
           })
       }
     }, total)
@@ -2284,7 +2307,11 @@ export function apply(ctx: Context, config: Config) {
     if (!ann_off && !add_flag) ann[index] = ''
     scheduleDeerMakeups(session)
     if (!ann_off) armDeerSpeechClock(session, seat, deerPhaseDeadline)
-    notifyGroup(session, deerSeatDisplay(seat, true) + '的前序发言已失效，请发送“' + seat + '补发言内容”补一次本轮发言；当前投票和技能照常进行。', '鹿模式补发言提示')
+    const prompt = deerSeatDisplay(seat) + '的前序发言已失效，请发送“' + seat + '补发言内容”补一次本轮发言；当前投票和技能照常进行。'
+    if (deerProgressPrivate()) {
+      notifyPrivate(session, player[index], prompt, '鹿模式补发言提示')
+      notifyPrivate(session, hostid, prompt, '鹿模式补发言主持通知')
+    } else notifyGroup(session, prompt, '鹿模式补发言提示')
   }
   const invalidateDeerSpeeches = (records: DeerSpeechReview['records']) => {
     const reason = '更换选词后复核未通过'
@@ -2420,11 +2447,12 @@ export function apply(ctx: Context, config: Config) {
     flag_start = false
     disp_off = true
     if (dealFailures.length > 0) {
-      await sendGroupNotice(
+      await sendPrivateNotice(
         session,
-        "以下私聊发送失败：" + dealFailures.map(({ seat, item }) => seat + "号" + item).join("、")
-          + "。游戏已继续；相关玩家可发送“重发我的信息”“我的题面”或“我的武将”补取。",
-        "发牌失败汇总",
+        hostid,
+        "以下私聊发送结果未能确认：" + dealFailures.map(({ seat, item }) => seat + "号" + item).join("、")
+          + "。玩家可能已经收到，请先确认；未收到时可私聊发送“题面”“武将”或“重发信息”补取。",
+        "发牌结果汇总",
       )
     }
     if (deerMode) {
@@ -2548,8 +2576,8 @@ export function apply(ctx: Context, config: Config) {
 普通局：关闭武将　自定义：手动设置身份与武将
 踢出3：踢出玩家　取消补位：主持人取消当前申请
 发题状态 / 重发发题提示 / 发题上一步 / 重新发题：主持人私聊检查或纠正配置
-我的题面 / 我的武将 / 重发我的信息：玩家随时私聊补取本局信息
-我的待处理：玩家查看当前技能选择与代投待办　待处理操作：主持人查看待办，详情私聊获取
+题面 / 武将 / 重发信息：玩家私聊补取本局信息，保留带“我的”的原名称
+待办 / 待处理 / 待审：玩家查看选词、发言、投票与技能任务；主持查看审核等待办，群查详情转私聊（保留原入口）
 谁没发言 / 谁没投票：经典与鹿进度　龟进度：龟模式问答进度
 凑人进度 / 几个人了：查看当前人数　发言总览：合并查看本局各轮发言
 盘3：解锁盘发言后，由在场玩家查看3号从开局至今的全部发言
@@ -2557,7 +2585,7 @@ export function apply(ctx: Context, config: Config) {
 结束投票：主持人强制结算　总结 / 复盘：查看上局记录
 开启投票通知 / 关闭投票通知：主持人随时切换私聊票况；投票通知状态可查询
 开启技能通知 / 关闭技能通知：独立切换主持人私聊技能动态；技能通知状态可查询
-隐藏选人：上把鹿模式玩家在原群隐藏自己的记录，避免被主持人批量公布
+隐藏选人 [编号]：无编号优先隐藏当前鹿局自己的选词，否则处理最近鹿局；编号指定旧局
 公布选人：原主持人公布全部未隐藏记录；上把玩家公布自己的记录并解除隐藏
 查询武将 [武将名]：查看技能；省略名称可交互选择　停止卧底：终止本局
 
@@ -2900,20 +2928,26 @@ export function apply(ctx: Context, config: Config) {
     const request = deerHostReviewPrompt(seat)
     if (!selection || !request) return
     const version = selection.version
+    const epoch = gameTimers.epoch
     modeInteraction.recordDeerRequestMessage(seat, undefined, request, version)
     let ids: string[] = []
     const results = await Promise.all(gameHostIds().map(target => messages.state('鹿模式选词审核提示', async () => {
       const result = await session.bot.sendPrivateMessage(target, request)
       ids.push(...(Array.isArray(result) ? result : [result]).filter(Boolean).map(String))
+      return result
     })))
     const delivered = results.some(Boolean)
-    if (delivered) modeInteraction.recordDeerRequestMessage(seat, ids, request, version)
-    else await sendGroupNotice(session, `鹿模式${seat}号玩家的主持审核私聊发送失败，主持人可私聊发送“待处理操作”补取。`, '鹿模式审核补取提示')
+    if (delivered && !game_off && epoch === gameTimers.epoch && modeInteraction.mode === 'deer') modeInteraction.recordDeerRequestMessage(seat, ids, request, version)
+    // A rejected transport receipt may still have delivered the message.
+    // Keep the request recoverable without publishing applicant identities.
   }
   const applyDeerSelectionReview = async (session: Session, input: Parameters<ModeInteractionCoordinator['reviewDeerSelection']>[0]) => {
     const review = modeInteraction.reviewDeerSelection(input)
     if (review.kind === 'not-found') return '没有找到对应的待审核选人，请检查座位号或引用消息。'
     if (review.kind === 'not-pending') return '该座位当前没有待审核的选人。'
+    if (review.kind === 'superseded') return '这条选人申请已被新的提交替代，请引用该玩家最新的待审核提示，或用座位号审核当前申请。'
+    if (review.kind === 'processed') return '这条选人申请已处理，无需重复审核。'
+    if (review.kind === 'inactive-reference') return '这条选人申请已失效，请通过“待审”获取当前待审核内容。'
     const { selection } = review
     syncDeerHostReviewClock(session, true)
     if (review.kind === 'approved') {
@@ -2946,7 +2980,8 @@ export function apply(ctx: Context, config: Config) {
     if (game_off) return next()
     if (!matchesActiveSession(session)) return next()
     const input = session.content.replace(/\s/g, "")
-    if (input === "待处理操作") {
+    const shortTodo = ['待办', '待处理', '待审'].includes(input)
+    if (input === "待处理操作" || shortTodo && isGameHost(session.userId)) {
       if (!isGameHost(session.userId)) return next()
       const actions = pendingAction.activeActions.filter(action => action.gameEpoch === gameTimers.epoch)
       const actionLines = actions.map(action => {
@@ -2955,46 +2990,80 @@ export function apply(ctx: Context, config: Config) {
       })
       const modeStatus: string[] = []
       const modeDetails: string[] = []
+      const deerRequests: Array<{ seat: number; version: number; content: string }> = []
       if (boom_pending) {
         modeStatus.push('正在等待主持人判定自爆。')
-        if (!session.guildId) modeDetails.push('自爆发言：' + boomAttemptText + '；请在群内回复“是”或“否”。')
+        modeDetails.push('自爆发言：' + boomAttemptText + '；请在群内回复“是”或“否”。')
       }
       if (modeInteraction.mode === 'deer') {
         const seats = modeInteraction.deerProgress().pendingHost
         if (seats.length) {
           modeStatus.push(`鹿模式待主持审核座位：${seats.join('、')}。`)
-          if (!session.guildId) modeDetails.push(...seats.map(deerHostReviewPrompt).filter((value): value is string => !!value))
+          for (const seat of seats) {
+            const selection = modeInteraction.deerSelectionForSeat(seat), content = deerHostReviewPrompt(seat)
+            if (selection && content) deerRequests.push({ seat, version: selection.version, content })
+          }
+          if (deerRequests.length === 1) modeDetails.push(deerRequests[0].content)
         }
         const reviews = deerRevisions.pendingReviews()
         if (reviews.length) {
           modeStatus.push('鹿模式待复核前序发言座位：' + reviews.map(r => r.seat).join('、') + '。')
-          if (!session.guildId) modeDetails.push(...reviews.map(deerSpeechReviewPrompt))
+          modeDetails.push(...reviews.map(deerSpeechReviewPrompt))
         }
       }
       if (modeInteraction.mode === 'turtle') {
         const seats = modeInteraction.turtleProgress().pendingHost
         if (seats.length) {
           modeStatus.push(`龟模式待主持回答座位：${seats.join('、')}。`)
-          if (!session.guildId) modeDetails.push(...seats.map(turtleHostAnswerPrompt).filter((value): value is string => !!value))
+          modeDetails.push(...seats.map(turtleHostAnswerPrompt).filter((value): value is string => !!value))
         }
       }
-      if (!actionLines.length && !modeStatus.length) return "当前没有等待处理的武将技能或主持操作。"
-      if (session.guildId) {
-        const delivered = await messages.state('主持待办私聊', () => session.bot.sendPrivateMessage(session.userId,
-          [...actionLines, ...modeStatus, '详细主持审核内容可私聊发送“待处理操作”补取。'].join('\n\n')))
-        return [...modeStatus, delivered ? '已私聊发送待处理详情。' : '私聊未送达，请添加机器人好友后私聊发送“待处理操作”。'].join('\n')
+      if (!disp_off && currentSetupPromptStep() !== 'idle') modeDetails.push(setupStatusText() + '\n' + setupPromptText())
+      for (const request of whiteGuessRequests.values()) modeDetails.push(`${request.seat}号白板猜词待判定：${request.text}；发送“白板判定${request.id}好人/卧底”。`)
+      const content = [...actionLines, ...modeStatus, ...modeDetails].join('\n\n') || '当前没有等待处理的主持操作。'
+      const epoch = gameTimers.epoch
+      let ids: string[] = []
+      let delivered = await messages.state('主持待办私聊', async () => {
+        ids = await session.bot.sendPrivateMessage(session.userId, content)
+        return ids
+      })
+      if (deerRequests.length === 1 && delivered && !game_off && epoch === gameTimers.epoch && modeInteraction.mode === 'deer') {
+        const request = deerRequests[0]
+        modeInteraction.recordDeerRequestMessage(request.seat, ids, content, request.version)
+      } else if (deerRequests.length > 1) {
+        for (const request of deerRequests) {
+          if (game_off || epoch !== gameTimers.epoch || modeInteraction.mode !== 'deer') break
+          const sent = await messages.state('主持待审选词补取', async () => {
+            ids = await session.bot.sendPrivateMessage(session.userId, request.content)
+            return ids
+          })
+          delivered = sent && delivered
+          if (sent && !game_off && epoch === gameTimers.epoch && modeInteraction.mode === 'deer') modeInteraction.recordDeerRequestMessage(request.seat, ids, request.content, request.version)
+        }
       }
-      return [...actionLines, ...modeStatus, ...modeDetails].join("\n\n")
+      if (session.guildId) return delivered ? '已私聊发送待办详情。' : '待办详情已尝试私聊发送，未收到可私聊发送“待办”补取。'
+      return
     }
-    if (input !== "我的待处理") return next()
+    if (input !== "我的待处理" && !shortTodo) return next()
     const actions = pendingAction.activeActions.filter(item =>
       item.gameEpoch === gameTimers.epoch && item.ownerUserId === session.userId,
     )
-    if (!actions.length) return "你当前没有等待处理的武将技能或游戏操作。"
-    const content = [skillFirstNotice(session.userId), ...actions.map(recoveredActionText)].filter(Boolean).join('\n\n')
+    const index = player.indexOf(session.userId), seat = index < 0 ? 0 : order[index]
+    if (!actions.length && !seat && !player_id_copy.includes(session.userId)) return next()
+    const modeTasks: string[] = []
+    if (modeInteraction.mode === 'deer' && seat) {
+      const selection = modeInteraction.deerSelectionForSeat(seat)
+      if (selection?.status === 'pending-host') modeTasks.push('你的新选词正在等待主持人审核。')
+      else if (selection && !selection.approvedCandidate) modeTasks.push('待选词：发送“选词＋内容”或“选人＋内容”。')
+      if (deerRevisions.review(seat)) modeTasks.push('前序发言正在等待主持人复核。')
+      if (deerRevisions.makeup(seat)) modeTasks.push(`待补发言：发送“${seat}＋发言内容”。`)
+    }
+    if (unfinishedVoteFor(session.userId)) modeTasks.push('待投票：请按当前投票提示完成投票。')
+    if (seat && !ann_off && (!add_flag || add_indices.includes(index)) && isEmpty(add_flag ? add_ann[add_indices.indexOf(index)] : ann[index])) modeTasks.push(modeInteraction.mode === 'turtle' ? `待提问：在群内发送“${seat}＋问题”。` : `待发言：在群内发送“${seat}＋发言内容”。`)
+    const content = [skillFirstNotice(session.userId), ...actions.map(recoveredActionText), ...modeTasks].filter(Boolean).join('\n\n') || '你当前没有等待处理的游戏操作。'
     if (!session.guildId) return content
     const results = [await messages.state('待办补取提示', () => session.bot.sendPrivateMessage(session.userId, content))]
-    return results.every(Boolean) ? "已私聊重发当前操作提示。" : "部分私聊提示仍发送失败，请检查是否已添加机器人好友。"
+    return results.every(Boolean) ? "已私聊发送待办详情。" : "待办详情已尝试私聊发送，未收到可私聊发送“待办”补取。"
   })
   ctx.exclude(ctx.guild()).middleware(async (session, next) => {
     if (game_off || !matchesActiveSession(session)) return next()
@@ -3092,7 +3161,8 @@ export function apply(ctx: Context, config: Config) {
   })
   ctx.middleware(async (session, next) => {//玩家补取题面与武将牌
     if (game_off) return next()
-    const command = session.content.replace(/\s/g, "")
+    const rawCommand = session.content.replace(/\s/g, "")
+    const command = ({ '题面': '我的题面', '武将': '我的武将', '重发信息': '重发我的信息' } as Record<string, string>)[rawCommand] ?? rawCommand
     if (!["重发我的信息", "我的题面", "我的武将"].includes(command)) return next()
     const isPrivate = !session.guildId
     if (isPrivate) {
@@ -3123,7 +3193,7 @@ export function apply(ctx: Context, config: Config) {
     }
     catch (error) {
       ctx.logger.warn("%d号玩家主动补取信息失败：%s", seat, safeErrorSummary(error))
-      return "私聊重发失败，请确认已添加机器人好友或稍后重试。"
+      return "发送结果未能确认；如果尚未收到，可稍后补取。"
     }
     if (!isPrivate) return "已将所需信息重新私聊发送给你。"
   })
@@ -3631,7 +3701,7 @@ export function apply(ctx: Context, config: Config) {
     }
     const selection = [...state.selections.values()].find(value => value.userId === session.userId)
     if (!selection || !player.includes(session.userId)) return next()
-    if (selection.approvedCandidate && !/^(?:选词|选人)/u.test(session.content.trim())) return next()
+    if ((selection.approvedCandidate || selection.explicitSubmissionRequired) && !/^(?:选词|选人)/u.test(session.content.trim())) return next()
     if (selection.approvedCandidate && !deerChangesOpen()) return '本局已超过选词重选截止节点。'
     const hadPendingReview = modeInteraction.deerProgress().pendingHost.length > 0
     const submitted = modeInteraction.submitDeerSelection(session.userId, session.content, Date.now())
@@ -3650,7 +3720,11 @@ export function apply(ctx: Context, config: Config) {
     const seat = Number(match[1])
     if (!deerChangesOpen()) return '本局已超过选词重选截止节点。'
     const selection = modeInteraction.resetDeerSelection(seat)
-    if (!selection) return ("该座位是白板、已离场或不存在，无需选人。")
+    if (!selection) {
+      if (!deerProgressPrivate()) return '该座位当前没有可重置的选词。'
+      notifyPrivate(session, session.userId, '该座位当前没有可重置的选词。', '鹿模式重置结果')
+      return '已私聊发送操作结果。'
+    }
     const records = speechHistory.bySeat(seat).filter(record => !record.invalidReason && record.identityKey === currentModeRoster().find(member => member.seat === seat)?.identityKey)
     clearDeerRevisionSeat(seat)
     if (records.length) { invalidateDeerSpeeches(records); deerResetNeedsMakeup.add(seat) }
@@ -3659,7 +3733,10 @@ export function apply(ctx: Context, config: Config) {
     cancelDeerSpeechClock(selection.seat)
     armDeerPlayerSelectionClock(session, selection.seat)
     await sendPrivateNotice(session, selection.userId, "主持人要求你重新选人，请按原阵营规则重新提交。", `鹿模式${selection.seat}号重选通知`)
-    return ("已重置" + selection.seat + "号玩家的选人。")
+    const result = '已重置' + selection.seat + '号玩家的选人，请发送“选词＋内容”重新提交。'
+    if (!deerProgressPrivate()) return result
+    notifyPrivate(session, session.userId, result, '鹿模式重置结果')
+    return '已私聊发送操作结果。'
   })
   ctx.guild().middleware((session, next) => {//谁没选人
     if (game_off || modeInteraction.mode !== "deer" || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
@@ -3674,6 +3751,10 @@ export function apply(ctx: Context, config: Config) {
     }
     deerLastSelectionReminderAt = Date.now()
     deerLastGroupProgressSignature = deerProgressSignature()
+    if (deerProgressPrivate()) {
+      remindDeerPrivately(session)
+      return '已私聊提醒相关玩家和主持人。'
+    }
     return deerProgressText()
   })
   ctx.exclude(ctx.guild()).middleware((session, next) => {//主持人发题状态与回退
@@ -4310,7 +4391,7 @@ export function apply(ctx: Context, config: Config) {
       quan[heros[HERO.HUANG_TAI_JI] - 1] += 1
       await sendPrivateNotice(session, player[order.indexOf(heros[HERO.HUANG_TAI_JI])], "陛下料敌机先，果然大破" + huangTaiJiRewardTarget + "号玩家" + player_copy[huangTaiJiRewardTarget - 1] + "此贼，获得一个“权”标记。", "皇太极权标记通知")
       sumup += heros[HERO.HUANG_TAI_JI] + "号玩家" + player_name[order.indexOf(heros[HERO.HUANG_TAI_JI])] + "（皇太极）获得1个“权”标记。\n"
-      recordSkill(HERO.HUANG_TAI_JI, '获得1个“权”标记')
+      recordSkill(HERO.HUANG_TAI_JI, '获得1个“权”标记', [], undefined, { timing: 'round-start' })
     }
     shiKeFaModule.clearTeammateAttackers(heroState)
     if (order.indexOf(heros[HERO.LIN_DAN_HAN]) !== -1) {
@@ -4348,22 +4429,22 @@ export function apply(ctx: Context, config: Config) {
       notifyPrivate(session, player[order.indexOf(wuSanGuiSeat)], "将军，您已遭到" + str_wsg + "之中伤，是可忍孰不可忍，今宜自立。\n您获得" + wuSanGuiRound.faReward + "个伐标记，当传檄天下，扫荡贼夷。", "吴三桂自立私聊通知")
       notifyGroup(session, wuSanGuiSeat + "号玩家" + player_name[order.indexOf(wuSanGuiSeat)] + "（吴三桂）自立，获知了投过他的玩家，并获得一定数量的“伐”标记。", "吴三桂自立群通知")
       sumup += wuSanGuiSeat + "号玩家" + player_name[order.indexOf(wuSanGuiSeat)] + "（吴三桂）觉醒，获得" + wuSanGuiRound.faReward + "个“伐”标记。\n"
-      recordSkill(HERO.WU_SAN_GUI, '觉醒，获得' + wuSanGuiRound.faReward + '个“伐”标记')
+      recordSkill(HERO.WU_SAN_GUI, '觉醒，获得' + wuSanGuiRound.faReward + '个“伐”标记', [], undefined, { timing: 'round-start' })
     }
     else if (wuSanGuiRound.restrictionAdded === 0) {
         notifyPrivate(session, player[order.indexOf(wuSanGuiSeat)], "元帅，您之后不能再于加时阶段自救了。", "吴三桂限制通知")
         sumup += wuSanGuiSeat + "号玩家" + player_name[order.indexOf(wuSanGuiSeat)] + "（吴三桂）获得援寡1效果：参与加时时不能发动“权计”。\n"
-        recordSkill(HERO.WU_SAN_GUI, '获得“援寡”效果：参与加时时不能发动“权计”')
+        recordSkill(HERO.WU_SAN_GUI, '获得“援寡”效果：参与加时时不能发动“权计”', [], undefined, { timing: 'round-start' })
       }
     else if(wuSanGuiRound.restrictionAdded === 1) {
         notifyPrivate(session, player[order.indexOf(wuSanGuiSeat)], "元帅，您之后发动权计的下一轮不能投票了。", "吴三桂限制通知")
         sumup += wuSanGuiSeat + "号玩家" + player_name[order.indexOf(wuSanGuiSeat)] + "（吴三桂）获得援寡2效果：发动“权计”的下一轮不能投票。\n"
-        recordSkill(HERO.WU_SAN_GUI, '获得“援寡”效果：发动“权计”的下一轮不能投票')
+        recordSkill(HERO.WU_SAN_GUI, '获得“援寡”效果：发动“权计”的下一轮不能投票', [], undefined, { timing: 'round-start' })
       }
     else if (wuSanGuiRound.restrictionAdded === 2) {
         notifyPrivate(session, player[order.indexOf(wuSanGuiSeat)], "元帅，您之后不能连续两轮发动权计了。", "吴三桂限制通知")
         sumup += wuSanGuiSeat + "号玩家" + player_name[order.indexOf(wuSanGuiSeat)] + "（吴三桂）获得援寡3效果：若前一轮发动了“权计”，则本轮无法发动。\n"
-        recordSkill(HERO.WU_SAN_GUI, '获得“援寡”效果：若前一轮发动了“权计”，则本轮无法发动')
+        recordSkill(HERO.WU_SAN_GUI, '获得“援寡”效果：若前一轮发动了“权计”，则本轮无法发动', [], undefined, { timing: 'round-start' })
       }
     const dorgonIndex = order.indexOf(heros[HERO.DUO_ER_GUN])
     const dorgonRoundStart = duoErGunModule.beginRound(heroState, {
@@ -4375,9 +4456,9 @@ export function apply(ctx: Context, config: Config) {
       notifyPrivate(session, player[dorgonIndex], "从现在起您可以重新发动“摄政”。您可向我发送“保A弃B”或“弃B保A”以发动技能（效果：下次A要被投出去时，AB得票数互换）\n注意A、B其一必须要在轮次开始时有“定策”标记；目前" + d + "号玩家" + player_name[order.indexOf(d)] + "拥有“定策”标记。", "多尔衮摄政恢复通知")
     }
     if (dorgonRoundStart.awakened) {
-      const dorgonIdentity = publicHeroIdentity(heros[HERO.DUO_ER_GUN])
+      const dorgonIdentity = publicHeroIdentity(heros[HERO.DUO_ER_GUN], false, '', 'round-start')
       sumup += dorgonIdentity + "，入关，获得“摄政”。\n"
-      recordSkill(HERO.DUO_ER_GUN, '入关，获得“摄政”')
+      recordSkill(HERO.DUO_ER_GUN, '入关，获得“摄政”', [], undefined, { timing: 'round-start' })
       notifyGroup(session, dorgonIdentity + "，入关，获得技能“摄政”。", "多尔衮入关通知")
       const d = dorgonRoundStart.strategySeat ?? 0
       notifyPrivate(session, player[dorgonIndex], "恭喜王爷获得摄政大权，您可向我发送“保A弃B”或“弃B保A”以发动技能（效果：下次A要被投出去时，AB得票数互换）\n注意A、B其一必须要在轮次开始时有“定策”标记；目前" + (order.indexOf(d)!==-1 ? (d + "号玩家" + player_name[order.indexOf(d)] + "拥有“定策”标记。") : "场上没有“定策”标记，您需要先拥立一人。"), "多尔衮摄政私聊通知")
@@ -5405,10 +5486,22 @@ export function apply(ctx: Context, config: Config) {
         ballot: effect.targetSeat, invalidatedByLinDanHan: false, invalidatedByDelegation: true,
       })
     }
-    liZiChengModule.recordBallotOutcome(heroState, {
-      ballot: vote[round - 1][order.indexOf(heros[HERO.LI_ZI_CHENG])],
-      invalidatedByLinDanHan: false,
-    })
+    // Only this phase's own ballot can earn 流兵; an overtime candidate has no
+    // such ballot, even if their preceding ordinary ballot was an abstention.
+    liZiChengModule.consumeRewardPending(heroState)
+    liRewardSnapshot = undefined
+    const liSeat = heros[HERO.LI_ZI_CHENG], liIndex = order.indexOf(liSeat)
+    const current = currentVoteData()
+    const voterIndex = liIndex < 0 ? -1 : current.voterIds.indexOf(player[liIndex])
+    if (voterIndex >= 0 && vote_num[liSeat - 1] > 0 && liRewardedSerial !== votePhaseSerial) {
+      const effect = currentBallotEffects.find(item => item.voterSeat === liSeat)
+      const outcome = liZiChengModule.recordBallotOutcome(heroState, {
+        ballot: current.ballots[voterIndex],
+        invalidatedByLinDanHan: !!effect?.invalidReasons.includes('lin-dan-han-protection'),
+        invalidatedByDelegation: !!effect?.invalidReasons.includes('zhu-you-xiao-delegation'),
+      })
+      if (outcome !== 'effective') liRewardSnapshot = { serial: votePhaseSerial, weight: vote_num[liSeat - 1], sequence: historyRecorder?.currentSequence() }
+    }
     buildVstr()
   }
   interface PreMaoResolutionResult {
@@ -5895,7 +5988,7 @@ export function apply(ctx: Context, config: Config) {
         lines.push("你可以发送“守+座位号”指定守卫目标；" + selfGuide + "，发送“弃守”放弃"
           + (previousGuardTarget === null || !order.includes(previousGuardTarget)
             ? "。"
-            : `；本轮不能继续守卫${previousGuardTarget}号玩家${player_copy[previousGuardTarget - 1]}。`))
+            : previousGuardTarget === seat ? '。' : `；本轮不能继续守卫${previousGuardTarget}号玩家${player_copy[previousGuardTarget - 1]}。`))
       }
       if (seat === heros[HERO.LIN_DAN_HAN] && linDanHanModule.isAwakened(heroState)) {
         lines.push("以上可投票对象已按“西迁”限制过滤。")
@@ -6551,14 +6644,18 @@ export function apply(ctx: Context, config: Config) {
     }
   }
   const grantLiZiChengReward = (session: Session) => {
+    const earned = liRewardSnapshot
+    if (!earned || earned.serial === liRewardedSerial || !liZiChengModule.hasRewardPending(heroState)) return
     const liSeat = heros[HERO.LI_ZI_CHENG]
-    const reward = vote_num[liSeat - 1]
+    const reward = earned.weight
     const liIndex = order.indexOf(liSeat)
     fa[liSeat - 1] += reward
     liZiChengModule.consumeRewardPending(heroState)
+    liRewardedSerial = earned.serial
+    liRewardSnapshot = undefined
     notifyPrivate(session, player[liIndex], "闯王，本次投票您获得" + reward + "个伐标记。您现在共有" + fa[liSeat - 1] + "个伐标记。", "李自成伐标记通知")
     sumup += liSeat + "号玩家" + player_name[liIndex] + "获得" + reward + "个伐标记。"
-    recordSkill(HERO.LI_ZI_CHENG, '获得' + reward + '个“伐”标记')
+    recordSkill(HERO.LI_ZI_CHENG, '获得' + reward + '个“伐”标记', [], undefined, { sequence: earned.sequence, timing: 'round-end' })
   }
 
   const resolveSafeNight = async (session: Session, str_shield: string) => {
@@ -7464,7 +7561,8 @@ export function apply(ctx: Context, config: Config) {
     historyDepartureReasons.set(outcast, cause === 'host' ? 'kick' : cause === 'selection-timeout' || cause === 'makeup-timeout' ? 'timeout' : 'self-exit')
     await player_out(session, outcast, true, true)
     if (modeInteraction.mode === "deer") syncDeerHostReviewClock(session, false)
-    await sendGroupNotice(session, outcast + "号玩家" + out_name + reason + "。", "玩家离场通知", guildId)
+    const publicReason = cause === 'selection-timeout' && deerProgressPrivate() ? '被自动踢出' : reason
+    await sendGroupNotice(session, outcast + "号玩家" + out_name + publicReason + "。", "玩家离场通知", guildId)
     if (game_off) return "removed"
     if (!ann_off) {
       if (add_flag) {
@@ -7796,10 +7894,11 @@ export function apply(ctx: Context, config: Config) {
         }
       }
       if (replacementFailures.length > 0) {
-        await sendGroupNotice(
+        await sendPrivateNotice(
           session,
-          replacementSeat + "号补位玩家的" + replacementFailures.join("、") + "私聊发送失败；该玩家可发送“重发我的信息”补取。",
-          "补位发牌失败通知",
+          hostid,
+          replacementSeat + "号补位玩家的" + replacementFailures.join("、") + "私聊发送结果未能确认，请先确认是否收到；可让玩家私聊发送“重发信息”补取。",
+          "补位发牌结果通知",
         )
       }
       if (vote_off) {

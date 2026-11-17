@@ -221,7 +221,7 @@ describe("hero module registry", () => {
     assert.deepEqual(yuanChongHuanModule.classifyGuardInput(state, {
       ...input,
       content: "守1",
-    }), { kind: "self-forbidden", seat: 1 })
+    }), { kind: "guard", seat: 1, replacedSeat: 3 })
     assert.deepEqual(yuanChongHuanModule.classifyGuardInput(state, {
       ...input,
       content: " 守 4 ",
@@ -233,7 +233,7 @@ describe("hero module registry", () => {
       ...input,
       whiteSeat: 1,
       content: "守1",
-    }), { kind: "self-forbidden", seat: 1 })
+    }), { kind: "guard", seat: 1, replacedSeat: 3 })
     assert.deepEqual(yuanChongHuanModule.classifyGuardInput(state, {
       ...input,
       content: "专镇",

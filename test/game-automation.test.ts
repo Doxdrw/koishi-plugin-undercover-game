@@ -197,6 +197,147 @@ function undercoverSeats(game: UndercoverGameHarness): number[] {
 }
 
 describe('Player prompts and skill routing', () => {
+  it('keeps separately recovered host requests quotable when several deer choices await review', async () => {
+    await withGame(async game => {
+      await startCustomDeerGame(game)
+      await game.sendPrivate('alice', '刘备')
+      await game.sendPrivate('bob', '关羽')
+      const before = game.transcript.length
+      await game.sendPrivate('host', '待审')
+      const requests = game.transcript.slice(before).filter(entry => entry.direction === 'out' && entry.channelId === '@host' && entry.content.includes('提交选人：'))
+      assert.equal(requests.length, 2)
+      for (const request of requests) await game.sendPrivateReply('host', '是', { id: request.messageId })
+      assert.match(privateTranscript(game, 'alice'), /已通过你的选人“刘备”/)
+      assert.match(privateTranscript(game, 'bob'), /已通过你的选人“关羽”/)
+    })
+  })
+  it('documents short role-aware todo commands and hiding current choices in game help', async () => {
+    await withGame(async game => {
+      await game.addUser('alice', 'Alice')
+      await game.sendGroup('alice', '卧底帮助')
+      assert.match(latestGroupOutput(game), /待办 \/ 待处理 \/ 待审/)
+      assert.match(latestGroupOutput(game), /主持查看审核/)
+      assert.match(latestGroupOutput(game), /优先隐藏当前鹿局/)
+    })
+  })
+  it('resolves an ordinary vote without registering the optional test observer', async () => {
+    await withGame(async game => {
+      assert.equal(game.app.get('undercoverGameResolutionTrace'), undefined)
+      await startCustomSixPlayerGame(game, {})
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      await voteOut(game, 3, [1, 2, 3, 4, 5, 6])
+      assert.match(groupTranscript(game), /开始第2轮/)
+      assert.deepEqual(game.resolutionTrace, [])
+    }, {}, { observeResolution: false })
+  })
+  it('keeps deer selection progress private after the original white seat leaves', async () => {
+    await withGame(async game => {
+      await startCustomDeerGame(game, '5', {}, false, 4)
+      await game.sendGroup('host', '踢出4')
+      await tickGameClock(300_001)
+      const before = groupTranscript(game).length
+      await game.sendGroup('alice', '谁没选人')
+      assert.equal(latestGroupOutput(game), '已私聊提醒相关玩家和主持人。')
+      assert.doesNotMatch(groupTranscript(game).slice(before), /尚未提交|待主持审核|\d号玩家/)
+      assert.match(latestPrivateOutput(game, 'host'), /尚未提交/)
+    })
+  })
+  it('keeps no-white manual reminders public but hides all automatic approval results', async () => {
+    await withGame(async game => {
+      await startCustomDeerGame(game)
+      await tickGameClock(300_001)
+      await game.sendGroup('alice', '谁没选人')
+      assert.match(latestGroupOutput(game), /尚未提交：1号玩家Alice/)
+      const before = groupTranscript(game).length
+      await game.sendPrivate('alice', '刘备')
+      await tickGameClock(30_001)
+      assert.doesNotMatch(groupTranscript(game).slice(before), /自动通过|审核超时/)
+      assert.match(privateTranscript(game, 'alice'), /已通过/)
+    }, { deerHostReviewTimeout: 30 })
+  })
+  for (const persistent of [false, true]) it(`hides current deer choices before the game ends with history ${persistent}`, async () => {
+    await withGame(async game => {
+      await startCustomDeerGame(game)
+      await game.sendGroup('alice', '隐藏选人')
+      assert.match(latestGroupOutput(game), /已隐藏本局/)
+      await submitAndApproveDeerSeat(game, 1, '刘备')
+      await submitAndApproveDeerSeat(game, 2, '曹操')
+      await game.sendGroup('host', '结束卧底')
+      await game.sendGroup('host', '公布选人 -t')
+      assert.doesNotMatch(latestGroupOutput(game), /Alice|刘备/)
+      assert.match(latestGroupOutput(game), /Bob|曹操/)
+    }, { history: { enabled: persistent, sandbox: persistent, retentionDays: 0 } })
+  })
+  it('offers short role-aware todo commands and explains obsolete deer references', async () => {
+    await withGame(async game => {
+      await startCustomDeerGame(game)
+      await game.sendPrivate('alice', '刘备')
+      const old = game.transcript.filter(x => x.direction === 'out' && x.channelId === '@host').at(-1)!
+      await game.sendPrivate('alice', '关羽')
+      await game.sendPrivateReply('host', '是', { id: old.messageId })
+      assert.match(latestPrivateOutput(game, 'host'), /已被新的提交替代/)
+      await game.sendPrivate('alice', '待办')
+      assert.match(latestPrivateOutput(game, 'alice'), /等待主持人审核/)
+      await game.sendGroup('host', '待审')
+      assert.equal(latestGroupOutput(game), '已私聊发送待办详情。')
+      const current = game.transcript.filter(x => x.direction === 'out' && x.channelId === '@host').at(-1)!
+      assert.match(current.content, /关羽/)
+      await game.sendPrivateReply('host', '是', { id: current.messageId })
+      assert.match(latestPrivateOutput(game, 'host'), /已通过1号/)
+    })
+  })
+  it('does not reward a non-voting overtime candidate from a stale ordinary abstention', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.LI_ZI_CHENG]: 1 })
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      for (const [index, ballot] of ['弃', '弃', '1', '1', '2', '2'].entries()) await game.sendPrivate(PLAYER_IDS[index], ballot)
+      const rewards = () => (privateTranscript(game, 'alice').match(/本次投票您获得/g) ?? []).length
+      assert.equal(rewards(), 1)
+      await game.sendGroup('alice', '1加时发言')
+      await game.sendGroup('bob', '2加时发言')
+      for (const id of PLAYER_IDS.slice(2)) await game.sendPrivate(id, '2')
+      assert.match(groupTranscript(game), /开始第2轮/)
+      assert.equal(rewards(), 1)
+      await game.sendGroup('host', '停止卧底')
+      await game.sendGroup('host', '复盘 1 -t')
+      const phases = await game.app.database.get('undercover_history_phase', {})
+      const earned = phases.flatMap(row => {
+        const phase = JSON.parse(row.payload)
+        return phase.events.filter((event: any) => event.kind === 'skill' && event.heroId === HERO.LI_ZI_CHENG && /获得.*伐/.test(event.effect))
+          .map((event: any) => ({ sequence: phase.sequence, kind: phase.kind, timing: event.timing }))
+      })
+      assert.deepEqual(earned, [{ sequence: 1, kind: 'regular', timing: 'round-end' }])
+      assert.doesNotMatch(groupTranscript(game), /历史采集不完整/)
+    }, { history: { enabled: true, sandbox: true, retentionDays: 0 } })
+  })
+  it('keeps initially-white deer reminders and automatic approvals private throughout the game', async () => {
+    await withGame(async game => {
+      await startCustomDeerGame(game, '5', {}, false, 4)
+      await tickGameClock(300_001)
+      const before = groupTranscript(game).length
+      await game.sendGroup('alice', '谁没选人')
+      assert.match(latestGroupOutput(game), /已私聊提醒/)
+      assert.match(privateTranscript(game, 'host'), /尚未提交/)
+      await game.sendPrivate('alice', '选词 刘备')
+      await tickGameClock(30_001)
+      assert.doesNotMatch(groupTranscript(game).slice(before), /尚未提交|待主持审核|自动通过|审核超时/)
+      assert.match(privateTranscript(game, 'alice'), /已通过/)
+      assert.match(privateTranscript(game, 'host'), /自动通过/)
+    }, { deerHostReviewTimeout: 30, deerHostTimeoutAction: 'auto' })
+  })
+  it('keeps a visibly delivered proxy prompt recoverable when the transport rejects its receipt, without public disclosure', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.ZHU_YOU_XIAO]: 5 })
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      const before = groupTranscript(game).length
+      game.bot.privateMessagePostFailures.set('alice', [Object.assign(new Error('transport response'), { code: 1200, url: 'send_private_msg' })])
+      await game.sendPrivate('eve', '放1')
+      assert.match(privateTranscript(game, 'alice'), /放权给你/)
+      assert.doesNotMatch(groupTranscript(game).slice(before), /私聊|操作提示|代投|发送失败/)
+      await game.sendPrivate('alice', '我的待处理')
+      assert.match(latestPrivateOutput(game, 'alice'), /代投|代弃/)
+    })
+  })
   for (const whiteSeat of [0, 1]) it(`rejects explicit out-of-window hero inputs without guessing them (white ${whiteSeat})`, async () => {
     await withGame(async game => {
       await startCustomSixPlayerGame(game, { [HERO.ZHU_YOU_XIAO]: 1, [HERO.WEI_ZHONG_XIAN]: 2 }, true, '5', true, whiteSeat)
@@ -920,7 +1061,7 @@ describe('Input routing and pending recovery', () => {
       await tickGameClock(1_000)
       await game.sendGroup('gina', '1')
       await game.sendGroup('host', '是')
-      await game.sendPrivate('gina', '张飞')
+      await game.sendPrivate('gina', '选词张飞')
       await tickGameClock(29_000)
       assert.doesNotMatch(privateTranscript(game, 'gina'), /主持人已通过|自动通过/)
       await game.sendPrivate('host', '待处理操作')
@@ -1880,6 +2021,7 @@ async function startCustomDeerGame(
   timeoutMode = "5",
   heroSeats: Partial<Record<number, number>> = {},
   checkBackwardSteps = false,
+  whiteSeat = 0,
 ): Promise<void> {
   await game.addUser("host", "主持人", 4)
   for (let index = 0; index < PLAYER_IDS.length; index++) {
@@ -1891,9 +2033,10 @@ async function startCustomDeerGame(
   await game.sendGroup("host", "开始")
   await game.sendGroup("host", "自定义")
   await game.sendPrivate("host", "2")
-  await game.sendPrivate("host", "否")
+  await game.sendPrivate("host", whiteSeat ? "是" : "否")
   await game.sendPrivate("host", "5")
   await game.sendPrivate("host", "6")
+  if (whiteSeat) await game.sendPrivate('host', String(whiteSeat))
   if (Object.keys(heroSeats).length > 0) {
     await game.sendPrivate("host", "是")
     for (let hero = 0; hero < HERO_NUM; hero++) {
@@ -2094,7 +2237,8 @@ describe('Host support', { concurrency: false }, () => {
       await tickGameClock(30_001)
       assert.match(privateTranscript(game, 'alice'), /主持人已通过你的选人“刘备”/)
       assert.match(privateTranscript(game, 'bob'), /主持人已通过你的选人“关羽”/)
-      assert.equal((groupTranscript(game).match(/选词审核超时，已自动通过/g) ?? []).length, 2)
+      assert.doesNotMatch(groupTranscript(game), /选词审核超时，已自动通过/)
+      assert.match(privateTranscript(game, 'host'), /选词审核超时.*自动通过/)
       await game.sendGroup('alice', '1自动批准后正常发言')
       assert.doesNotMatch(latestGroupOutput(game), /需要先.*审核/)
       assert.doesNotMatch(groupTranscript(game), /本局已自动终止/)
@@ -2189,7 +2333,7 @@ describe('Host support', { concurrency: false }, () => {
       await game.sendGroup('host', '踢出1')
       await game.sendGroup('gina', '1')
       await game.sendGroup('host', '是')
-      await game.sendPrivate('gina', '张飞')
+      await game.sendPrivate('gina', '选词张飞')
       await tickGameClock(30_001)
       assert.equal((groupTranscript(game).match(/本局需要一名协同主持/g) ?? []).length, 2)
       assert.doesNotMatch(privateTranscript(game, 'gina'), /主持人已通过/)
@@ -2310,7 +2454,7 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       await game.addUser('replacement', '后来者')
       await game.sendGroup('replacement', '1')
       await game.sendGroup('host', '是')
-      await game.sendPrivate('replacement', '独有新选人')
+      await game.sendPrivate('replacement', '选词独有新选人')
       await game.sendPrivate('host', '1是')
       await game.sendGroup('replacement', '1后任发言')
       await game.sendGroup('host', '停止卧底')
@@ -2917,7 +3061,7 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       await game.sendGroup("host", "是")
       await game.sendGroup("grace", "1尚未审核")
       assert.match(latestGroupOutput(game), /先私聊提交选词并通过主持人审核/)
-      await game.sendPrivate("grace", "刘备")
+      await game.sendPrivate("grace", "选词刘备")
       await game.sendPrivate("host", "1是")
       await game.sendGroup("grace", "1审核后的补发言")
       await game.sendGroup("host", "发言总览")
@@ -2972,7 +3116,8 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       game.failNextPrivateMessages("bob")
       await advanceUntilSettled(game.sendPrivate("host", "5"))
 
-      assert.match(groupTranscript(game), /以下私聊发送失败：2号题面/)
+      assert.doesNotMatch(groupTranscript(game), /私聊发送失败|2号题面/)
+      assert.match(privateTranscript(game, 'host'), /私聊发送结果未能确认：2号题面/)
       assert.match(groupTranscript(game), /发题完毕，开始第1轮/)
       assert.match(privateTranscript(game, "frank"), /你是6号玩家/)
       assert.doesNotMatch(privateTranscript(game, "bob"), /你是2号玩家/)
@@ -3992,8 +4137,8 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
 
       const transcript = privateTranscript(game, "alice")
       assert.match(transcript, /找不到您要守的对象/)
-      assert.match(transcript, /守卫自己请发送“专镇”/)
-      assert.match(transcript, /本轮2号玩家Bob会得到守卫/)
+      assert.match(transcript, /本轮1号玩家Alice会得到守卫/)
+      assert.match(transcript, /2号玩家Bob会得到守卫/)
       assert.match(transcript, /已放弃对2号玩家Bob的守卫；3号玩家Carol会得到守卫/)
     })
   })
@@ -5186,7 +5331,7 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       await game.sendPrivate("frank", String(ballots.at(-1)))
       await new Promise<void>(resolve => setImmediate(resolve))
 
-      assert.match(groupTranscript(game), /1号玩家的私聊操作提示发送失败；流程仍在等待/)
+      assert.doesNotMatch(groupTranscript(game), /私聊操作提示发送失败|1号玩家的私聊/)
       await game.sendPrivate("alice", "我的待处理")
       assert.match(latestPrivateOutput(game, "alice"), /毛帅，请在参阅本次投票结果后投票/)
       await game.sendPrivate("host", "待处理操作")
@@ -5612,10 +5757,11 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       await startCustomDeerGame(game)
       game.failNextPrivateMessages("host")
       await game.sendPrivate("alice", "刘备")
-      assert.match(groupTranscript(game), /鹿模式1号玩家的主持审核私聊发送失败.*待处理操作/)
+      assert.doesNotMatch(groupTranscript(game), /鹿模式1号玩家的主持审核私聊发送失败/)
 
       await game.sendGroup("host", "待处理操作")
-      assert.match(latestGroupOutput(game), /鹿模式待主持审核座位：1/)
+      assert.match(latestGroupOutput(game), /已私聊发送待办详情/)
+      assert.match(latestPrivateOutput(game, 'host'), /鹿模式待主持审核座位：1/)
       assert.doesNotMatch(latestGroupOutput(game), /刘备|选择三国人物|卧底|好人/)
 
       await game.sendPrivate("host", "待处理操作")
@@ -5646,7 +5792,7 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       await game.sendGroup("grace", "1我先发言")
       assert.match(groupTranscript(game), /你需要先私聊提交选人并通过主持人审核/)
       await game.sendGroup("bob", "2补位选人期间照常发言")
-      await game.sendPrivate("grace", "周瑜")
+      await game.sendPrivate("grace", "选词周瑜")
       await game.sendPrivate("host", "1是")
       assert.doesNotMatch(groupTranscript(game), /1号玩家选人通过|已通过1号玩家的选人/)
       await game.sendGroup("grace", "1周瑜")
@@ -5731,7 +5877,8 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       assert.match(latestGroupOutput(game), /问题已记录，但主持人私聊提示发送失败.*待处理操作/)
 
       await game.sendGroup("host", "待处理操作")
-      assert.match(latestGroupOutput(game), /龟模式待主持回答座位：1/)
+      assert.match(latestGroupOutput(game), /已私聊发送待办详情/)
+      assert.match(latestPrivateOutput(game, 'host'), /龟模式待主持回答座位：1/)
       assert.doesNotMatch(latestGroupOutput(game), /曹操|孙权|统一过北方/)
       await game.sendPrivate("host", "待处理操作")
       assert.match(latestPrivateOutput(game, "host"), /1号玩家Alice提问：他是否统一过北方/)

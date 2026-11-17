@@ -126,7 +126,7 @@ export const yuanChongHuanModule = {
   classifyGuardInput(state, input) {
     const content = normalizeHeroCommand(input.content)
     if (content === "弃守") return { kind: "abandon" } as const
-    const selfGuard = content === "专镇"
+    const selfGuard = content === "专镇" || /^守\d+$/u.test(content) && parseHeroNumber(content.slice(1)) === input.heroSeat
     if (!selfGuard && !content.startsWith("守")) return { kind: "ignore" } as const
 
     const chosenSeat = selfGuard ? input.heroSeat : parseHeroNumber(content.slice(1))

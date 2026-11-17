@@ -27,6 +27,7 @@ export interface DeerSelectionState {
   requestMessageContent?: string
   selectionDeadlineAt?: number
   submittedAt?: number
+  explicitSubmissionRequired?: boolean
 }
 
 export interface DeerProgress {
@@ -62,12 +63,15 @@ export interface ModeMessageReferenceSources {
 
 export type DeerSubmissionResult =
   | { readonly kind: "accepted", readonly selection: DeerSelectionState }
-  | { readonly kind: "empty" | "common-term" | "not-player" | "pending" | "approved" }
+  | { readonly kind: "empty" | "common-term" | "not-player" | "pending" | "approved" | "explicit-required" }
 
 export type DeerReviewResult =
   | { readonly kind: "approved" | "rejected", readonly selection: DeerSelectionState, readonly reason?: string, readonly previousCandidate?: string }
   | { readonly kind: "not-found" }
   | { readonly kind: "not-pending" }
+  | { readonly kind: "superseded" }
+  | { readonly kind: "processed" }
+  | { readonly kind: "inactive-reference" }
 
 export interface ClassicModeState {
   readonly kind: "classic"
@@ -307,10 +311,17 @@ export function parseTurtleHostInput(content: string, quotedSeat?: number): Turt
 export class ModeInteractionCoordinator {
   private currentState: GameModeState = createGameModeState("classic")
   private deerArchive = new Map<string, DeerSelectionState>()
+  private deerReferences = new Map<string, { seat: number; identity: string; version: number; status: 'active' | 'superseded' | 'processed' | 'inactive-reference' }>()
+  private retireDeerReferences(selection: DeerSelectionState, status: 'superseded' | 'processed' | 'inactive-reference') {
+    for (const ref of this.deerReferences.values()) {
+      if (ref.seat === selection.seat && ref.identity === this.deerIdentityKey(selection) && ref.version === selection.version && ref.status === 'active') ref.status = status
+    }
+  }
   private deerIdentityKey(member: Pick<ModeRosterMember, 'seat' | 'userId' | 'identityKey'>): string {
     return JSON.stringify([member.seat, member.identityKey ?? member.userId])
   }
   private archiveDeer(selection: DeerSelectionState): void {
+    this.retireDeerReferences(selection, 'inactive-reference')
     const saved = structuredClone(selection)
     delete saved.requestMessageIds; delete saved.requestMessageContent
     delete saved.selectionDeadlineAt
@@ -331,6 +342,7 @@ export class ModeInteractionCoordinator {
 
   reset(mode: GameMode): GameModeState {
     this.deerArchive.clear()
+    this.deerReferences.clear()
     this.currentState = createGameModeState(mode)
     return this.currentState
   }
@@ -364,6 +376,7 @@ export class ModeInteractionCoordinator {
           identityKey: member.identityKey,
           status: "waiting-player",
           version: 0,
+          ...(state.firstRoundStarted ? { explicitSubmissionRequired: true } : {}),
         })
       }
       else {
@@ -391,6 +404,7 @@ export class ModeInteractionCoordinator {
     const state = this.requireDeer()
     const selection = [...state.selections.values()].find(value => value.userId === userId)
     if (!selection) return { kind: "not-player" }
+    if (selection.explicitSubmissionRequired && !/^(?:选人|选词)/u.test(input.trim())) return { kind: 'explicit-required' }
     if (selection.approvedCandidate && !/^(?:选人|选词)/u.test(input.trim())) return { kind: "approved" }
 
     // “选词” is the neutral public wording; keep “选人” as a compatibility
@@ -402,6 +416,7 @@ export class ModeInteractionCoordinator {
       return { kind: "common-term" }
     }
 
+    this.retireDeerReferences(selection, 'superseded')
     selection.status = "pending-host"
     selection.version++
     selection.candidate = candidate
@@ -415,7 +430,8 @@ export class ModeInteractionCoordinator {
   recordDeerRequestMessage(seat: number, messageIds?: readonly string[], messageContent?: string, version?: number): boolean {
     const selection = this.requireDeer().selections.get(seat)
     if (!selection || selection.status !== "pending-host" || (version !== undefined && selection.version !== version)) return false
-    selection.requestMessageIds = messageIds?.map(String).filter(Boolean)
+    selection.requestMessageIds = [...new Set([...(selection.requestMessageIds ?? []), ...(messageIds?.map(String).filter(Boolean) ?? [])])]
+    for (const id of selection.requestMessageIds) this.deerReferences.set(id, { seat, identity: this.deerIdentityKey(selection), version: selection.version, status: 'active' })
     selection.requestMessageContent = messageContent?.trim() || undefined
     return true
   }
@@ -432,6 +448,8 @@ export class ModeInteractionCoordinator {
     const seatSelection = input.seat === undefined ? undefined : state.selections.get(input.seat)
     let referencedSelection: DeerSelectionState | undefined
     if (input.requestMessageId) {
+      const ref = this.deerReferences.get(input.requestMessageId)
+      if (ref && ref.status !== 'active') return { kind: ref.status }
       referencedSelection = [...state.selections.values()]
         .find(value => value.requestMessageIds?.includes(input.requestMessageId!))
     }
@@ -450,6 +468,7 @@ export class ModeInteractionCoordinator {
     if (!selection || (input.version !== undefined && selection.version !== input.version)) return { kind: "not-found" }
     if (selection.status !== "pending-host") return { kind: "not-pending" }
 
+    this.retireDeerReferences(selection, 'processed')
     if (input.approved) {
       const previousCandidate = selection.approvedCandidate
       selection.approvedCandidate = selection.candidate
@@ -477,6 +496,8 @@ export class ModeInteractionCoordinator {
   resetDeerSelection(seat: number): DeerSelectionState | null {
     const selection = this.requireDeer().selections.get(seat)
     if (!selection) return null
+    this.retireDeerReferences(selection, 'inactive-reference')
+    selection.explicitSubmissionRequired = true
     selection.status = "waiting-player"
     selection.version++
     delete selection.approvedCandidate

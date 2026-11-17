@@ -75,7 +75,7 @@ export interface HistoryPhase {
   effectiveVotes: Array<{ seat: number; count: number }>
   /** Public result notices belonging to this phase; optional for older snapshots. */
   outcomes?: string[]
-  events: Array<
+  events: Array<(
     | { kind: 'hero-reveal'; tenureId: string; heroId: number }
     | { kind: 'skill'; tenureId: string; heroId: number; effect: string; targetSeats: number[];
         details?: { kind: 'wei-slander'; affectedSeats: number[]; changedSeats: number[];
@@ -84,7 +84,7 @@ export interface HistoryPhase {
     | { kind: 'self-explosion'; tenureId: string; text: string; outcome?: HistoryExplosionOutcome; adjudicated?: boolean }
     | { kind: 'replacement'; tenureId: string }
     | { kind: 'departure'; tenureId: string; reason: 'vote' | 'skill' | 'kick' | 'self-exit' | 'timeout' }
-  >
+  ) & { timing?: 'round-start' | 'before-vote' | 'resolution' | 'round-end' }>
 }
 
 export interface HistoryAward {
@@ -197,6 +197,7 @@ export function captureHistory(input: HistorySnapshot): Readonly<HistorySnapshot
     for (const v of phase.effectiveVotes) invariant(seats.has(v.seat) && Number.isFinite(v.count) && v.count >= 0, '有效票数')
     if (phase.outcomes !== undefined) invariant(Array.isArray(phase.outcomes) && phase.outcomes.every(text => typeof text === 'string'), '阶段结果')
     for (const e of phase.events) {
+      invariant(e.timing === undefined || ['round-start', 'before-vote', 'resolution', 'round-end'].includes(e.timing), '事件时点')
       invariant(tenures.has(e.tenureId), '事件作者')
       if (e.kind === 'departure') invariant(['vote', 'skill', 'kick', 'self-exit', 'timeout'].includes(e.reason), '出局原因')
       else if (e.kind === 'replacement') invariant(input.participants.some(p => p.tenureId === e.tenureId && p.replacedTenureId), '补位记录')

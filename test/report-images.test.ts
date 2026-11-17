@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { it } from 'node:test'
 import { h } from 'koishi'
-import { ReportImages, reportHtml, reportImagePages, reportParts, type ReportBrowserPage } from '../src/game/report-images'
+import { ReportImages, reportHtml, reportImagePages, reportParts, reportTableHtml, type ReportBrowserPage } from '../src/game/report-images'
 
 function fixture(fail?: 'render' | 'send' | 'size') {
   const html: string[] = [], messages: string[] = [], settings: unknown[] = []
@@ -25,7 +25,44 @@ it('escapes all supplied text and applies a script/network denying document poli
   assert.ok(html.includes('&lt;img'))
   assert.doesNotMatch(html, /<script|<img|第1\/1/)
   assert.match(html, /default-src 'none'/)
-  assert.match(html, /class="row"/)
+  assert.match(html, /class="line"/)
+})
+
+it('keeps newlines and separator-like characters inside structured table cells', () => {
+  const table = { caption: '对局#8，易混：<甲>\n乙', headers: ['玩家', '身份', '规则', '选词'], rows: [['1号 Alice', '好人', '第一行\n第二行｜仍属规则', '<词条>']] }
+  const html = reportTableHtml('选词', table, 1, 1)
+  assert.equal((html.match(/<td>/g) ?? []).length, 4)
+  assert.match(html, /第一行\n第二行｜仍属规则/)
+  assert.match(html, /&lt;词条&gt;/)
+  assert.match(html, /对局#8，易混：&lt;甲&gt;\n乙/)
+})
+
+it('paginates a tall table using measured layout without splitting cell boundaries', async () => {
+  const test = fixture(), rendered: string[] = []
+  let current = ''
+  test.page.setContent = async html => { current = html; rendered.push(html) }
+  test.page.$ = async () => ({ boundingBox: async () => ({ x: 0, y: 0, width: 960,
+    height: (current.match(/<td>/g) ?? []).length > 8 ? 2400 : 1000 }) })
+  const rows = Array.from({ length: 5 }, (_, i) => [`${i + 1}号 Alice`, '好人', `规则${i}\n第二行｜仍是规则`, `选词${i}`])
+  assert.equal(await test.images.send(test.session, '选词', h.text('完整文字'), { caption: '易混：主题', headers: ['玩家', '身份', '规则', '选词'], rows }), true)
+  const pages = rendered.slice(-test.messages.length)
+  assert.equal(test.messages.length, 3)
+  for (let i = 0; i < rows.length; i++) assert.equal(pages.filter(html => html.includes(`选词${i}</td>`)).length, 1)
+  assert.ok(pages.every(html => html.includes('易混：主题')))
+})
+
+it('splits an oversized data row into labeled continuations without inserting or losing text', async () => {
+  const test = fixture(), rendered: string[] = []
+  let current = ''
+  const value = '长规则'.repeat(180)
+  test.page.setContent = async html => { current = html; rendered.push(html) }
+  test.page.$ = async () => ({ boundingBox: async () => ({ x: 0, y: 0, width: 960,
+    height: [...current.matchAll(/<td>(.*?)<\/td>/gs)].some(cell => cell[1].length > 300) ? 2400 : 1000 }) })
+  assert.equal(await test.images.send(test.session, '选词', h.text(value), { headers: ['玩家', '身份', '规则', '选词'], rows: [['1号 Alice', '好人', value, '词条']] }), true)
+  const pages = rendered.slice(-test.messages.length)
+  assert.equal(test.messages.length, 2)
+  assert.equal(pages.flatMap(html => [...html.matchAll(/<td>(.*?)<\/td>/gs)].filter((_, i) => i % 4 === 2).map(cell => cell[1])).join(''), value)
+  assert.match(pages[1], /1号 Alice（续）/)
 })
 
 it('splits long content without losing or reordering lines and refuses excessive pages', () => {

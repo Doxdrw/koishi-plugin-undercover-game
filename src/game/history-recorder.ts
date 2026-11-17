@@ -17,6 +17,7 @@ export class HistoryRecorder {
       ending: { kind: 'aborted', reason: 'system-error' }, participants: [], phases: [], awards: [], deerChoices: [] }
   }
   hasPhase(): boolean { return this.data.phases.length > 0 }
+  currentSequence(): number | undefined { return this.current?.sequence }
   private live() { if (this.finished) throw new Error('历史记录器已经结束。') }
   private participant(seat: number) {
     const row = this.active.get(seat)
@@ -127,19 +128,38 @@ export class HistoryRecorder {
     this.current.anonymousVotes = anonymousVotes.length ? structuredClone(anonymousVotes) : undefined
   }
   event(seat: number, event: Omit<Extract<HistoryPhase['events'][number], { kind: 'hero-reveal' }>, 'tenureId'>
-    | Omit<Extract<HistoryPhase['events'][number], { kind: 'skill' }>, 'tenureId'>) {
+    | Omit<Extract<HistoryPhase['events'][number], { kind: 'skill' }>, 'tenureId'>,
+    position?: { sequence?: number; timing?: HistoryPhase['events'][number]['timing'] }) {
     this.live()
     // Post-elimination skills remain authored by the departed tenure.
     const row = this.active.get(seat) ?? this.data.participants.filter(p => p.seat === seat).at(-1)
-    if (!row || !this.current) throw new Error('历史技能阶段或参与者缺失。')
-    this.current.events.push({ ...structuredClone(event), tenureId: row.tenureId })
+    const phase = position?.sequence === undefined ? this.current : this.data.phases.find(p => p.sequence === position.sequence)
+    if (!row || !phase) throw new Error('历史技能阶段或参与者缺失。')
+    phase.events.push({ ...structuredClone(event), ...(position?.timing ? { timing: position.timing } : {}), tenureId: row.tenureId })
   }
   choice(seat: number, choice: string | null) {
     this.live(); if (this.data.mode !== 'deer') throw new Error('仅鹿模式拥有选人记录。')
     const row = this.participant(seat)
     const old = this.data.deerChoices.find(c => c.tenureId === row.tenureId)
     if (old) old.choice = choice
-    else this.data.deerChoices.push({ tenureId: row.tenureId, choice, hidden: false })
+    else {
+      const prior = this.data.participants.filter(p => p.seat === seat && p.tenureId !== row.tenureId && p.identity.platform === row.identity.platform
+        && (p.identity.userId === row.identity.userId || row.identity.personId !== undefined && p.identity.personId === row.identity.personId))
+      const hidden = prior.some(p => this.data.deerChoices.some(c => c.tenureId === p.tenureId && c.hidden))
+      this.data.deerChoices.push({ tenureId: row.tenureId, choice, hidden })
+    }
+  }
+  hideChoices(platform: string, userId: string, personId?: number): number {
+    this.live()
+    let count = 0
+    for (const p of this.data.participants) {
+      if (p.identity.platform !== platform || p.identity.erased || !(p.identity.userId === userId || personId !== undefined && p.identity.personId === personId)) continue
+      const choice = this.data.deerChoices.find(c => c.tenureId === p.tenureId)
+      if (choice) choice.hidden = true
+      else this.data.deerChoices.push({ tenureId: p.tenureId, choice: null, hidden: true })
+      count++
+    }
+    return count
   }
   finish(ending: HistoryEnding, at: number, receipts: readonly ScoreReceipt[] = [], systemKey?: string): Readonly<HistorySnapshot> {
     if (this.finished) return this.finished

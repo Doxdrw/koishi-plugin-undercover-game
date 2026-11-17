@@ -2,7 +2,7 @@ import { h, type Context, type Session } from 'koishi'
 import { randomBytes } from 'node:crypto'
 import { GameUserError, safeErrorSummary } from './errors'
 import { HistoryQueries, historyTextPages, historyContentPages, type HistoryViewer } from './history-query'
-import type { DeerHistoryControls } from './history-deer'
+import type { DeerHistoryControls, DeerPublication } from './history-deer'
 import type { HistoryStore } from './history-store'
 import type { ReportImages } from './report-images'
 
@@ -20,7 +20,7 @@ const date = (value?: string) => {
   return result
 }
 export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, deer: DeerHistoryControls,
-  store: HistoryStore, flush: () => Promise<void>, ephemeralDeer?: (session: Session, op: 'hide' | 'reveal') => Promise<string | undefined>,
+  store: HistoryStore, flush: () => Promise<void>, ephemeralDeer?: (session: Session, op: 'hide' | 'reveal') => Promise<string | DeerPublication | undefined>,
   afterErase?: () => Promise<void>, images?: ReportImages) {
   const confirmations = new Map<string, { actor: string; expires: number; rows: Array<{ gameId: string; digest: string }> }>()
   const safe = async (action: () => Promise<string | void>) => {
@@ -128,13 +128,15 @@ export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, d
         + '\n公布选人 [编号] / 隐藏选人 [编号]。'
     }))
   for (const [name, op] of [['公布选人', 'reveal'], ['隐藏选人', 'hide']] as const)
-    ctx.command(`${name} [id:posint]`, '在原群维护已结束鹿局的选人公开状态')
+    ctx.command(`${name} [id:posint]`, op === 'hide' ? '在原群隐藏自己的选词；无编号优先当前鹿局' : '在原群公布已结束鹿局的选词')
       .option('text', '-t 本次仅使用文字，不渲染图片')
       .action(({ session, options }, id) => safe(async () => {
         const ephemeral = id === undefined ? await ephemeralDeer?.(session, op) : undefined
-        const text = ephemeral ?? await deer.change(viewer(session), op, id)
-        if (op === 'reveal' && text.startsWith('鹿模式选人公布') && !options.text && await images?.send(session, '鹿模式选词公布', h.text(text))) return
-        return text
+        const view = typeof ephemeral === 'string' ? { text: ephemeral } : ephemeral
+          ?? (deer.changeView ? await deer.changeView(viewer(session), op, id) : { text: await deer.change(viewer(session), op, id) })
+        if (op === 'reveal' && view.text.startsWith('鹿模式选人公布') && !options.text
+          && await images?.send(session, '鹿模式选词公布', h.text(view.text), view.table)) return
+        return view.text
       }))
   ctx.command('历史清理 [id:posint]', 'authority 5：预览删除当前群指定对局', { authority: 5 }).userFields(['authority'])
     .action(({ session }, id) => safe(async () => {
