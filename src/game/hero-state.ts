@@ -4,6 +4,14 @@ import { createWeiZhongXianState } from "./wei-zhong-xian-state"
 import type { WeiZhongXianState } from "./wei-zhong-xian-state"
 
 export type Seat = number
+export type ZhangXianZhongLevel = 1 | 2 | 3
+
+export interface ZhangXianZhongState {
+  awaitingTarget: boolean
+  level: ZhangXianZhongLevel
+  lastSettledVoteSerial: number
+  voterSeats: Set<Seat>
+}
 
 export type YuanChongHuanGuardState =
   | { kind: "none" }
@@ -36,9 +44,7 @@ export type ShiKeFaMode = "resistance-available" | "resistance-lost" | "awaiting
 
 export interface HeroStateStore {
   readonly legacy: HeroState
-  readonly zhangXianZhong: {
-    awaitingTarget: boolean
-  }
+  readonly zhangXianZhong: ZhangXianZhongState
   readonly liZiCheng: {
     faRewardPending: boolean
   }
@@ -102,6 +108,9 @@ export function adaptHeroState(legacy: HeroState): HeroStateStore {
   return {
     legacy,
     zhangXianZhong: {
+      level: 1,
+      lastSettledVoteSerial: 0,
+      voterSeats: new Set<Seat>(),
       get awaitingTarget() {
         return readBoolean(legacy.flag1[HERO.ZHANG_XIAN_ZHONG])
       },

@@ -6,7 +6,8 @@ import { assertGroups, fields, semanticSchema } from './config-contract'
 
 const before = JSON.parse(readFileSync(new URL('./fixtures/config-before-ui.json', import.meta.url), 'utf8'))
 const addedKeys = ['aiTools', 'reportImages', 'deerReselectionDeadline', 'deerPreviousSpeechPolicy', 'deerMakeupTimeout', 'deerSpeechReviewDefault',
-  'deerHostTimeoutAction', 'boomHostTimeoutAction', 'turtleHostTimeoutAction', 'deerSpeechReviewTimeoutAction', 'hostRecruitmentTimeout', 'realtimeSkillNoticeDefault']
+  'deerHostTimeoutAction', 'boomHostTimeoutAction', 'turtleHostTimeoutAction', 'deerSpeechReviewTimeoutAction', 'hostRecruitmentTimeout', 'realtimeSkillNoticeDefault',
+  'hostVoteEndMissingPercent', 'hostVoteEndMissingAllowance']
 const originalDefaults = (values: any) => {
   const result: any = structuredClone(Object.fromEntries(Object.entries(values).filter(([key]) => !addedKeys.includes(key))))
   delete result.history?.winrateMinimumGames
@@ -39,6 +40,18 @@ it('preserves legacy explicit false, zero, empty lists and nested configuration'
     notifications: { ...before.defaults.notifications, ...input.notifications } }
   assert.deepEqual(originalDefaults(Config(structuredClone(input))), originalDefaults(expected))
   assert.deepEqual(originalDefaults(Config(Config.simplify(Config(structuredClone(input))))), originalDefaults(expected))
+})
+
+it('keeps both host closure controls in the vote settings, with independent defaults and explicit zero values', () => {
+  const defaults = Config({})
+  assert.equal(defaults.hostVoteEndMissingPercent, 50)
+  assert.equal(defaults.hostVoteEndMissingAllowance, 1)
+  const specified = Config({ hostVoteEndMissingPercent: 75, hostVoteEndMissingAllowance: 0, skillTimeout: 60 })
+  assert.equal(specified.hostVoteEndMissingPercent, 75)
+  assert.equal(specified.hostVoteEndMissingAllowance, 0)
+  assert.equal(specified.skillTimeout, 60)
+  const voteGroup = Config.list.find(group => group.meta.description === '发言、投票与技能时限')
+  assert.ok(voteGroup?.dict.hostVoteEndMissingPercent && voteGroup.dict.hostVoteEndMissingAllowance)
 })
 
 it('puts short business groups first and one compatible collapsed debug object last', () => {

@@ -262,6 +262,30 @@ it('keeps Zhu Youjian backlash distinct from self-execution in historical wordin
   assert.doesNotMatch(won.phases[0].text, /自裁/)
 })
 
+it('keeps a protected execution successful and does not attribute a later departure to protected self-execution', async () => {
+  const { store, queries } = await fixture()
+  const snapshot = input()
+  snapshot.mode = 'classic'; snapshot.deerChoices = []
+  snapshot.participants.push({ ...snapshot.participants[0], tenureId: 'b', seat: 2,
+    identity: { platform: 'onebot', userId: 'target', nickname: '明月' }, joinedAt: 101 })
+  snapshot.phases[0].events = [
+    { kind: 'skill', tenureId: 'a', heroId: HERO.ZHU_YOU_JIAN, effect: '处决：命中异阵营', targetSeats: [2] },
+    { kind: 'skill', tenureId: 'a', heroId: HERO.ZHU_YOU_JIAN, effect: '处决被保护抵消', targetSeats: [2] },
+    { kind: 'skill', tenureId: 'a', heroId: HERO.ZHU_YOU_JIAN, effect: '处决：自裁', targetSeats: [1] },
+    { kind: 'skill', tenureId: 'a', heroId: HERO.ZHU_YOU_JIAN, effect: '处决被保护抵消', targetSeats: [1] },
+    { kind: 'skill', tenureId: 'b', heroId: HERO.ZHANG_XIAN_ZHONG, effect: '出局带走', targetSeats: [1] },
+    { kind: 'departure', tenureId: 'a', reason: 'skill' },
+  ]
+  await store.save(snapshot)
+  const replay = await queries.replay(group); assert.ok(replay)
+  for (const text of [replay.phases[0].text, String(replay.phases[0].content)]) {
+    assert.match(text, /选择处决2号玩家明月，处决成功。\n2号玩家明月受到武将技能保护，未因此出局。/)
+    assert.match(text, /1号玩家清风选择自裁。\n1号玩家清风受到武将技能保护，未因此出局。/)
+    assert.match(text, /1号玩家清风被张献忠带走。/)
+    assert.doesNotMatch(text, /处决失效|处决失败|清风自裁。|清风2号玩家/)
+  }
+})
+
 it('keeps natural skill departure causes once, including Yuan retaliation on its own author', async () => {
   const { store, queries } = await fixture(), snapshot = input()
   for (let seat = 2; seat <= 6; seat++) snapshot.participants.push({ ...snapshot.participants[0],

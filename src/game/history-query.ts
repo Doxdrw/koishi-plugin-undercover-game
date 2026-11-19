@@ -4,7 +4,7 @@ import type { HistoryParticipant } from './history-snapshot'
 import { h, type Context } from 'koishi'
 import type { HistorySnapshot, HistoryPhase, HistorySpeechSegment } from './history-snapshot'
 import type { HistoryGameRow } from './history-store'
-import { HERO_NAMES } from '../heroes'
+import { HERO, HERO_NAMES } from '../heroes'
 import { WinrateAccumulator, type WinrateFilter, type WinrateHeader } from './history-winrate'
 
 export interface HistoryViewer {
@@ -121,10 +121,20 @@ export class HistoryQueries {
     type SkillEvent = Extract<HistoryPhase['events'][number], { kind: 'skill' }>
     const departureCauses = new Map<string, SkillEvent>()
     const consumedSkillEvents = new Set<SkillEvent>()
+    const pendingSelfExecutions = new Map<string, SkillEvent>()
+    const protectedSelfExecutions = new Set<SkillEvent>()
     for (const event of phase.events) {
       if (event.kind === 'hero-reveal') reveals.set(event.tenureId, HERO_NAMES[event.heroId] ?? '未知武将')
       else if (event.kind === 'departure') {
         departureTenures.add(event.tenureId)
+      }
+      else if (event.kind === 'skill' && event.heroId === HERO.ZHU_YOU_JIAN) {
+        if (event.effect === '处决：自裁') pendingSelfExecutions.set(event.tenureId, event)
+        else if (event.effect.startsWith('处决：') || event.effect === '处决被保护抵消') {
+          const prior = pendingSelfExecutions.get(event.tenureId)
+          if (prior && event.effect === '处决被保护抵消') protectedSelfExecutions.add(prior)
+          pendingSelfExecutions.delete(event.tenureId)
+        }
       }
     }
     for (const event of phase.events) {
@@ -135,7 +145,7 @@ export class HistoryQueries {
         && ((candidate.effect === '出局带走' || candidate.effect === '权计指定出局' || candidate.effect.startsWith('发动“权计”，指定'))
           ? candidate.targetSeats.includes(participant.seat)
           : candidate.effect === '守卫连带出局' && candidate.tenureId === event.tenureId
-            || candidate.effect === '处决：自裁' && candidate.tenureId === event.tenureId))
+            || candidate.effect === '处决：自裁' && candidate.tenureId === event.tenureId && !protectedSelfExecutions.has(candidate)))
       if (cause) {
         departureCauses.set(event.tenureId, cause)
         consumedSkillEvents.add(cause)
@@ -200,6 +210,10 @@ export class HistoryQueries {
           return `${seat}号玩家${target?.identity.nickname ?? ''}`
         }).join('、')
         const effect = event.effect.replace(/；本人投票未失效/g, '')
+        if (effect === '处决被保护抵消' || effect === '殒阵带人被保护抵消') {
+          eventLines.push(sentence(`${targets || '原应出局的玩家'}受到武将技能保护，未因此出局`))
+          continue
+        }
         if (effect === '指定放权对象，等待代投') {
           const next = phase.events.slice(phase.events.indexOf(event) + 1).find(e => e.kind === 'skill' && e.tenureId === event.tenureId)
           if (next?.kind === 'skill' && /^放权给\d+号玩家代投$/.test(next.effect)
@@ -211,7 +225,6 @@ export class HistoryQueries {
           '处决：命中异阵营': `选择处决${targets}，处决成功`,
           '处决：自裁': '选择自裁',
           '处决：同阵营反噬': `选择处决${targets}，处决失败`,
-          '处决被保护抵消': `${targets}受到保护，处决失效`,
           '权计被保护抵消': `${targets}受到保护，“权计”失效`,
           '“权计”被保护抵消': `${targets}受到保护，“权计”失效`,
           '设置守卫目标': `选择守卫${targets}`,

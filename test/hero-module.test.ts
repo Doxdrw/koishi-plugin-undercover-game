@@ -131,13 +131,14 @@ describe("hero module registry", () => {
   it("registers Zhang Xianzhong and owns his waiting-state lifecycle", () => {
     assert.equal(zhangXianZhongModule.id, HERO.ZHANG_XIAN_ZHONG)
     assert.equal(heroRegistry.getById(HERO.ZHANG_XIAN_ZHONG), zhangXianZhongModule)
-    assert.deepEqual(zhangXianZhongModule.windows, [HeroWindow.PostElimination])
+    assert.deepEqual(zhangXianZhongModule.windows, [HeroWindow.VoteBallot, HeroWindow.VoteResolution, HeroWindow.Elimination, HeroWindow.PostElimination])
 
     const state = createHeroStateStore()
     state.zhangXianZhong.awaitingTarget = true
     heroRegistry.initializeState(state)
     assert.equal(zhangXianZhongModule.isAwaitingTarget(state), false)
     assert.equal(state.legacy.flag1[HERO.ZHANG_XIAN_ZHONG], 0)
+    assert.equal(state.zhangXianZhong.level, 1)
 
     zhangXianZhongModule.beginTargetSelection(state)
     assert.equal(zhangXianZhongModule.isAwaitingTarget(state), true)
@@ -159,10 +160,31 @@ describe("hero module registry", () => {
       content: "2",
       activeSeats,
     }), { kind: "invalid-target", chosenSeat: 2 })
+    assert.deepEqual(zhangXianZhongModule.classifyTargetInput({ content: '3', activeSeats, ownerSeat: 3 }),
+      { kind: 'invalid-target', chosenSeat: 3 })
     assert.deepEqual(zhangXianZhongModule.classifyTargetInput({
       content: "不是座位",
       activeSeats,
     }), { kind: "invalid-target", chosenSeat: Number.NaN })
+  })
+
+  it('upgrades only from a finalized own self-ballot and keeps named votes by owner rather than delegate', () => {
+    const state = createHeroStateStore()
+    const settle = (serial: number, facts: Parameters<typeof zhangXianZhongModule.settleVote>[3]) =>
+      zhangXianZhongModule.settleVote(state, 1, serial, facts)
+    const self = { voterSeat: 1, targetSeat: 1, weight: 4, status: 'vote' as const }
+    const proxy = { voterSeat: 2, deciderSeat: 3, targetSeat: 1, weight: 2, status: 'vote' as const,
+      invalidReasons: ['zhu-you-xiao-delegation' as const] }
+    assert.equal(settle(1, [{ ...self, targetSeat: 2 }, proxy]), undefined)
+    assert.equal(state.zhangXianZhong.level, 1)
+    assert.equal(settle(2, [self, proxy]), 2)
+    assert.equal(settle(2, [self]), undefined)
+    assert.deepEqual([...state.zhangXianZhong.voterSeats], [2])
+    assert.equal(settle(3, [{ ...self, status: 'skip', weight: 0 }]), undefined)
+    assert.equal(settle(4, [{ ...self, deciderSeat: 3 }]), undefined)
+    assert.equal(settle(5, [self]), 3)
+    assert.equal(settle(6, [self]), undefined)
+    assert.equal(state.zhangXianZhong.level, 3)
   })
 
   it("registers Yuan Chonghuan and owns his guard-state lifecycle", () => {

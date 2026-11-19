@@ -95,12 +95,7 @@ export function classifyHeirTargetInput(input: {
 }
 
 export function zhuYouXiaoHeirOptions(heroId: number | null): ZhuYouXiaoHeirOption[] {
-  if (heroId === null || [
-    HERO.ZHANG_XIAN_ZHONG,
-    HERO.LI_ZI_CHENG,
-    HERO.MAO_WEN_LONG,
-    HERO.HUANG_TAI_JI,
-  ].includes(heroId as typeof HERO.ZHANG_XIAN_ZHONG)) {
+  if (heroId === null || heroId === HERO.LI_ZI_CHENG || heroId === HERO.MAO_WEN_LONG || heroId === HERO.HUANG_TAI_JI) {
     return [ZhuYouXiaoHeirOption.GrantExecution]
   }
   const options: ZhuYouXiaoHeirOption[] = [

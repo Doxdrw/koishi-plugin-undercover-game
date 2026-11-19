@@ -588,7 +588,7 @@ describe('Vote facts and aborted history', () => {
       await game.sendGroup('host', '结束卧底')
       const rows = await game.app.database.get('undercover_history_phase', {}, { sort: { sequence: 'asc' } })
       assert.equal(JSON.parse(rows[0].payload).ballots.filter(b => b.status === 'timeout').length, 2)
-    }, { whiteMinPlayers: 99, history: { enabled: true, sandbox: true, retentionDays: 0 } })
+    }, { whiteMinPlayers: 99, hostVoteEndMissingPercent: 30, history: { enabled: true, sandbox: true, retentionDays: 0 } })
     await withGame(async game => {
       await startCustomSixPlayerGame(game, { [HERO.ZHU_YOU_XIAO]: 1 })
       await finishSpeech(game, [1, 2, 3, 4, 5, 6])
@@ -597,7 +597,7 @@ describe('Vote facts and aborted history', () => {
       await game.sendGroup('host', '结束投票')
       assert.match(latestGroupOutput(game), /共1位玩家未完成投票.*等大家再投一会/)
       assert.doesNotMatch(groupTranscript(game), /本轮投票结果/)
-    })
+    }, { hostVoteEndMissingPercent: 30 })
   })
   for (const stage of ['open', 'mao', 'huang']) it(`archives accepted ballots when stopped during ${stage}`, async () => {
     await withGame(async game => {
@@ -1217,6 +1217,365 @@ async function voteOut(game: UndercoverGameHarness, targetSeat: number, activeSe
     await game.sendPrivate(PLAYER_IDS[seat - 1], String(targetSeat))
   }
 }
+
+describe('Zhang Xianzhong levels and vote closure', { concurrency: false }, () => {
+  it('waits for Zhang to submit a legal self-vote even when the tally is already decisive', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.ZHANG_XIAN_ZHONG]: 5 })
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      for (const id of PLAYER_IDS.slice(0, 4)) await game.sendPrivate(id, '6')
+      await tickGameClock(119_000)
+      assert.doesNotMatch(groupTranscript(game), /本轮6号玩家Frank出局/)
+      assert.doesNotMatch(privateTranscript(game, 'eve'), /票数已够，无需/)
+      await game.sendPrivate('eve', '5')
+      assert.match(groupTranscript(game), /本轮6号玩家Frank出局/)
+      assert.match(privateTranscript(game, 'eve'), /殒阵.*升至2级/)
+      assert.doesNotMatch(privateTranscript(game, 'eve'), /投票已记录/)
+    })
+  })
+
+  it('keeps Zhang’s overtime decision window without advertising an unavailable self-vote', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.ZHANG_XIAN_ZHONG]: 5 })
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      await game.sendPrivate('eve', '5')
+      for (const [id, ballot] of [['alice', '2'], ['bob', '3'], ['carol', '2'], ['dave', '3'], ['eve', '2'], ['frank', '3']]) {
+        await game.sendPrivate(id, ballot)
+      }
+      assert.match(groupTranscript(game), /进入第1轮加时/)
+      assert.doesNotMatch(privateTranscript(game, 'eve'), /殒阵.*升至2级/)
+      await finishSpeech(game, [2, 3])
+      assert.match(latestPrivateOutput(game, 'eve'), /加时投票已开始/)
+      assert.doesNotMatch(latestPrivateOutput(game, 'eve'), /诈降|投自己/)
+      for (const id of ['alice', 'dave', 'frank']) await game.sendPrivate(id, '2')
+      await tickGameClock(1_001)
+      assert.match(latestPrivateOutput(game, 'eve'), /赶快投票/)
+      assert.doesNotMatch(latestPrivateOutput(game, 'eve'), /诈降|投自己/)
+      assert.doesNotMatch(groupTranscript(game), /本轮2号玩家Bob出局/)
+      await game.sendPrivate('eve', '5')
+      assert.match(latestPrivateOutput(game, 'eve'), /无效的投票语句/)
+      assert.doesNotMatch(groupTranscript(game), /本轮2号玩家Bob出局/)
+      await game.sendPrivate('eve', '2')
+      assert.match(groupTranscript(game), /本轮2号玩家Bob出局/)
+    }, { skillTimeout: 3, hurryTimeout: 1 })
+  })
+
+  for (const decision of ['守2', '弃守', '到期'] as const) it(`rechecks an already decisive vote when Yuan makes a decision or the hold expires (${decision})`, async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.YUAN_CHONG_HUAN]: 1 })
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      for (const id of PLAYER_IDS.slice(1, 5)) await game.sendPrivate(id, '6')
+      await game.sendPrivate('alice', '守99')
+      await tickGameClock(2_000)
+      assert.doesNotMatch(groupTranscript(game), /本轮6号玩家Frank出局/)
+      if (decision === '到期') await tickGameClock(1_001)
+      else await game.sendPrivate('alice', decision)
+      assert.match(groupTranscript(game), /本轮6号玩家Frank出局/)
+      assert.doesNotMatch(groupTranscript(game), /已经催了/)
+    }, { skillTimeout: 3, hurryTimeout: 3 })
+  })
+
+  it('honors the host allowance even when the configured proportion would otherwise block', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.MAO_WEN_LONG]: 1 })
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      await game.sendGroup('host', '结束投票')
+      assert.match(latestGroupOutput(game), /等大家再投一会/)
+      for (const [id, vote] of [['bob', '3'], ['carol', '2'], ['dave', '2'], ['eve', '3']]) await game.sendPrivate(id, vote)
+      await game.sendGroup('host', '结束投票')
+      assert.match(groupTranscript(game), /本次投票阶段结束/)
+      assert.match(privateTranscript(game, 'frank'), /主持人已经结束了投票阶段/)
+      assert.doesNotMatch(privateTranscript(game, 'alice'), /主持人已经结束了投票阶段/)
+    }, { hostVoteEndMissingPercent: 1 })
+  })
+
+  for (const skill of [HERO.ZHU_YOU_XIAO, HERO.WEI_ZHONG_XIAN, HERO.DUO_ER_GUN]) {
+    it(`releases the undecided active skill opportunity after a valid choice (${HERO_NAMES[skill]})`, async () => {
+      await withGame(async game => {
+        await startCustomSixPlayerGame(game, { [skill]: 1 })
+        await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+        for (const id of PLAYER_IDS.slice(1, 5)) await game.sendPrivate(id, '6')
+        assert.doesNotMatch(groupTranscript(game), /本轮6号玩家Frank出局/)
+        await game.sendPrivate('alice', skill === HERO.ZHU_YOU_XIAO ? '放2' : skill === HERO.WEI_ZHONG_XIAN ? '查2+2' : '立2')
+        assert.match(groupTranscript(game), /本轮6号玩家Frank出局/)
+        assert.doesNotMatch(groupTranscript(game), /等待.*(?:放权|缉访|定策)/)
+      })
+    })
+  }
+
+  it('keeps Zhang eligible to self-vote when a departure, not a ballot, makes the poll decisive', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.ZHANG_XIAN_ZHONG]: 1 })
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      for (const id of ['bob', 'carol', 'eve']) await game.sendPrivate(id, '6')
+      await game.sendGroup('host', '踢出4')
+      assert.doesNotMatch(groupTranscript(game), /本轮6号玩家Frank出局/)
+      await game.sendPrivate('alice', '1')
+      assert.match(groupTranscript(game), /本轮6号玩家Frank出局/)
+      assert.match(privateTranscript(game, 'alice'), /殒阵.*升至2级/)
+    })
+  })
+
+  for (const reason of ['hard timeout', 'host'] as const) it(`does not apply the skill hold to the ${reason}`, async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.YUAN_CHONG_HUAN]: 1 }, true, '4')
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      for (const id of PLAYER_IDS.slice(1, 5)) await game.sendPrivate(id, '6')
+      await game.sendPrivate('frank', '2')
+      assert.doesNotMatch(groupTranscript(game), /本轮6号玩家Frank出局/)
+      if (reason === 'host') await game.sendGroup('host', '结束投票')
+      else await tickGameClock(2_001)
+      assert.match(groupTranscript(game), /本轮6号玩家Frank出局/)
+    }, { voteTimeout: 2 })
+  })
+
+  it('uses only eligible seats for the proportion, counts abstentions, and allows one missing vote', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.MAO_WEN_LONG]: 2 })
+      await game.sendGroup('host', '踢出6')
+      await finishSpeech(game, [1, 2, 3, 4, 5])
+      await game.sendPrivate('alice', '弃')
+      await game.sendPrivate('carol', '弃权')
+      await game.sendGroup('host', '结束投票')
+      assert.match(latestGroupOutput(game), /等大家再投一会/)
+      assert.doesNotMatch(groupTranscript(game), /本轮投票结果/)
+      await game.sendPrivate('dave', '弃')
+      await game.sendGroup('host', '结束投票')
+      assert.match(groupTranscript(game), /本次投票阶段结束/)
+      assert.match(privateTranscript(game, 'eve'), /主持人已经结束了投票阶段/)
+    })
+  })
+
+  it('permits host closure with no ballot cast when there is just one eligible overtime seat', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.MAO_WEN_LONG]: 1 })
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      await voteOut(game, 6, [2, 3, 4, 5, 6])
+      await finishSpeech(game, [1, 2, 3, 4, 5])
+      await voteOut(game, 4, [2, 3, 4, 5])
+      await finishSpeech(game, [1, 2, 3, 5])
+      await game.sendPrivate('bob', '3')
+      await game.sendPrivate('carol', '2')
+      await game.sendPrivate('eve', '弃')
+      await game.sendPrivate('alice', '弃')
+      assert.match(groupTranscript(game), /进入第3轮加时/)
+      await finishSpeech(game, [2, 3])
+      await game.sendGroup('host', '结束投票')
+      assert.match(privateTranscript(game, 'eve'), /主持人已经结束了投票阶段/)
+      assert.match(groupTranscript(game), /本次投票阶段结束/)
+    })
+  })
+
+  for (const count of [3, 4] as const) it(`settles level-three sacrifice before removing the last undercover (${count} players)`, async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.ZHANG_XIAN_ZHONG]: 5 })
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      await game.sendPrivate('eve', '5')
+      await voteOut(game, 6, [1, 2, 3, 4])
+      await finishSpeech(game, [1, 2, 3, 4, 5])
+      await game.sendPrivate('eve', '弃')
+      await voteOut(game, 1, [1, 2, 3, 4])
+      if (count === 3) await game.sendGroup('host', '踢出4')
+      const players = count === 3 ? [2, 3, 5] : [2, 3, 4, 5]
+      await finishSpeech(game, players)
+      for (const seat of players.filter(seat => seat !== 5)) await game.sendPrivate(PLAYER_IDS[seat - 1], '5')
+      await game.sendPrivate('eve', '5')
+      assert.match(privateTranscript(game, 'eve'), /殒阵.*升至3级/)
+      assert.match(latestPrivateOutput(game, 'eve'), /投过你.*2号.*3号/s)
+      assert.doesNotMatch(groupTranscript(game), /本轮5号玩家Eve出局|游戏结束/)
+      await game.sendGroup('eve', '2')
+      const transcript = groupTranscript(game)
+      assert.match(transcript, /2号玩家Bob被张献忠带走/)
+      if (count === 3) {
+        assert.match(transcript, /卧底胜利/)
+        assert.doesNotMatch(transcript, /5号玩家Eve出局/)
+      } else {
+        assert.match(transcript, /2号玩家Bob被张献忠带走[\s\S]*本轮5号玩家Eve出局/)
+        assert.match(transcript, /好人胜利/)
+      }
+      await game.sendGroup('host', '总结 -t')
+      const history = await game.app.database.get('undercover_history_game', {})
+      assert.equal(history.length, 1)
+      const saved = JSON.parse(history[0].payload)
+      assert.equal(saved.ending.winner, count === 3 ? 'undercover' : 'good')
+      assert.equal(saved.participants.find(p => p.seat === 5).leftAt !== undefined, count === 4)
+      const phases = await game.app.database.get('undercover_history_phase', {})
+      const finalEvents = JSON.parse(phases.find(row => row.sequence === 3)!.payload).events
+      assert.equal(finalEvents.filter(event => event.kind === 'skill' && event.effect.includes('升至3级')).length, 1)
+      assert.equal(finalEvents.some(event => event.kind === 'skill' && event.effect.includes('原定出局未执行')), count === 3)
+    }, { history: { enabled: true, sandbox: true, retentionDays: 0 } })
+  })
+
+  async function reachThirdLevel(game: UndercoverGameHarness, heroes: Partial<Record<number, number>>, zhang = 5, secondTarget = 4, white = 0) {
+    await startCustomSixPlayerGame(game, { ...heroes, [HERO.ZHANG_XIAN_ZHONG]: zhang }, true, '5', true, white)
+    for (const [target, seats] of [[6, [1, 2, 3, 4, 5, 6]], [secondTarget, [1, 2, 3, 4, 5]]] as const) {
+      await finishSpeech(game, seats)
+      await game.sendPrivate(PLAYER_IDS[zhang - 1], String(zhang))
+      await voteOut(game, target, seats.filter(seat => seat !== zhang))
+    }
+    assert.match(privateTranscript(game, PLAYER_IDS[zhang - 1]), /殒阵.*升至3级/)
+  }
+
+  it('resumes the original overtime departure after a level-three carry without giving the candidate a ballot', async () => {
+    await withGame(async game => {
+      await reachThirdLevel(game, {})
+      await finishSpeech(game, [1, 2, 3, 5])
+      for (const [id, ballot] of [['alice', '2'], ['bob', '5'], ['carol', '5'], ['eve', '2']]) await game.sendPrivate(id, ballot)
+      assert.match(groupTranscript(game), /进入第3轮加时/)
+      await finishSpeech(game, [2, 5])
+      await game.sendPrivate('eve', '5')
+      assert.match(latestPrivateOutput(game, 'eve'), /加时阶段与他人平票，无法投票/)
+      await game.sendPrivate('alice', '5')
+      await game.sendPrivate('carol', '5')
+      assert.match(groupTranscript(game), /5号玩家Eve即将出局，先结算“殒阵”/)
+      await game.sendGroup('eve', '3')
+      assert.match(groupTranscript(game), /3号玩家Carol被张献忠带走[\s\S]*本轮5号玩家Eve出局[\s\S]*好人胜利/)
+    })
+  })
+
+  it('reports a settled guard before opening level-three sacrifice even if the carry ends the game', async () => {
+    await withGame(async game => {
+      await reachThirdLevel(game, { [HERO.YUAN_CHONG_HUAN]: 1 })
+      await game.sendGroup('host', '踢出3')
+      await finishSpeech(game, [1, 2, 5])
+      await game.sendPrivate('alice', '守2')
+      await game.sendPrivate('alice', '2')
+      await game.sendPrivate('bob', '5')
+      await game.sendPrivate('eve', '弃')
+      assert.match(groupTranscript(game), /2号玩家Bob因武将技能，免于参与加时[\s\S]*5号玩家Eve即将出局/)
+      await game.sendGroup('eve', '1')
+      assert.match(groupTranscript(game), /1号玩家Alice被张献忠带走[\s\S]*卧底胜利/)
+      assert.doesNotMatch(groupTranscript(game), /本轮5号玩家Eve出局/)
+    })
+  })
+
+  for (const forced of [false, true]) it(`respects the independent white victory threshold during level-three sacrifice (forced=${forced})`, async () => {
+    await withGame(async game => {
+      await reachThirdLevel(game, {}, 4, 5, 4)
+      if (forced) await game.sendGroup('host', '踢出3')
+      const seats = forced ? [1, 2, 4] : [1, 2, 3, 4]
+      await finishSpeech(game, seats)
+      await voteOut(game, 4, seats)
+      assert.match(groupTranscript(game), /4号玩家Dave即将出局，先结算“殒阵”/)
+      assert.doesNotMatch(groupTranscript(game), /游戏结束/)
+      await game.sendGroup('dave', '2')
+      const transcript = groupTranscript(game)
+      if (forced) {
+        assert.match(transcript, /2号玩家Bob被张献忠带走[\s\S]*白板胜利/)
+        assert.doesNotMatch(transcript, /4号玩家Dave出局/)
+      } else {
+        assert.match(transcript, /2号玩家Bob被张献忠带走[\s\S]*本轮4号玩家Dave出局[\s\S]*好人胜利/)
+        assert.doesNotMatch(transcript, /白板胜利/)
+      }
+    })
+  })
+
+  it('gives level two the settled voter seats privately, excluding the decider, replaced ballots and self', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.ZHANG_XIAN_ZHONG]: 4, [HERO.ZHU_YOU_XIAO]: 1 })
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      await game.sendPrivate('alice', '放2')
+      await game.sendPrivate('bob', '4')
+      await game.sendPrivate('bob', '6')
+      await game.sendPrivate('bob', '代4')
+      for (const [id, ballot] of [['carol', '6'], ['dave', '4'], ['eve', '6'], ['frank', '2']]) await game.sendPrivate(id, ballot)
+      await game.sendGroup('host', '踢出1')
+      await finishSpeech(game, [2, 3, 4, 5])
+      for (const [id, ballot] of [['bob', '3'], ['carol', '4'], ['dave', '2'], ['eve', '4']]) await game.sendPrivate(id, ballot)
+      assert.match(groupTranscript(game), /本轮4号玩家Dave出局[\s\S]*选择带出局的玩家/)
+      const votes = latestPrivateOutput(game, 'dave')
+      assert.match(votes, /投过你的玩家：1号玩家Alice、3号玩家Carol、5号玩家Eve。/)
+      assert.doesNotMatch(groupTranscript(game), /投过你的玩家/)
+      await game.sendPrivate('dave', '待办')
+      assert.match(latestPrivateOutput(game, 'dave'), /殒阵选人[\s\S]*投过你的玩家：1号玩家Alice/)
+      await game.sendPrivate('bob', '待办')
+      assert.doesNotMatch(latestPrivateOutput(game, 'bob'), /投过你的玩家/)
+      await game.sendGroup('dave', '弃')
+      assert.match(groupTranscript(game), /开始第3轮发言/)
+    })
+  })
+
+  it('keeps execution successful when level-three Zhang carries a target and wins before departing', async () => {
+    await withGame(async game => {
+      await reachThirdLevel(game, { [HERO.ZHU_YOU_JIAN]: 1 })
+      await game.sendGroup('host', '踢出3')
+      await game.sendGroup('alice', '处决5')
+      assert.match(groupTranscript(game), /处决成功！/)
+      assert.match(groupTranscript(game), /5号玩家Eve即将出局，先结算“殒阵”/)
+      assert.doesNotMatch(groupTranscript(game), /5号玩家Eve出局|游戏结束/)
+      await game.sendGroup('eve', '5')
+      assert.match(latestGroupOutput(game), /其他在场玩家/)
+      await game.sendGroup('eve', '2')
+      assert.match(groupTranscript(game), /2号玩家Bob被张献忠带走[\s\S]*卧底胜利/)
+      assert.doesNotMatch(groupTranscript(game), /5号玩家Eve出局|处决失败/)
+      await game.sendGroup('host', '总结 -t')
+      assert.match(groupTranscript(game), /选择处决5号玩家Eve，处决成功[\s\S]*原定出局未执行/)
+    }, { history: { enabled: true, sandbox: true, retentionDays: 0 } })
+  })
+
+  it('restores the original speech phase after a protected level-three carry and still removes Zhang', async () => {
+    await withGame(async game => {
+      await reachThirdLevel(game, { [HERO.ZHU_YOU_JIAN]: 5, [HERO.LIN_DAN_HAN]: 2 }, 3)
+      await game.sendGroup('eve', '处决3')
+      await game.sendGroup('alice', '1等待期间仍可发言')
+      await game.sendGroup('bob', '2等待期间仍可发言')
+      await game.sendGroup('eve', '5等待期间仍可发言')
+      const before = groupTranscript(game).length
+      await game.sendGroup('carol', '2')
+      const transcript = groupTranscript(game).slice(before)
+      assert.match(transcript, /2号玩家Bob受武将技能保护[\s\S]*3号玩家Carol出局[\s\S]*现在开始投票/)
+      assert.doesNotMatch(transcript, /Bob被张献忠带走|开始第4轮发言/)
+    })
+  })
+
+  it('keeps a latched level-three continuation when Zhang accepts a native reset during it', async () => {
+    await withGame(async game => {
+      await reachThirdLevel(game, { [HERO.ZHU_YOU_JIAN]: 1, [HERO.ZHU_YOU_XIAO]: 2 }, 5, 2)
+      await game.sendPrivate('bob', '传5')
+      await game.sendGroup('alice', '处决5')
+      await game.sendPrivate('eve', '传弟选1')
+      assert.match(latestPrivateOutput(game, 'eve'), /殒阵恢复为1级/)
+      await game.sendPrivate('eve', '待办')
+      assert.match(latestPrivateOutput(game, 'eve'), /殒阵选人/)
+      await game.sendGroup('eve', '3')
+      assert.match(groupTranscript(game), /3号玩家Carol被张献忠带走[\s\S]*5号玩家Eve出局[\s\S]*好人胜利/)
+      assert.equal((groupTranscript(game).match(/选择带出局的玩家/g) ?? []).length, 1)
+    })
+  })
+
+  for (const resolution of ['abandon', 'timeout'] as const) it(`resumes only the confirmed Wu Sangui departure when level-three Zhang ${resolution}s`, async () => {
+    await withGame(async game => {
+      await reachThirdLevel(game, { [HERO.WU_SAN_GUI]: 1 })
+      await finishSpeech(game, [1, 2, 3, 5])
+      for (const [id, ballot] of [['alice', '5'], ['bob', '1'], ['carol', '1'], ['eve', '5']]) await game.sendPrivate(id, ballot)
+      await game.sendGroup('alice', '5')
+      assert.match(groupTranscript(game), /5号玩家Eve即将出局/)
+      assert.doesNotMatch(groupTranscript(game), /被吴三桂指定出局|游戏结束/)
+      if (resolution === 'abandon') await game.sendGroup('eve', '弃')
+      else await tickGameClock(3_001)
+      const output = groupTranscript(game)
+      assert.equal((output.match(/被吴三桂指定出局/g) ?? []).length, 1)
+      assert.match(output, /好人胜利/)
+      assert.doesNotMatch(output, /被张献忠带走/)
+    }, { skillTimeout: 3 })
+  })
+
+  it('does not repeat a reveal or use a dangling connector when an already revealed hero executes again', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.ZHU_YOU_JIAN]: 1, [HERO.ZHU_YOU_XIAO]: 2 })
+      await game.sendGroup('alice', '处决5')
+      await finishSpeech(game, [1, 2, 3, 4, 6])
+      await voteOut(game, 2, [1, 2, 3, 4, 6])
+      await game.sendPrivate('bob', '传1')
+      await game.sendPrivate('alice', '传弟选2')
+      await game.sendGroup('alice', '处决6')
+      const output = groupTranscript(game)
+      assert.equal((output.match(/亮出武将牌：朱由检，并选择处决/g) ?? []).length, 1)
+      assert.match(output, /第1号玩家Alice（朱由检）选择处决6号玩家Frank!/)
+      assert.doesNotMatch(output, /（朱由检），并选择处决/)
+    })
+  })
+})
 
 describe('Wei Zhongxian settlement regressions', () => {
   it('rewards the actual enemy after removal and does not re-award it through slander', async () => {
@@ -3513,7 +3872,7 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       await game.sendGroup("carol", "处决3")
       for (const seat of [4, 5, 6]) await game.sendGroup(PLAYER_IDS[seat - 1], seat + "号测试发言")
 
-      assert.match(groupTranscript(game), /第3号玩家Carol，并选择处决3号玩家Carol!/)
+      assert.match(groupTranscript(game), /第3号玩家Carol选择处决3号玩家Carol!/)
       assert.doesNotMatch(groupTranscript(game), /第3号玩家Carol（未知武将）/)
     })
   })
@@ -4028,6 +4387,7 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       await game.sendGroup("alice", "处决6")
 
       const transcript = groupTranscript(game)
+      assert.match(transcript, /处决成功！[\s\S]*5号玩家Eve受武将技能保护/)
       assert.match(transcript, /5号玩家Eve受武将技能保护，不出局，处决未能使其出局/)
       assert.equal((transcript.match(/亮出武将牌：朱由检，并选择处决/g) ?? []).length, 1)
     })

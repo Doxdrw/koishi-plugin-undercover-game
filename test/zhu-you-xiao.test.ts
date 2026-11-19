@@ -126,7 +126,6 @@ describe("Zhu Youxiao input and inheritance characterization", () => {
   it("builds the approved dynamic transfer menu without meaningless options", () => {
     assert.deepEqual(zhuYouXiaoHeirOptions(null), [ZhuYouXiaoHeirOption.GrantExecution])
     for (const heroId of [
-      HERO.ZHANG_XIAN_ZHONG,
       HERO.LI_ZI_CHENG,
       HERO.MAO_WEN_LONG,
       HERO.HUANG_TAI_JI,
@@ -134,6 +133,7 @@ describe("Zhu Youxiao input and inheritance characterization", () => {
       assert.deepEqual(zhuYouXiaoHeirOptions(heroId), [ZhuYouXiaoHeirOption.GrantExecution])
     }
     for (const heroId of [
+      HERO.ZHANG_XIAN_ZHONG,
       HERO.WU_SAN_GUI,
       HERO.DUO_ER_GUN,
       HERO.LIN_DAN_HAN,
@@ -154,6 +154,19 @@ describe("Zhu Youxiao input and inheritance characterization", () => {
       ZhuYouXiaoHeirOption.GrantExecution,
       ZhuYouXiaoHeirOption.GrantLimited,
     ])
+  })
+
+  it('resets Zhang to level one without cancelling a latched choice or erasing settled votes', () => {
+    const state = createHeroStateStore()
+    state.zhangXianZhong.level = 3
+    state.zhangXianZhong.awaitingTarget = true
+    state.zhangXianZhong.lastSettledVoteSerial = 5
+    state.zhangXianZhong.voterSeats.add(6)
+    resetNativeHeroState(state, HERO.ZHANG_XIAN_ZHONG)
+    assert.equal(state.zhangXianZhong.level, 1)
+    assert.equal(state.zhangXianZhong.awaitingTarget, true)
+    assert.equal(state.zhangXianZhong.lastSettledVoteSerial, 5)
+    assert.deepEqual([...state.zhangXianZhong.voterSeats], [6])
   })
 
   it("rejects options that are not shown for the selected target", () => {

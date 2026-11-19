@@ -24,7 +24,9 @@ export function resetNativeHeroState(
 ): void {
   switch (heroId) {
     case HERO.ZHANG_XIAN_ZHONG:
-      state.zhangXianZhong.awaitingTarget = false
+      // Vote facts and a previously opened departure continuation are not
+      // native progress. Reset the level prospectively, not those facts.
+      state.zhangXianZhong.level = 1
       return
     case HERO.LI_ZI_CHENG:
       state.liZiCheng.faRewardPending = false
