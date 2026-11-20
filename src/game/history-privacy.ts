@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import type { Context } from 'koishi'
 import type { HistoryIdentity, HistorySnapshot } from './history-snapshot'
 import type { ProfileDeletionScopeLike } from './subscription-service'
+import { readDeerPublications, type DeerPublicationMetadata } from './history-deer-publication'
 
 export interface HistoryRedactionRow { key: string; cutoff: number }
 declare module 'koishi' { interface Tables { undercover_history_redaction: HistoryRedactionRow } }
@@ -46,16 +47,21 @@ export function redactHistory(input: HistorySnapshot, markers: readonly HistoryR
   return snapshot
 }
 export async function loadStoredHistory(database: Context['database'], row: { payload: string; gameId: string }): Promise<HistorySnapshot> {
-  return { ...JSON.parse(row.payload),
+  const { deerPublications: _publication, ...header } = JSON.parse(row.payload)
+  return { ...header,
     phases: (await database.get('undercover_history_phase', { gameId: row.gameId }, { sort: { sequence: 'asc' } })).map(p => JSON.parse(p.payload)),
     deerChoices: (await database.get('undercover_history_choice', { gameId: row.gameId })).map(({ tenureId, choice, hidden }) => ({ tenureId, choice, hidden })),
   }
 }
 export async function writeRedactedHistory(database: Context['database'], snapshot: HistorySnapshot) {
   const { phases, deerChoices, ...header } = snapshot
-  await database.set('undercover_history_game', { gameId: snapshot.gameId }, { payload: JSON.stringify(header) })
-  for (const p of phases) await database.set('undercover_history_phase', { gameId: snapshot.gameId, sequence: p.sequence }, { payload: JSON.stringify(p) })
   const ids = new Set(deerChoices.map(c => c.tenureId))
+  const stored = (await database.get('undercover_history_game', { gameId: snapshot.gameId }, ['payload']))[0]
+  const marks = stored && readDeerPublications(JSON.parse(stored.payload) as DeerPublicationMetadata).filter(mark => ids.has(mark.tenureId))
+  await database.set('undercover_history_game', { gameId: snapshot.gameId }, {
+    payload: JSON.stringify(marks?.length ? { ...header, deerPublications: marks } : header),
+  })
+  for (const p of phases) await database.set('undercover_history_phase', { gameId: snapshot.gameId, sequence: p.sequence }, { payload: JSON.stringify(p) })
   for (const row of await database.get('undercover_history_choice', { gameId: snapshot.gameId }))
     if (!ids.has(row.tenureId)) await database.remove('undercover_history_choice', { gameId: snapshot.gameId, tenureId: row.tenureId })
 }

@@ -5,6 +5,8 @@ import { HistoryQueries, historyTextPages, historyContentPages, type HistoryView
 import type { DeerHistoryControls, DeerPublication } from './history-deer'
 import type { HistoryStore } from './history-store'
 import type { ReportImages } from './report-images'
+import { hasMessageReceipt } from './message-delivery'
+import { withinBudget } from './operation-budget'
 
 const viewer = (s: Session): HistoryViewer => ({ platform: s.platform, selfId: s.selfId, userId: s.userId,
   guildId: s.guildId, isDirect: s.isDirect })
@@ -134,8 +136,27 @@ export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, d
         const ephemeral = id === undefined ? await ephemeralDeer?.(session, op) : undefined
         const view = typeof ephemeral === 'string' ? { text: ephemeral } : ephemeral
           ?? (deer.changeView ? await deer.changeView(viewer(session), op, id) : { text: await deer.change(viewer(session), op, id) })
-        if (op === 'reveal' && view.text.startsWith('鹿模式选人公布') && !options.text
-          && await images?.send(session, '鹿模式选词公布', h.text(view.text), view.table)) return
+        if (op === 'reveal' && view.text.startsWith('鹿模式选人公布')) {
+          const confirm = async () => {
+            if (!view.confirm) return
+            await withinBudget(view.confirm(), 2000).catch(error =>
+              ctx.logger.warn('鹿选词公布记录未确认：%s', safeErrorSummary(error)))
+          }
+          if (!options.text && await images?.send(session, '鹿模式选词公布', h.text(view.text), view.table)) {
+            await confirm()
+            return
+          }
+          if (view.confirm) {
+            // Explicit send supplies the receipt; a command return string
+            // is sent later by Koishi, outside this publication boundary.
+            try {
+              if (hasMessageReceipt(await withinBudget(session.send(h.text(view.text)), 4000))) await confirm()
+            } catch (error) {
+              ctx.logger.warn('鹿选词公布发送未确认：%s', safeErrorSummary(error))
+            }
+            return
+          }
+        }
         return view.text
       }))
   ctx.command('历史清理 [id:posint]', 'authority 5：预览删除当前群指定对局', { authority: 5 }).userFields(['authority'])

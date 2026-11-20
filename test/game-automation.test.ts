@@ -242,6 +242,24 @@ describe('Player prompts and skill routing', () => {
       assert.match(latestPrivateOutput(game, 'host'), /尚未提交/)
     })
   })
+  it('does not expose a deer replacement’s unapproved choice in the group when a white seat exists', async () => {
+    await withGame(async game => {
+      await startCustomDeerGame(game, '5', {}, false, 4)
+      await game.addUser('grace', 'Grace')
+      for (const seat of [2, 3, 4, 5, 6]) {
+        if (seat !== 4) await submitAndApproveDeerSeat(game, seat, '词条' + seat)
+        await game.sendGroup(PLAYER_IDS[seat - 1], seat + '普通发言')
+      }
+      await game.sendGroup('host', '踢出1')
+      assert.match(groupTranscript(game), /现在开始投票/)
+      await game.sendGroup('grace', '1')
+      await game.sendGroup('host', '是')
+      const before = groupTranscript(game).length
+      await game.sendGroup('grace', '1尚未审核')
+      assert.doesNotMatch(groupTranscript(game).slice(before), /先私聊提交选词|通过主持人审核/)
+      assert.match(latestPrivateOutput(game, 'grace'), /先私聊提交选词并通过主持人审核/)
+    })
+  })
   it('keeps no-white manual reminders public but hides all automatic approval results', async () => {
     await withGame(async game => {
       await startCustomDeerGame(game)
@@ -1560,6 +1578,26 @@ describe('Zhang Xianzhong levels and vote closure', { concurrency: false }, () =
     }, { skillTimeout: 3 })
   })
 
+  it('keeps the chosen authority target in history when level-three Zhang ends the game first', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.WU_SAN_GUI]: 1, [HERO.ZHANG_XIAN_ZHONG]: 5 })
+      for (const [target, seats] of [[4, [1, 2, 3, 4, 5, 6]], [3, [1, 2, 3, 5, 6]]] as const) {
+        await finishSpeech(game, seats)
+        await game.sendPrivate('eve', '5')
+        await voteOut(game, target, seats.filter(s => s !== 5))
+      }
+      await finishSpeech(game, [1, 2, 5, 6])
+      for (const [id, ballot] of [['alice', '5'], ['bob', '1'], ['frank', '1'], ['eve', '5']]) await game.sendPrivate(id, ballot)
+      await game.sendGroup('alice', '5')
+      assert.match(groupTranscript(game), /5号玩家Eve即将出局/)
+      await game.sendGroup('eve', '2')
+      assert.match(groupTranscript(game), /2号玩家Bob被张献忠带走[\s\S]*卧底胜利/)
+      await game.sendGroup('host', '复盘 -t')
+      assert.match(groupTranscript(game), /选定5号玩家Eve为“权计”目标/)
+      assert.doesNotMatch(groupTranscript(game), /5号玩家Eve被吴三桂指定出局/)
+    }, { history: { enabled: true, sandbox: true, retentionDays: 0 } })
+  })
+
   it('does not repeat a reveal or use a dangling connector when an already revealed hero executes again', async () => {
     await withGame(async game => {
       await startCustomSixPlayerGame(game, { [HERO.ZHU_YOU_JIAN]: 1, [HERO.ZHU_YOU_XIAO]: 2 })
@@ -2483,16 +2521,17 @@ async function tickGameClock(milliseconds: number): Promise<void> {
   }
 }
 
+const browserFixture = () => {
+  const html: string[] = []
+  const browser: ReportBrowser = { page: async () => ({
+    setJavaScriptEnabled: async () => {}, setRequestInterception: async () => {}, on: () => {}, setViewport: async () => {},
+    setContent: async value => { html.push(value) }, $: async () => ({ boundingBox: async () => ({ x: 0, y: 0, width: 960, height: 1000 }) }),
+    screenshot: async () => createPng(), close: async () => {},
+  }) }
+  return { html, browser }
+}
+
 describe('Report images', { concurrency: false }, () => {
-  const browserFixture = () => {
-    const html: string[] = []
-    const browser: ReportBrowser = { page: async () => ({
-      setJavaScriptEnabled: async () => {}, setRequestInterception: async () => {}, on: () => {}, setViewport: async () => {},
-      setContent: async value => { html.push(value) }, $: async () => ({ boundingBox: async () => ({ x: 0, y: 0, width: 960, height: 1000 }) }),
-      screenshot: async () => createPng(), close: async () => {},
-    }) }
-    return { html, browser }
-  }
   it('prefers images, preserves face attachments, honors -t and falls back after an image delivery failure', async () => {
     const browser = browserFixture()
     await withGame(async game => {
@@ -2889,6 +2928,52 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       assert.doesNotMatch(groupTranscript(game), /历史采集不完整|历史保存失败/)
     }, { history: { enabled: true, sandbox: true, retentionDays: 0 } })
   })
+  it('makes only acknowledged original-group deer publications available to the AI history reader', async () => {
+    const browser = browserFixture()
+    await withGame(async game => {
+      await game.addUser('host', '主持人', 4)
+      await game.addUser('alice', 'Alice')
+      const scope = { platform: game.bot.platform, selfId: game.bot.selfId, guildId: game.guildId }
+      const snapshot: HistorySnapshot = {
+        ...scope, version: 1, gameId: randomUUID(), startedAt: 100, endedAt: 300, mode: 'deer', sandbox: false,
+        ruleVersion: '0.4.0', rules: {}, topics: { publicText: '易混', good: '好人规则', undercover: '卧底规则' },
+        ending: { kind: 'completed', reason: 'elimination', winner: 'good' },
+        host: { platform: scope.platform, userId: 'host', nickname: '主持人' },
+        participants: [{ tenureId: 'alice-deer', seat: 1, joinedAt: 100, initialCamp: 'good', finalCamp: 'good',
+          identity: { platform: scope.platform, userId: 'alice', nickname: 'Alice' }, heroId: null }],
+        phases: [{ sequence: 1, round: 1, kind: 'regular', eligibleTenures: ['alice-deer'],
+          speeches: [], ballots: [], effectiveVotes: [], events: [] }],
+        awards: [], deerChoices: [{ tenureId: 'alice-deer', choice: '冷静地看', hidden: false }],
+      }
+      const saved = await new HistoryStore(game.app.database).save(snapshot)
+      assert.ok(saved.kind === 'saved')
+      const query = new HistoryQueries(game.app.database)
+      const getChoices = () => query.readForAi({ ...scope, userId: 'reader', isDirect: false }, { view: 'choices', id: saved.id })
+      const publish = '公布选人 ' + saved.id + ' -t'
+      const send = game.bot.sendMessage.bind(game.bot)
+      let acknowledged = false
+      game.bot.sendMessage = async (channel, content, referrer, options) =>
+        !acknowledged && String(content).includes('鹿模式选人公布 #') ? [] : send(channel, content, referrer, options)
+      await game.sendGroup('host', publish)
+      assert.doesNotMatch(await getChoices(), /冷静地看/)
+      acknowledged = true
+      await game.sendGroupTo('other-group', 'host', publish)
+      assert.doesNotMatch(await getChoices(), /冷静地看/)
+      await game.sendGroup('host', publish)
+      assert.match(latestGroupOutput(game), /鹿模式选人公布[\s\S]*冷静地看/)
+      assert.match(await getChoices(), /Alice：冷静地看/)
+      await game.sendGroup('alice', '隐藏选人 ' + saved.id)
+      assert.doesNotMatch(await getChoices(), /冷静地看/)
+      await game.sendGroup('alice', '公布选人 ' + saved.id)
+      assert.match(latestGroupOutput(game), /data:image\/png;base64,/)
+      assert.match(await getChoices(), /Alice：冷静地看/)
+      await game.sendGroup('alice', '隐藏选人 ' + saved.id)
+      game.failNextGroupMessages()
+      await game.sendGroup('alice', '公布选人 ' + saved.id)
+      assert.match(latestGroupOutput(game), /鹿模式选人公布[\s\S]*冷静地看/)
+      assert.match(await getChoices(), /Alice：冷静地看/)
+    }, {}, { configureApp: app => app.provide('puppeteer', browser.browser, true) })
+  })
 
   it('finishes, archives, and clears a game when all final group notices fail', async () => {
     await withGame(async game => {
@@ -2913,6 +2998,133 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       await game.sendGroup('host', '卧底')
       assert.match(latestGroupOutput(game), /开始凑人，请扣1/)
     }, { history: { enabled: true, sandbox: true, retentionDays: 0 } })
+  })
+  it('locks the verdict even if its announcement hangs, then releases without touching the next lobby', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'uc-terminal-announcement-'))
+    let stage = 'setup'
+    try { await withGame(async game => {
+      await startCustomSixPlayerGame(game, {})
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      await voteOut(game, 5, [1, 2, 3, 4, 5, 6])
+      await finishSpeech(game, [1, 2, 3, 4, 6])
+
+      let entered!: () => void, release!: () => void
+      const sending = new Promise<void>(resolve => { entered = resolve })
+      const held = new Promise<void>(resolve => { release = resolve })
+      const send = game.bot.sendMessage.bind(game.bot)
+      game.bot.sendMessage = async (channel, content, referrer, options) => {
+        if (String(content) === '游戏结束，好人胜利。') { entered(); await held }
+        return send(channel, content, referrer, options)
+      }
+      stage = 'waiting for the injected announcement'
+      const closing = voteOut(game, 6, [1, 2, 3, 4, 6])
+      try {
+        await sending
+        stage = 'rejecting the stop before the deadline'
+        await game.sendGroup('host', '结束卧底')
+        assert.match(latestGroupOutput(game), /已确定胜负，正在结算/)
+        stage = 'letting the terminal deadline expire'
+        await tickGameClock(30_001)
+        await closing
+        stage = 'waiting for the completed history'
+        let rows = await game.app.database.get('undercover_history_game', {})
+        for (let i = 0; !rows.length && i < 200; i++) {
+          await new Promise<void>(resolve => wallSetTimeout(resolve, 5))
+          rows = await game.app.database.get('undercover_history_game', {})
+        }
+        assert.equal(rows.length, 1)
+        assert.equal(JSON.parse(rows[0].payload).ending.kind, 'completed')
+        assert.equal(JSON.parse(rows[0].payload).ending.winner, 'good')
+        stage = 'opening the next lobby'
+        await game.sendGroup('host', '卧底')
+        assert.match(latestGroupOutput(game), /开始凑人/)
+        stage = 'returning the old announcement acknowledgement'
+        release()
+        await tickGameClock(1)
+        await game.sendGroup('host', '卧底')
+        assert.match(latestGroupOutput(game), /已有一局/)
+      } finally {
+        release()
+        await closing
+      }
+    }, { history: { enabled: true, sandbox: true, retentionDays: 0, mediaRetention: 'permanent' } }, { baseDir: directory })
+    } catch (error) {
+      throw new Error('Terminal announcement fixture: ' + stage, { cause: error })
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+  it('keeps a completed archive and frozen score accounts if a score acknowledgement is late', async () => {
+    let entered!: () => void, release!: () => void
+    const writing = new Promise<void>(resolve => { entered = resolve })
+    const held = new Promise<void>(resolve => { release = resolve })
+    const writes: Array<{ accountId: string; idempotencyKey: string }> = []
+    const xpPoints = {
+      ensureManagedIdentity: async (_platform: string, userId: string, suggested?: string) => ({
+        profileId: PLAYER_IDS.indexOf(userId as typeof PLAYER_IDS[number]) + 2,
+        accountId: 'account-' + userId, nickname: suggested ?? userId, automatic: false,
+      }),
+      registerScoreConsumer: () => ({ systemKey: 'undercover', dispose() {},
+        addAccount: async (target: { accountId: string }, amount: number, context: { idempotencyKey?: string }) => {
+          writes.push({ accountId: target.accountId, idempotencyKey: context.idempotencyKey! })
+          if (writes.length === 1) { entered(); await held }
+          return { after: amount }
+        },
+      }),
+    }
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, {})
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      await voteOut(game, 5, [1, 2, 3, 4, 5, 6])
+      await finishSpeech(game, [1, 2, 3, 4, 6])
+      const closing = voteOut(game, 6, [1, 2, 3, 4, 6])
+      try {
+        await writing
+        await game.sendGroup('host', '停止卧底')
+        assert.match(latestGroupOutput(game), /已确定胜负，正在结算/)
+        await tickGameClock(30_001)
+        await closing
+        await game.sendGroup('host', '复盘 -t')
+        assert.match(groupTranscript(game), /部分积分写入未确认/)
+        const rows = await game.app.database.get('undercover_history_game', {})
+        assert.equal(rows.length, 1)
+        const saved = JSON.parse(rows[0].payload)
+        assert.equal(saved.ending.winner, 'good')
+        assert.equal(saved.ending.scoreUnconfirmed, true)
+        assert.deepEqual(writes.map(write => write.accountId), ['account-alice', 'account-bob', 'account-carol', 'account-dave'])
+        assert.ok(writes.every(write => write.idempotencyKey.startsWith(rows[0].gameId + ':')))
+        await game.sendGroup('host', '卧底')
+        release()
+        await tickGameClock(1)
+        assert.equal(writes.length, 4)
+        assert.deepEqual(await game.app.database.get('undercover_history_game', {}), rows)
+      } finally {
+        release()
+        await closing
+      }
+    }, { history: { enabled: true, sandbox: false, retentionDays: 0 } }, { xpPoints, platform: 'test-platform' })
+  })
+  it('reserves the lobby before waiting on old history media and does not wait indefinitely', async () => {
+    await withGame(async game => {
+      await game.addUser('host', '主持人', 4)
+      let started!: () => void, release!: () => void
+      const pruning = new Promise<void>(resolve => { started = resolve })
+      const held = new Promise<number>(resolve => { release = () => resolve(0) })
+      const stub = mock.method(HistoryStore.prototype, 'pruneMediaForBot', () => { started(); return held })
+      const opening = game.sendGroup('host', '卧底')
+      try {
+        await pruning
+        await game.sendGroupTo('other-group', 'host', '卧底')
+        assert.match(latestGroupOutput(game), /已在其他群/)
+        await tickGameClock(2_001)
+        await opening
+        assert.match(latestGroupOutput(game), /开始凑人/)
+      } finally {
+        release()
+        await opening
+        stub.mock.restore()
+      }
+    })
   })
   it('never exposes stopped sandbox or in-progress internal recaps through persistent recap commands', async () => {
     await withGame(async game => {
@@ -5292,6 +5504,61 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
     })
   })
 
+  it('retains ballot ownership while a departure announcement is still in flight', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.ZHANG_XIAN_ZHONG]: 1 })
+      await finishSpeech(game, [1, 2, 3, 4, 5, 6])
+      for (const id of PLAYER_IDS.slice(1, 5)) await game.sendPrivate(id, '6')
+      let started!: () => void, release!: () => void
+      const sending = new Promise<void>(resolve => { started = resolve })
+      const held = new Promise<void>(resolve => { release = resolve })
+      const send = game.bot.sendMessage.bind(game.bot)
+      game.bot.sendMessage = async (channel, content, referrer, options) => {
+        if (/2号玩家Bob被主持人踢出/.test(String(content))) { started(); await held }
+        return send(channel, content, referrer, options)
+      }
+      const kick = game.sendGroup('host', '踢出2')
+      try {
+        await sending
+        await game.sendPrivate('alice', '1')
+        assert.match(groupTranscript(game), /本轮6号玩家Frank出局/)
+        release()
+        await kick
+        await game.sendGroup('host', '结束卧底')
+        const phase = (await game.app.database.get('undercover_history_phase', {})).find(row => row.sequence === 1)
+        const header = JSON.parse((await game.app.database.get('undercover_history_game', {}))[0].payload)
+        const bySeat = new Map(header.participants.map(p => [p.seat, p.tenureId]))
+        const ballots = JSON.parse(phase!.payload).ballots
+        assert.equal(ballots.find(b => b.voterTenureId === bySeat.get(6))?.targetSeat, null)
+        assert.equal(ballots.find(b => b.voterTenureId === bySeat.get(3))?.targetSeat, 6)
+        assert.equal(ballots.some(b => b.voterTenureId === bySeat.get(2)), false)
+      } finally {
+        release()
+        await kick
+      }
+    }, { history: { enabled: true, sandbox: true, retentionDays: 0 } })
+  })
+
+  it('reaches Mao’s late vote when unlimited overtime starts with no ordinary voters', async () => {
+    await withGame(async game => {
+      await startCustomSixPlayerGame(game, { [HERO.MAO_WEN_LONG]: 1 })
+      await game.sendGroup('host', '踢出4')
+      await game.sendGroup('host', '踢出6')
+      await finishSpeech(game, [1, 2, 3, 5])
+      await game.sendPrivate('bob', '5')
+      await game.sendPrivate('eve', '2')
+      await game.sendPrivate('carol', '弃')
+      await game.sendPrivate('alice', '弃')
+      assert.match(groupTranscript(game), /进入第1轮加时/)
+      await game.sendGroup('host', '踢出3')
+      const after = privateTranscript(game, 'alice').length
+      await finishSpeech(game, [2, 5])
+      assert.match(privateTranscript(game, 'alice').slice(after), /毛帅，请在参阅本次投票结果后投票/)
+      await game.sendPrivate('alice', '5')
+      assert.match(groupTranscript(game), /本轮5号玩家Eve出局[\s\S]*好人胜利/)
+    })
+  })
+
   it("settles immediately when kicking an unvoted player locks the result", async () => {
     await withGame(async (game) => {
       await startSixPlayerGame(game)
@@ -6235,6 +6502,9 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       game.failNextPrivateMessages("host")
       await game.sendGroup("alice", "1他是否统一过北方")
       assert.match(latestGroupOutput(game), /问题已记录，但主持人私聊提示发送失败.*待处理操作/)
+      await game.sendPrivate('alice', '待办')
+      assert.match(latestPrivateOutput(game, 'alice'), /等待主持人回答/)
+      assert.doesNotMatch(latestPrivateOutput(game, 'alice'), /待提问/)
 
       await game.sendGroup("host", "待处理操作")
       assert.match(latestGroupOutput(game), /已私聊发送待办详情/)
@@ -6245,6 +6515,8 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       assert.match(latestPrivateOutput(game, "host"), /对应实际词条：/)
 
       await game.sendGroup("host", "1是")
+      await game.sendPrivate('alice', '待办')
+      assert.doesNotMatch(latestPrivateOutput(game, 'alice'), /待提问|等待主持人回答/)
       await game.sendGroup("host", "龟进度")
       assert.match(latestGroupOutput(game), /已完成 1/)
     })

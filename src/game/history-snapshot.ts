@@ -6,7 +6,7 @@ export type HistoryMode = 'classic' | 'deer' | 'turtle'
 export type HistoryCamp = 'good' | 'undercover' | 'white'
 export type HistoryExplosionOutcome = 'undercover-win' | 'white-win' | 'good-win' | 'no-winner' | 'white-departure'
 export type HistoryEnding =
-  | { kind: 'completed'; reason: 'elimination' | 'stalemate' | 'white-survival' | 'rule-no-winner' | 'self-explosion' | 'recruitment'; winner: HistoryCamp | 'none' }
+  | { kind: 'completed'; reason: 'elimination' | 'stalemate' | 'white-survival' | 'rule-no-winner' | 'self-explosion' | 'recruitment'; winner: HistoryCamp | 'none'; scoreUnconfirmed?: true }
   | { kind: 'aborted'; reason: 'host-stop' | 'host-timeout' | 'setup-timeout' | 'system-error' | 'restart' }
 
 export interface HistoryIdentity {
@@ -135,6 +135,7 @@ export function captureHistory(input: HistorySnapshot): Readonly<HistorySnapshot
   invariant(input.ruleVersion && input.host.platform && (input.host.userId || input.host.erased) && typeof input.host.nickname === 'string', '主持人/规则版本')
   invariant(Object.values(input.rules).every(v => v === null || ['string', 'boolean'].includes(typeof v) || typeof v === 'number' && Number.isFinite(v)), '配置必须为显式原始规则值')
   if (input.ending.kind === 'completed') {
+    invariant(input.ending.scoreUnconfirmed === undefined || input.ending.scoreUnconfirmed === true, '未确认积分状态')
     invariant(['elimination', 'stalemate', 'white-survival', 'rule-no-winner', 'self-explosion', 'recruitment'].includes(input.ending.reason), '完成原因')
     invariant([...camps, 'none'].includes(input.ending.winner), '胜方')
     invariant(input.ending.reason !== 'stalemate' || input.ending.winner === 'undercover', '僵局胜方')

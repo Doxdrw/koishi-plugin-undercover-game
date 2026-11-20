@@ -16,7 +16,12 @@ it('keeps flat diagnostic settings compatible and explains advanced parameters i
   }
   assert.match(all.history.dict.enabled.meta.description, /第一阶段.*终止/)
   assert.match(all.scoreWhiteWin.meta.description, /苟赢.*招安后按所加入阵营/)
-  assert.deepEqual(Config({}).aiTools, { enabled: false })
-  assert.deepEqual(Config({ aiTools: { enabled: true } }).aiTools, { enabled: true })
+  const history = { enabled: false, pageSize: 5, maxChars: 2500 }
+  assert.deepEqual(Config({}).aiTools, { enabled: false, history })
+  assert.deepEqual(Config({ aiTools: { enabled: true } }).aiTools, { enabled: true, history })
+  assert.deepEqual(Config({ aiTools: { enabled: true, history: { enabled: true, pageSize: 1, maxChars: 8000 } } }).aiTools,
+    { enabled: true, history: { enabled: true, pageSize: 1, maxChars: 8000 } })
+  assert.throws(() => Config({ aiTools: { history: { pageSize: 11 } } }))
+  assert.throws(() => Config({ aiTools: { history: { maxChars: 499 } } }))
   assert.match(all.aiTools.dict.enabled.meta.description, /按需规则查询/)
 })

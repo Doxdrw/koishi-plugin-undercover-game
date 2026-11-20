@@ -2,6 +2,9 @@ export type MessageDeliveryFailureHandler = (label: string, error: unknown) => v
 export type MessageDeliveryOutcome = { status: 'confirmed'; value: unknown } | { status: 'unknown'; error: unknown }
 const emptyReceipt = (value: unknown) => Array.isArray(value)
   && !value.some(id => typeof id === 'string' ? !!id.trim() : typeof id === 'number' && Number.isFinite(id))
+export function hasMessageReceipt(value: unknown): boolean {
+  return Array.isArray(value) && !emptyReceipt(value)
+}
 
 export class GameMessageDelivery {
   constructor(private readonly onFailure: MessageDeliveryFailureHandler) {}

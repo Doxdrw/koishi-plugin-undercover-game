@@ -13,6 +13,7 @@ export interface PublicGameEvent {
   phase: 'gathering' | 'setup' | 'dealing' | 'speech' | 'voting' | 'resolving' | 'adjudication'
   overtime: boolean
   text: string
+  delivery?: '发送未确认' | '已获接口回执'
 }
 export interface PublicGameStateQuery {
   round?: number
@@ -71,7 +72,8 @@ const projectTimeline = (events: PublicGameEvent[] | undefined, query: PublicGam
   const filtered = (events ?? []).filter(event =>
     Number.isSafeInteger(event.id) && Number.isSafeInteger(event.round) && typeof event.text === 'string'
     && (round === undefined || event.round === round) && (query.phase === undefined || event.phase === query.phase))
-    .map(event => ({ ...event, text: publicMessageText(event.text) }))
+    .map(event => ({ id: event.id, round: event.round, phase: event.phase, overtime: event.overtime,
+      text: publicMessageText(event.text), ...(event.delivery ? { delivery: event.delivery } : {}) }))
     .filter(event => event.text.length > 0)
   const limit = Math.min(20, Math.max(1, Math.floor(query.limit ?? 8)))
   const pages = Math.max(1, Math.ceil(filtered.length / limit))
@@ -107,12 +109,20 @@ export class PublicGameTimelineStore {
 
   clear(): void { this.events = []; this.nextId = 1 }
 
-  record(input: Omit<PublicGameEvent, 'id'>): void {
+  record(input: Omit<PublicGameEvent, 'id'>): PublicGameEvent | undefined {
     const text = publicMessageText(input.text)
     if (!text) return
-    this.events.push({ ...input, id: this.nextId++, text })
+    const event = { ...input, id: this.nextId++, text }
+    this.events.push(event)
     // The tool is a live context window, not a second history database.
     if (this.events.length > 512) this.events.splice(0, this.events.length - 512)
+    return event
+  }
+
+  confirm(event: PublicGameEvent | undefined): void {
+    // Event IDs repeat between games. A late acknowledgement may only
+    // change the exact record that still belongs to this timeline.
+    if (event?.delivery && this.events.includes(event)) event.delivery = '已获接口回执'
   }
 
   snapshot(): PublicGameEvent[] { return this.events.map(event => ({ ...event })) }

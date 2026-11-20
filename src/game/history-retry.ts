@@ -3,6 +3,7 @@ import { link, mkdir, open, readFile, readdir, realpath, unlink, lstat } from 'n
 import { resolve, join } from 'node:path'
 import { captureHistory, archiveDisposition, type HistorySnapshot } from './history-snapshot'
 import type { HistoryStore } from './history-store'
+import { withinBudget } from './operation-budget'
 
 const fileName = /^[0-9a-f-]{36}\.json$/i
 const digest = (value: string) => createHash('sha256').update(value).digest('hex')
@@ -68,11 +69,22 @@ export class FileHistoryRetryQueue implements HistoryRetryQueue {
 /** Never accepts a callback that runs game logic or awards scores. */
 export class HistoryPersistence {
   private tail: Promise<unknown> = Promise.resolve()
+  private writeInFlight: ReturnType<HistoryStore['save']> | undefined
   constructor(private readonly store: Pick<HistoryStore, 'save'>, private readonly queue: HistoryRetryQueue,
-    private readonly warn: (event: string, gameId?: string) => void) {}
+    private readonly warn: (event: string, gameId?: string) => void, private readonly ioBudgetMs = 4000) {}
   private report(event: string, gameId?: string) { try { this.warn(event, gameId) } catch {} }
   private serial<T>(task: () => Promise<T>) {
     const result = this.tail.then(task); this.tail = result.catch(() => undefined); return result
+  }
+  private write(snapshot: HistorySnapshot, options: { enabled: boolean; sandbox: boolean }) {
+    // A timed-out transaction may still commit. Keep one actual database
+    // attempt in flight; spool other snapshots without filling a stuck queue.
+    if (this.writeInFlight) throw new Error('Previous archive write still pending')
+    const work = this.store.save(snapshot, options)
+    this.writeInFlight = work
+    const clear = () => { if (this.writeInFlight === work) this.writeInFlight = undefined }
+    void work.then(clear, clear)
+    return withinBudget(work, this.ioBudgetMs)
   }
   save(input: HistorySnapshot, options = { enabled: true, sandbox: false }) {
     let snapshot: HistorySnapshot
@@ -80,10 +92,10 @@ export class HistoryPersistence {
     catch { this.report('invalid-snapshot'); return Promise.resolve({ kind: 'failed' as const }) }
     if (archiveDisposition(snapshot, options) === 'skip') return Promise.resolve({ kind: 'skipped' as const })
     return this.serial(async () => {
-      try { return await this.store.save(snapshot, options) }
+      try { return await this.write(snapshot, options) }
       catch {
         this.report('database-save-failed', snapshot.gameId)
-        try { await this.queue.put(snapshot); return { kind: 'queued' as const } }
+        try { await withinBudget(this.queue.put(snapshot), this.ioBudgetMs); return { kind: 'queued' as const } }
         catch { this.report('archive-and-spool-failed', snapshot.gameId); return { kind: 'failed' as const } }
       }
     })
@@ -91,18 +103,19 @@ export class HistoryPersistence {
   retry() {
     return this.serial(async () => {
       let names: string[]
-      try { names = await this.queue.names() }
+      try { names = await withinBudget(this.queue.names(), this.ioBudgetMs) }
       catch { this.report('spool-read-failed'); return { saved: 0, failed: 1 } }
       let saved = 0, failed = 0
       for (const name of names) {
+        if (this.writeInFlight) break
         let id: string | undefined
         try {
-          const snapshot = await this.queue.read(name); id = snapshot.gameId
+          const snapshot = await withinBudget(this.queue.read(name), this.ioBudgetMs); id = snapshot.gameId
           // Already accepted by capture policy. Allow intentionally archived sandbox
           // records even if the current default excludes new sandbox games.
-          const result = await this.store.save(snapshot, { enabled: true, sandbox: true })
+          const result = await this.write(snapshot, { enabled: true, sandbox: true })
           if (result.kind !== 'saved' && result.kind !== 'erased') throw new Error('队列中包含不应保存的对局。')
-          await this.queue.remove(name); saved++
+          await withinBudget(this.queue.remove(name), this.ioBudgetMs); saved++
         } catch { failed++; this.report('archive-retry-failed', id) }
       }
       return { saved, failed }

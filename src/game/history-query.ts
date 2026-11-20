@@ -3,9 +3,11 @@ import { projectHistoryParticipants } from './history-participants'
 import type { HistoryParticipant } from './history-snapshot'
 import { h, type Context } from 'koishi'
 import type { HistorySnapshot, HistoryPhase, HistorySpeechSegment } from './history-snapshot'
-import type { HistoryGameRow } from './history-store'
+import { stripHistoryMedia, type HistoryGameRow } from './history-store'
 import { HERO, HERO_NAMES } from '../heroes'
 import { WinrateAccumulator, type WinrateFilter, type WinrateHeader } from './history-winrate'
+import { aiHistoryLimits, aiHistoryTextPage, validAiHistoryQuery, type AiHistoryLimits, type AiHistoryQuery, type ArchiveHint } from './history-ai-pagination'
+import { deerChoiceDigest, readDeerPublications, type DeerPublicationMetadata } from './history-deer-publication'
 
 export interface HistoryViewer {
   platform: string
@@ -22,7 +24,7 @@ export interface HistoryFilter {
   from?: number
   until?: number
 }
-type Header = Omit<HistorySnapshot, 'phases' | 'deerChoices'>
+type Header = Omit<HistorySnapshot, 'phases' | 'deerChoices'> & DeerPublicationMetadata
 /** Only rendered, public fields leave this boundary. IDs and private choices do not. */
 export interface HistorySummary {
   id: number
@@ -64,7 +66,9 @@ export class HistoryQueries {
   constructor(private readonly database: Context['database'],
     /** Return current canonical person ID; unavailable service returns undefined. */
     private readonly currentPerson: (platform: string, userId: string) => Promise<number | undefined> = async () => undefined,
-    private readonly canonical: (personId: number) => Promise<number | undefined> = async id => id) {}
+    private readonly canonical: (personId: number) => Promise<number | undefined> = async id => id,
+    private readonly canReadMedia: (platform: string, selfId: string, endedAt: number) => boolean = () => true,
+    private readonly retentionDays = 0) {}
 
   private validate(viewer: HistoryViewer) {
     if (!viewer.platform || !viewer.selfId || !viewer.userId || (!viewer.isDirect && !viewer.guildId)) throw new GameUserError('缺少历史查询会话范围。')
@@ -210,6 +214,9 @@ export class HistoryQueries {
           return `${seat}号玩家${target?.identity.nickname ?? ''}`
         }).join('、')
         const effect = event.effect.replace(/；本人投票未失效/g, '')
+        if (effect === '选定权计目标' && phase.events.some(candidate => candidate.kind === 'skill'
+          && candidate.tenureId === event.tenureId && candidate.effect === '权计指定出局'
+          && candidate.targetSeats[0] === event.targetSeats[0])) continue
         if (effect === '处决被保护抵消' || effect === '殒阵带人被保护抵消') {
           eventLines.push(sentence(`${targets || '原应出局的玩家'}受到武将技能保护，未因此出局`))
           continue
@@ -222,6 +229,7 @@ export class HistoryQueries {
         const natural: Record<string, string> = {
           '出局带走': `带走${targets}`,
           '权计指定出局': `发动“权计”，指定${targets}出局`,
+          '选定权计目标': `选定${targets}为“权计”目标`,
           '处决：命中异阵营': `选择处决${targets}，处决成功`,
           '处决：自裁': '选择自裁',
           '处决：同阵营反噬': `选择处决${targets}，处决失败`,
@@ -278,17 +286,18 @@ export class HistoryQueries {
       }
     }
     const nonZeroVotes = phase.effectiveVotes.filter(v => v.count > 0)
-    const speechLines = [...openingLines, ...this.orderedSpeeches(header, phase).flatMap(s => header.mode === 'turtle'
+    const speechEntries = this.orderedSpeeches(header, phase).flatMap(s => header.mode === 'turtle'
       ? [`${who(s.tenureId)}：问：${s.question}`, `答：${s.answer}`]
-      : [`${who(s.tenureId)}：${s.text}`])]
-    const tailLines = [
-      ...beforeVoteLines,
+      : [`${who(s.tenureId)}：${s.text}`])
+    const voteLines = [
       ...(phase.ballots.length ? [phase.voteSettled === false ? '投票尚未结算，以下为中止前已记录的投票：' : '投票结果：', ...phase.ballots.map(ballotText)] : []),
       ...(nonZeroVotes.length ? [phase.voteSettled === false ? '中止时的票况（尚未结算）：' : '最终票数：', ...nonZeroVotes.map(v => `${v.seat}号玩家${header.participants.find(p => p.seat === v.seat)?.identity.nickname ?? ''}获得${v.count}票。`)] : []),
       ...(phase.anonymousVotes ?? []).map(v => `${v.seat}号玩家有${v.count}票无来源。`),
-      ...(phase.outcomes ?? []),
-      ...resolutionLines]
-    return { headerLine: `第${phase.round}轮${phase.kind === 'overtime' ? '加时' : ''}`, openingLines, speechLines, tailLines }
+    ]
+    const outcomes = phase.outcomes ?? []
+    return { headerLine: `第${phase.round}轮${phase.kind === 'overtime' ? '加时' : ''}`, openingLines, beforeVoteLines,
+      speechEntries, voteLines, resolutionLines, speechLines: [...openingLines, ...speechEntries],
+      tailLines: [...beforeVoteLines, ...voteLines, ...outcomes, ...resolutionLines] }
   }
   private phaseText(header: Header, phase: HistoryPhase) {
     const lines = this.phaseLines(header, phase)
@@ -416,7 +425,21 @@ export class HistoryQueries {
     const phases = (await this.database.get('undercover_history_phase', { gameId: row.gameId }, { sort: { sequence: 'asc' } }))
       .map(p => JSON.parse(p.payload) as HistoryPhase).filter(p => (filter.round === undefined || p.round === filter.round)
         && (filter.sequence === undefined || p.sequence === filter.sequence) && (filter.overtime === undefined || (p.kind === 'overtime') === filter.overtime))
+    if (!this.canReadMedia(row.platform, row.selfId, row.endedAt)) stripHistoryMedia(phases)
     const summary = this.summary(row, header)
+    const { topicLines, playerLines, formerLines, awardLines, settlementNotes } = await this.overviewLines(header, this.canonical)
+    const introduction = [`对局 #${row.id}｜${modes[header.mode]}模式｜${summary.result}`,
+      `主持人：${header.host.nickname}`,
+      ...(header.ending.reason === 'elimination' ? [] : [`结束原因：${endingReasons[header.ending.reason]}`]),
+      ...topicLines,
+      '玩家：', ...playerLines,
+      ...(formerLines.length ? ['被替换的玩家：', ...formerLines] : []),
+      ...(awardLines.length ? ['积分：', ...awardLines] : []), ...settlementNotes]
+    return { ...summary, introduction: introduction.filter(Boolean).join('\n'),
+      phases: phases.map(p => ({ sequence: p.sequence, round: p.round, kind: p.kind, text: this.phaseText(header, p), content: this.phaseContent(header, p) })) }
+  }
+
+  private async overviewLines(header: Header, canonical?: (personId: number) => Promise<number | undefined>) {
     const topicLines = header.topics ? [
       ...(header.mode === 'deer' ? [`易混：${header.topics.publicText}`] : header.mode === 'turtle' ? [`汤面：${header.topics.publicText}`] : []),
       `${header.mode === 'deer' ? '好人规则' : header.mode === 'turtle' ? '好人实际词条' : '好人词条'}：${header.topics.good}`,
@@ -425,7 +448,7 @@ export class HistoryQueries {
       ...(header.topics.undercoverHint ? [header.mode === 'classic' ? '卧底雷点：' + header.topics.undercoverHint : '卧底提示：' + header.topics.undercoverHint] : []),
       ...(header.topics.whiteHint ? ['白板提示：' + header.topics.whiteHint] : []),
     ] : []
-    const roster = await projectHistoryParticipants(header.participants, this.canonical)
+    const roster = await projectHistoryParticipants(header.participants, canonical)
     const participantLine = (p: HistoryParticipant) => `${p.seat}号 ${p.identity.nickname}（${label[p.initialCamp]}${p.finalCamp !== p.initialCamp ? '→' + label[p.finalCamp] : ''}${p.heroId !== null ? '，' + (HERO_NAMES[p.heroId] ?? '未知武将') : ''}${p.replacedTenureId ? '，补位' : ''}）`
     const playerLines = roster.current.map(participantLine)
     const formerLines = roster.former.map(participantLine)
@@ -436,15 +459,96 @@ export class HistoryQueries {
       if (a.status === 'zero') return `${nickname}本局未获得积分。`
       return /undercover-boom-bonus$/.test(a.reason) ? `${nickname}自爆获胜，额外加${a.amount}分。` : `${nickname}获得${a.amount}分。`
     })
-    const introduction = [`对局 #${row.id}｜${modes[header.mode]}模式｜${summary.result}`,
-      `主持人：${header.host.nickname}`,
-      ...(header.ending.reason === 'elimination' ? [] : [`结束原因：${endingReasons[header.ending.reason]}`]),
-      ...topicLines,
-      '玩家：', ...playerLines,
-      ...(formerLines.length ? ['被替换的玩家：', ...formerLines] : []),
-      ...(awardLines.length ? ['积分：', ...awardLines] : [])]
-    return { ...summary, introduction: introduction.filter(Boolean).join('\n'),
-      phases: phases.map(p => ({ sequence: p.sequence, round: p.round, kind: p.kind, text: this.phaseText(header, p), content: this.phaseContent(header, p) })) }
+    const settlementNotes = header.ending.kind === 'completed' && header.ending.scoreUnconfirmed
+      ? ['结算时部分积分写入未确认，请核对原流水。'] : []
+    return { topicLines, playerLines, formerLines, awardLines, settlementNotes }
+  }
+
+  /** Read the same public facts as group replay, but only one small stored
+   * window at a time. Never invoke the commands that disclose deer choices. */
+  async readForAi(viewer: HistoryViewer, input: AiHistoryQuery = {}, options: Partial<AiHistoryLimits> = {}, pending?: ArchiveHint): Promise<string> {
+    const error = (message: string) => JSON.stringify({ message })
+    if (viewer.isDirect !== false || !viewer.guildId || !viewer.platform || !viewer.selfId || !viewer.userId) return error('仅可在对局原群查询已完成的历史。')
+    if (!validAiHistoryQuery(input)) return error('历史工具参数不正确。')
+    const scope = { platform: viewer.platform, selfId: viewer.selfId, guildId: viewer.guildId, disposition: 'completed',
+      ...(this.retentionDays > 0 ? { endedAt: { $gte: Date.now() - this.retentionDays * 86400000 } } : {}) }
+    const { pageSize, maxChars } = aiHistoryLimits(options)
+    const { view = 'overview', id, page = 1, section, sequence } = input
+    const limit = Math.min(pageSize, input.limit ?? pageSize)
+    // The list/directory contain only short fixed-shape rows. A conservative
+    // width bound keeps DB pages stable even at the smallest configured budget.
+    const rowLimit = Math.min(limit, Math.max(1, Math.floor((maxChars - 240) / 145)))
+    const sort = { endedAt: 'desc', id: 'desc' } as const
+    const archivedGame = (row: HistoryGameRow, header: Header) => ({
+      id: row.id, mode: header.mode, endedAt: row.endedAt,
+      result: this.summary(row, header).result, reason: endingReasons[header.ending.reason],
+    })
+    const boundedRows = (base: object, items: readonly object[]) => {
+      const json = JSON.stringify({ ...base, items: items.slice(0, rowLimit), ...(items.length > rowLimit ? { nextPage: page + 1 } : {}) })
+      return json.length <= maxChars ? json : error('当前返回预算不足，请减少每页条数。')
+    }
+    if (view === 'list') {
+      const rows = await this.database.get('undercover_history_game', scope, { sort, limit: rowLimit + 1, offset: (page - 1) * rowLimit })
+      return boundedRows({ view }, rows.map(row => archivedGame(row, JSON.parse(row.payload))))
+    }
+    const read = async (db: Context['database']) => {
+      const [row] = await db.get('undercover_history_game', { ...scope, ...(id === undefined ? {} : { id }) }, { sort, limit: 1 })
+      if (!row) return error(id === undefined && pending ? `最近结束的对局${pending.status}，暂无可读归档。` : '没有可访问的完成局记录。')
+      const header = JSON.parse(row.payload) as Header
+      if (header.ending.kind !== 'completed') return error('没有可访问的完成局记录。')
+      const game = archivedGame(row, header)
+      const base = { view, game }
+      const text = (lines: readonly string[], extra: object = {}) => aiHistoryTextPage({ ...base, ...extra }, lines, page, limit, maxChars)
+      if (view === 'overview') {
+        if (!section) return JSON.stringify({ ...base, ...(id === undefined && pending && pending.gameId !== row.gameId
+          ? { note: `最近结束的对局${pending.status}，返回最近已归档对局。` } : {}) })
+        const { topicLines, playerLines, formerLines, awardLines, settlementNotes } = await this.overviewLines(header)
+        return text(section === 'topics' ? topicLines : section === 'players'
+          ? [`主持人：${header.host.nickname}`, ...playerLines, ...formerLines.map(line => `被替换的玩家：${line}`)]
+          : [...awardLines, ...settlementNotes], { section })
+      }
+      if (view === 'phases') {
+        const list = await db.get('undercover_history_phase', { gameId: row.gameId },
+          { sort: { sequence: 'asc' }, limit: rowLimit + 1, offset: (page - 1) * rowLimit })
+        return boundedRows(base, list.map(item => {
+          const phase = JSON.parse(item.payload) as HistoryPhase
+          return { sequence: item.sequence, round: phase.round, kind: phase.kind }
+        }))
+      }
+      if (view === 'phase') {
+        const [item] = await db.get('undercover_history_phase', { gameId: row.gameId, sequence })
+        if (!item) return error('本局没有该阶段。')
+        const phase = JSON.parse(item.payload) as HistoryPhase
+        const lines = this.phaseLines(header, phase)
+        const speech = () => this.orderedSpeeches(header, phase).flatMap(entry => {
+          const player = header.participants.find(p => p.tenureId === entry.tenureId)
+          const who = player ? `${player.seat}号玩家${player.identity.nickname}` : '已移除玩家'
+          return [
+            ...(entry.previousInvalid ?? []).map(previous => `${who}（已失效：${previous.reason}）：${previous.text}`),
+            `${who}${entry.invalidReason ? '（已失效：' + entry.invalidReason + '）' : ''}：`
+              + (header.mode === 'turtle' ? `问：${entry.question}\n答：${entry.answer}` : entry.text),
+          ]
+        })
+        return text(section === 'speech' ? speech() : section === 'votes'
+          ? lines.voteLines.filter(line => !/^(?:投票结果|最终票数)：$/.test(line))
+          : [...lines.openingLines, ...lines.beforeVoteLines, ...(phase.outcomes ?? []), ...lines.resolutionLines],
+        { sequence, round: phase.round, kind: phase.kind, section: section ?? 'events' })
+      }
+      if (row.mode !== 'deer') return text([])
+      const marks = new Map(readDeerPublications(header).filter(mark => mark.confirmed === true).map(mark => [mark.tenureId, mark]))
+      if (!marks.size) return text([])
+      const visible = new Map((await db.get('undercover_history_choice',
+        { gameId: row.gameId, hidden: false, tenureId: { $in: [...marks.keys()] } })).map(choice => [choice.tenureId, choice]))
+      const roster = await projectHistoryParticipants(header.participants)
+      return text([...roster.current, ...roster.former].flatMap(p => {
+        const choice = visible.get(p.tenureId)
+        if (p.identity.erased || !choice || deerChoiceDigest(choice) !== marks.get(p.tenureId)?.digest) return []
+        return [`${p.seat}号玩家${p.identity.nickname}${p.replacedTenureId ? '（补位）' : ''}：${p.initialCamp === 'white' ? '无需选词' : choice.choice ?? '未通过'}`]
+      }))
+    }
+    // Publication/hide writes are transactional; observe one coherent view of
+    // both the receipt record and the current hidden flag.
+    return view === 'choices' ? this.database.transact(read) : read(this.database)
   }
 }
 

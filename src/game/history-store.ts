@@ -1,7 +1,7 @@
 import { GameUserError } from './errors'
 import { createHash } from 'node:crypto'
 import type { Context } from 'koishi'
-import { captureHistory, archiveDisposition, type HistorySnapshot } from './history-snapshot'
+import { captureHistory, archiveDisposition, type HistoryPhase, type HistorySnapshot } from './history-snapshot'
 import { redactHistory, loadStoredHistory } from './history-privacy'
 
 export interface HistoryGameRow {
@@ -59,13 +59,30 @@ function canonical(value: unknown): string {
 }
 
 /** Internal persistence boundary, not a user-facing query API. No score writes. */
+export function stripHistoryMedia(phases: readonly HistoryPhase[]): void {
+  for (const phase of phases) for (const speech of phase.speeches) {
+    for (const item of [speech, ...(speech.previousInvalid ?? [])]) {
+      if (item.segments?.some(segment => segment.kind === 'media')) {
+        item.segments = item.segments.filter(segment => segment.kind !== 'media')
+      }
+    }
+  }
+}
+
 export class HistoryStore {
   private tail: Promise<unknown> = Promise.resolve()
+  private readonly mediaBoundaries = new Map<string, number>()
+  private readonly mediaPrunes = new Map<string, Promise<number>>()
   constructor(
     private readonly database: Context['database'],
     private readonly retentionDays = 0,
     private readonly mediaRetention: HistoryMediaRetention = { mode: 'next-game' },
   ) {}
+  canReadMedia(platform: string, selfId: string, endedAt: number): boolean {
+    return endedAt >= (this.mediaBoundaries.get(mediaKey(platform, selfId)) ?? 0)
+      && (this.mediaRetention.mode !== 'days'
+        || endedAt >= Date.now() - Math.max(1, this.mediaRetention.days) * 86400000)
+  }
   async deletionFingerprint(gameId: string, database = this.database) {
     const row = (await database.get('undercover_history_game', { gameId }))[0]
     if (!row) throw new GameUserError('历史记录已不存在。')
@@ -93,13 +110,8 @@ export class HistoryStore {
       // A late database retry must respect a next-game cleanup which already
       // committed. Store the boundary in the existing generic cutoff table.
       const marker = (await db.get('undercover_history_redaction', { key: mediaKey(snapshot.platform, snapshot.selfId) }))[0]
-      if ((marker && snapshot.endedAt < marker.cutoff) || this.mediaRetention.mode === 'days'
-        && snapshot.endedAt < Date.now() - Math.max(1, this.mediaRetention.days) * 86400000) {
-        for (const phase of sanitized.phases) for (const speech of phase.speeches) {
-          for (const item of [speech, ...(speech.previousInvalid ?? [])]) {
-            if (item.segments?.some(s => s.kind === 'media')) item.segments = item.segments.filter(s => s.kind !== 'media')
-          }
-        }
+      if ((marker && snapshot.endedAt < marker.cutoff) || !this.canReadMedia(snapshot.platform, snapshot.selfId, snapshot.endedAt)) {
+        stripHistoryMedia(sanitized.phases)
       }
       const { phases, deerChoices, ...header } = sanitized
       const departureReasons = phases.flatMap(phase => phase.events.flatMap(event => event.kind === 'departure'
@@ -185,14 +197,27 @@ export class HistoryStore {
     const cutoff = this.mediaRetention.mode === 'days'
       ? before - Math.max(1, this.mediaRetention.days) * 86400000
       : before + 1 // A game ended in this same millisecond is still a previous game.
-    const task = this.tail.then(() => this.database.transact(async db => {
-      const rows = await db.get('undercover_history_game', { platform, selfId })
-      const key = mediaKey(platform, selfId)
-      const old = (await db.get('undercover_history_redaction', { key }))[0]
-      const marker = { key, cutoff: Math.max(cutoff, old?.cutoff ?? 0) }
-      await db.upsert('undercover_history_redaction', [marker])
-      return this.removeMediaRows(db, rows, cutoff)
-    }))
+    const key = mediaKey(platform, selfId)
+    // Apply the privacy boundary before awaiting the write queue. Existing
+    // replay reads and delayed archives both obey it if the database stalls.
+    this.mediaBoundaries.set(key, Math.max(cutoff, this.mediaBoundaries.get(key) ?? 0))
+    const pending = this.mediaPrunes.get(key)
+    if (pending) return pending
+    const task = this.tail.then(async () => {
+      let total = 0, target: number
+      do {
+        target = this.mediaBoundaries.get(key)!
+        total += await this.database.transact(async db => {
+          const rows = await db.get('undercover_history_game', { platform, selfId })
+          const old = (await db.get('undercover_history_redaction', { key }))[0]
+          const marker = { key, cutoff: Math.max(target, old?.cutoff ?? 0) }
+          await db.upsert('undercover_history_redaction', [marker])
+          return this.removeMediaRows(db, rows, marker.cutoff)
+        })
+      } while (target !== this.mediaBoundaries.get(key))
+      return total
+    }).finally(() => { this.mediaPrunes.delete(key) })
+    this.mediaPrunes.set(key, task)
     this.tail = task.catch(() => undefined)
     return task
   }

@@ -9,7 +9,7 @@ import { ReplacementRequestCoordinator } from './game/replacement-request'
 import { GameRouteCoordinator } from './game/game-route'
 import { AsyncSerialQueue } from './game/async-serial-queue'
 import { VoteSettlementCoordinator } from './game/vote-settlement'
-import { GameMessageDelivery } from './game/message-delivery'
+import { GameMessageDelivery, hasMessageReceipt, type MessageDeliveryOutcome } from './game/message-delivery'
 import {
   ModeInteractionCoordinator,
   formatModeRoundCapabilities,
@@ -19,7 +19,8 @@ import {
   parseTurtleQuestion,
   resolveModeMessageReference,
 } from './game/game-mode'
-import { ScoreService } from './game/score-service'
+import { ScoreService, type ScoreWriteInput } from './game/score-service'
+import { withinBudget } from './game/operation-budget'
 import { HistoryRecorder } from './game/history-recorder'
 import { HistoryStore, registerHistoryModels, type HistoryMediaRetention } from './game/history-store'
 import { HistoryPersistence, FileHistoryRetryQueue } from './game/history-retry'
@@ -29,7 +30,8 @@ import { registerHistoryCommands } from './game/history-commands'
 import { registerWinrateCommands } from './game/winrate-commands'
 import { ReportImages, type ReportBrowser } from './game/report-images'
 import { createHistoryDeletionConsumer } from './game/history-deletion-consumer'
-import type { HistoryEnding, HistoryCamp, HistorySpeechSegment } from './game/history-snapshot'
+import { archiveDisposition, type HistoryEnding, type HistoryCamp, type HistorySpeechSegment } from './game/history-snapshot'
+import { defaultAiHistoryLimits, type ArchiveHint } from './game/history-ai-pagination'
 import { DiagnosticLog, GameDiagnostics, type DiagnosticConfig } from './game/diagnostics'
 import { removeRosterSeat } from './game/roster-service'
 import { isEligibleSpeechSeat } from './game/speech-eligibility'
@@ -40,7 +42,7 @@ import { DeerRevisionCoordinator, type DeerSpeechReview } from './game/deer-revi
 import { HostSupportCoordinator } from './game/host-support'
 import { PublicHeroRevealState } from './game/hero-reveal'
 import { projectPublicGameState, PublicGameTimelineStore, publicMessageText, type PublicGameEvent, type PublicGameStateQuery } from './game/public-game-state'
-import { installChatLunaGameTools } from './game/chatluna-game-tools'
+import { installChatLunaGameTools, installChatLunaHistoryTool } from './game/chatluna-game-tools'
 import { postEliminationHero } from './game/post-elimination'
 import { classifyEliminationVictory } from './game/elimination-outcome'
 import { isStalemateEligible, StalemateTracker } from './game/stalemate'
@@ -176,7 +178,7 @@ export const inject = { required: ["database"], optional: ["xpPoints", "puppetee
 
 export interface Config {
   debug?: DiagnosticConfig
-  aiTools?: { enabled: boolean }
+  aiTools?: { enabled: boolean; history?: { enabled: boolean; pageSize?: number; maxChars?: number } }
   reportImages?: { enabled: boolean; timeout: number }
   history?: {
     enabled: boolean
@@ -362,6 +364,11 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     aiTools: Schema.object({
       enabled: Schema.boolean().default(false).description("向 ChatLuna 提供按需规则查询和当前群公开状态工具。由 AI 在需要时调用；接入说明见 ChatLuna 协作指南。"),
+      history: Schema.object({
+        enabled: Schema.boolean().default(false).description('允许 AI 查询本群已归档对局；需同时开启 AI 工具和历史存档。'),
+        pageSize: Schema.natural().min(1).max(10).default(defaultAiHistoryLimits.pageSize).description('AI 历史每页最多返回的条数。'),
+        maxChars: Schema.natural().min(500).max(8000).default(defaultAiHistoryLimits.maxChars).description('AI 历史单次完整返回的字符上限，含分页信息。'),
+      }).description('AI 历史查询'),
     }),
   }).description("AI 工具"),
   Schema.object({
@@ -423,15 +430,21 @@ export function apply(ctx: Context, config: Config) {
     (event, id) => ctx.logger.warn('对局历史保存状态：%s（%s）', event, id ?? 'unknown'))
   const historyPerson = async (platform: string, userId: string) => (await ctx.xpPoints?.getManagedIdentity?.(platform, userId))?.profileId
   const historyCanonical = async (id: number) => ctx.xpPoints?.resolveCanonicalProfileId ? ctx.xpPoints.resolveCanonicalProfileId(id) : id
-  const historyQueries = new HistoryQueries(ctx.database, historyPerson, historyCanonical)
+  const historyQueries = new HistoryQueries(ctx.database, historyPerson, historyCanonical,
+    (platform, selfId, endedAt) => historyStore.canReadMedia(platform, selfId, endedAt), config.history?.retentionDays ?? 0)
   const deerHistory = new DeerHistoryControls(ctx.database, historyPerson, historyCanonical)
   const pendingHistoryWrites = new Set<Promise<unknown>>()
+  const archiveRouteKey = (platform: string, selfId: string, guildId: string) => JSON.stringify([platform, selfId, guildId])
+  const recentArchiveHints = new Map<string, ArchiveHint>()
   const reportImages = new ReportImages(() => ctx.get('puppeteer') as ReportBrowser | undefined,
     { enabled: config.reportImages?.enabled ?? true, timeoutMs: Math.max(1, config.reportImages?.timeout ?? 15) * 1000 },
     error => ctx.logger.warn('图片输出未完成，使用文字回退：%s', safeErrorSummary(error)))
   const deerHiddenChoices = new Set<string>()
   const deerHiddenKey = (seat: number, userId: string) => JSON.stringify([seat, profileIdByNickname.get(player_copy?.[seat - 1]) ?? userId])
-  registerHistoryCommands(ctx, historyQueries, deerHistory, historyStore, async () => { await Promise.allSettled([...pendingHistoryWrites]) },
+  registerHistoryCommands(ctx, historyQueries, deerHistory, historyStore, async () => {
+    try { await withinBudget(Promise.allSettled([...pendingHistoryWrites]), 2000) }
+    catch { throw new GameUserError('历史存档正在处理，请稍后重试。') }
+  },
     async (session, op) => {
       if (!game_off && modeInteraction.mode === 'deer' && matchesActiveSession(session)) {
         if (session.isDirect || !session.guildId) return '请在本局所在群使用该指令。'
@@ -475,7 +488,8 @@ export function apply(ctx: Context, config: Config) {
     await historyStore.pruneExpiredMedia()
     await historyPersistence.retry()
   }
-  ctx.on('ready', maintainHistory)
+  ctx.on('ready', () => withinBudget(maintainHistory(), 2000)
+    .catch(error => ctx.logger.warn('历史维护暂未完成：%s', safeErrorSummary(error))))
   if ((config.history?.retentionDays ?? 0) > 0 || mediaRetention.mode === 'days') ctx.setInterval(() => {
     void maintainHistory().catch(error => ctx.logger.warn('历史保留期清理未完成：%s', safeErrorSummary(error)))
   }, 3600000)
@@ -559,6 +573,7 @@ export function apply(ctx: Context, config: Config) {
     }
   }
   const ensurePlayerNickname = async (session: Session): Promise<string> => {
+    const epoch = gameInstanceId
     const identity = session.guildId && ctx.xpPoints?.ensureManagedGuildIdentity
       ? await ctx.xpPoints.ensureManagedGuildIdentity(
         session.platform,
@@ -571,7 +586,7 @@ export function apply(ctx: Context, config: Config) {
         session.userId,
         suggestedPlayerNickname(session),
       )
-    if (identity) {
+    if (identity && !game_off && gameInstanceId === epoch) {
       profileIdByNickname.set(identity.nickname, identity.profileId)
       identityByUserId.set(session.userId, identity)
     }
@@ -687,6 +702,13 @@ export function apply(ctx: Context, config: Config) {
   var vstr = "本轮投票结果：\n"
   var vstr2 = "本轮投票结果：\n"
   var ptsstr = "本局计分结算："
+  const scoreAwards: ScoreWriteInput[] = []
+  type CompletedEnding = Extract<HistoryEnding, { kind: 'completed' }>
+  type TerminalNotice = { text: string; label: string }
+  type TerminalSettlement = { endedAt: number; deadline: number; finish: () => void }
+  let terminalSettlement: TerminalSettlement | undefined
+  let lobbyPreparing = false
+  const TERMINAL_SETTLEMENT_MS = 15_000
   var flag: boolean
   var flag_white: boolean
   var flag_white_perm: boolean
@@ -698,7 +720,6 @@ export function apply(ctx: Context, config: Config) {
   // Permission belongs to this finalized vote, never merely to a roster fact.
   // Keep it through a post-vote skill pause; clear it before the next round.
   let whiteSurvivalSettlementPending = false
-  let whiteConsolationHandled = false
   let preDealRevision = 0
   var boom_pending: boolean
   var boom_state: number
@@ -753,12 +774,17 @@ export function apply(ctx: Context, config: Config) {
   const gameRoute = new GameRouteCoordinator<Session["bot"]>()
   const publicTimeline = new PublicGameTimelineStore()
   const currentPublicPhase = (): PublicGameEvent['phase'] =>
-    !wait_off ? 'gathering' : flag_start ? (flag_fati ? 'dealing' : 'setup')
+    terminalSettlement ? 'resolving' : !wait_off ? 'gathering' : flag_start ? (flag_fati ? 'dealing' : 'setup')
       : boom_pending ? 'adjudication' : !ann_off ? 'speech' : !vote_off ? 'voting' : 'resolving'
-  const recordPublicEvent = (content: h.Fragment): void => {
-    if (game_off || !gameRoute.guildId) return
-    publicTimeline.record({ round: Math.max(0, Math.floor(round || 0)), phase: currentPublicPhase(),
-      overtime: !!add_flag, text: publicMessageText(content) })
+  const sendPublicNotice = async (bot: Session['bot'], guildId: string, content: h.Fragment,
+    delivery: Promise<MessageDeliveryOutcome>): Promise<boolean> => {
+    const event = (!game_off || terminalSettlement) && gameRoute.matchesSession(bot.platform, guildId, bot.selfId)
+      ? publicTimeline.record({ round: Math.max(0, Math.floor(round || 0)), phase: currentPublicPhase(),
+        overtime: !!add_flag, text: publicMessageText(content), delivery: '发送未确认' }) : undefined
+    const receipt = await delivery
+    if (receipt.status !== 'confirmed') return false
+    if (hasMessageReceipt(receipt.value)) publicTimeline.confirm(event)
+    return true
   }
   const matchesActiveSession = (session: Session): boolean => session.guildId
     ? gameRoute.matchesSession(session.platform, session.guildId, session.selfId)
@@ -768,10 +794,8 @@ export function apply(ctx: Context, config: Config) {
     content: h.Fragment,
     label: string,
     guildId = gameRoute.guildId,
-  ): Promise<boolean> => {
-    recordPublicEvent(content)
-    return messages.state(label, () => session.bot.sendMessage(guildId, content))
-  }
+  ): Promise<boolean> => sendPublicNotice(session.bot, guildId, content,
+    messages.outcome(label, () => session.bot.sendMessage(guildId, content)))
   const sendPrivateNotice = (
     session: Session,
     userId: string,
@@ -785,8 +809,7 @@ export function apply(ctx: Context, config: Config) {
     label: string,
     guildId = gameRoute.guildId,
   ): void => {
-    recordPublicEvent(content)
-    messages.bestEffort(label, () => session.bot.sendMessage(guildId, content))
+    void sendGroupNotice(session, content, label, guildId)
   }
   const notifyPrivate = (
     session: Session,
@@ -801,8 +824,9 @@ export function apply(ctx: Context, config: Config) {
     content: h.Fragment,
     label = "会话通知",
   ): void => {
-    if (!session.isDirect && session.guildId && gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) recordPublicEvent(content)
-    messages.bestEffort(label, () => session.send(content))
+    if (!session.isDirect && session.guildId) {
+      void sendPublicNotice(session.bot, session.guildId, content, messages.outcome(label, () => session.send(content)))
+    } else messages.bestEffort(label, () => session.send(content))
   }
   const notifyBotGroup = (
     bot: Session["bot"] | undefined,
@@ -811,8 +835,7 @@ export function apply(ctx: Context, config: Config) {
     label: string,
   ): void => {
     if (!bot || !guildId) return
-    if (!game_off && guildId === gameRoute.guildId) recordPublicEvent(content)
-    messages.bestEffort(label, () => bot.sendMessage(guildId, content))
+    void sendPublicNotice(bot, guildId, content, messages.outcome(label, () => bot.sendMessage(guildId, content)))
   }
   const notifyBotPrivate = (
     bot: Session["bot"] | undefined,
@@ -1076,12 +1099,11 @@ export function apply(ctx: Context, config: Config) {
   const speechHistory = new SpeechHistory()
   const publicHeroReveals = new PublicHeroRevealState()
   installChatLunaGameTools(ctx, config.aiTools?.enabled === true, (session, query?: PublicGameStateQuery) => {
-    if (game_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return
+    if ((game_off && !terminalSettlement) || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return
     return projectPublicGameState({
       route: { platform: gameRoute.platform, selfId: gameRoute.bot!.selfId, guildId: gameRoute.guildId },
       mode: modeInteraction.mode, heroesEnabled,
-      phase: !wait_off ? 'gathering' : flag_start ? (flag_fati ? 'dealing' : 'setup')
-        : boom_pending ? 'adjudication' : !ann_off ? 'speech' : !vote_off ? 'voting' : 'resolving',
+      phase: currentPublicPhase(),
       round: round ?? 0, overtime: add_flag, hostNickname: hostname,
       players: player_copy.map((nickname, index) => {
         const seat = index + 1, hero = heros?.indexOf(seat) ?? -1
@@ -1099,6 +1121,15 @@ export function apply(ctx: Context, config: Config) {
     `好人误自爆时非好人阵营：${config.scoreGoodBoomNoWin}分；白板存活安慰积分固定为1分。`,
     `积分写入：${config.enablePersistentScoring ? '开启，仍需有效积分系统及账号；沙盒不写分' : '关闭'}。`,
   ].join('\n'))
+  installChatLunaHistoryTool(ctx, config.aiTools?.enabled === true && config.aiTools.history?.enabled === true && historyOptions.enabled,
+    (session, query) => {
+      const { platform, selfId, guildId } = session
+      const key = archiveRouteKey(platform, selfId, guildId)
+      const pending = terminalSettlement && historyRecorder && gameRoute.matchesSession(platform, guildId, selfId)
+        ? { gameId: gameInstanceId, status: '正在归档' as const } : recentArchiveHints.get(key)
+      return historyQueries.readForAi({ platform, selfId, guildId, userId: session.userId, isDirect: session.isDirect },
+        query, config.aiTools?.history, pending)
+    })
   const setGameTimeout = gameTimers.schedule.bind(gameTimers)
   const armSetupTimeout = (session: Session) => {
     gameTimers.cancel(timer_setup)
@@ -1134,43 +1165,41 @@ export function apply(ctx: Context, config: Config) {
     if (game_off || !boom_pending || boomAdjudicationClaimed) return
     if (str_ann !== "是" && str_ann !== "否") return "不识别的语句，请主持人发送“是”或“否”。"
     boomAdjudicationClaimed = true
+    let outcomeText = ''
   if (str_ann === "是") {
     gameTimers.cancel(timer_boom)
     switch (boom_state) {
       case 1:
         sumup += "卧底自爆成功，游戏结束，卧底胜利"
         recordExplosionOutcome('undercover-win', true)
-        notifySession(session, "卧底自爆成功，游戏结束，卧底胜利")
+        outcomeText = '卧底自爆成功，游戏结束，卧底胜利'
         increment = config.scoreUndercoverWin
         for (let i = 0; i < player_copy.length; i++) {
           if (uc_copy.indexOf(i + 1) !== -1 && !isEmpty(player_copy[i])) {
-            await addScore(player_copy[i], increment, 'confirmed-undercover-boom-win')
+            queueScoreAward(player_copy[i], increment, 'confirmed-undercover-boom-win')
             ptsstr += player_copy[i] + "，"
           }
         }
         ptsstr = ptsstr.slice(0, -1)
         ptsstr += "加" + increment + "分。"
-        await addScore(boomname, config.scoreUndercoverBoomBonus, 'confirmed-undercover-boom-bonus')
+        queueScoreAward(boomname, config.scoreUndercoverBoomBonus, 'confirmed-undercover-boom-bonus')
         ptsstr += boomname + "自爆获胜，额外加" + config.scoreUndercoverBoomBonus + "分。"
-        await sendScoreSummary(session, 'undercover')
         break
       case 2:
         sumup += "白板自爆成功，游戏结束，白板胜利"
         recordExplosionOutcome('white-win', true)
-        notifySession(session, "白板自爆成功，游戏结束，白板胜利")
+        outcomeText = '白板自爆成功，游戏结束，白板胜利'
         increment = config.scoreWhiteBoomWin
-        await addScore(boomname, increment, 'confirmed-white-boom-win-two')
+        queueScoreAward(boomname, increment, 'confirmed-white-boom-win-two')
         ptsstr += boomname + "加" + increment + "分。"
-        await sendScoreSummary(session, 'white')
         break
       case 3:
         sumup += "白板自爆成功，游戏结束，白板胜利"
         recordExplosionOutcome('white-win', true)
-        notifySession(session, "白板自爆成功，游戏结束，白板胜利")
+        outcomeText = '白板自爆成功，游戏结束，白板胜利'
         increment = config.scoreWhiteBoomWin
-        await addScore(boomname, increment, 'confirmed-white-boom-win-three')
+        queueScoreAward(boomname, increment, 'confirmed-white-boom-win-three')
         ptsstr += boomname + "加" + increment + "分。"
-        await sendScoreSummary(session, 'white')
         break
       default:
         notifySession(session, "出现未知bug，游戏已结束。")
@@ -1182,17 +1211,16 @@ export function apply(ctx: Context, config: Config) {
       case 1:
         sumup += "卧底自爆失败，游戏结束，好人胜利。"
         recordExplosionOutcome('good-win', true)
-        notifySession(session, "卧底自爆失败，游戏结束，好人胜利。")
+        outcomeText = '卧底自爆失败，游戏结束，好人胜利。'
         increment = config.scoreGoodWin
         for (let i = 0; i < player_copy.length; i++) {
           if (uc_copy.indexOf(i + 1) === -1 && i + 1 !== white_copy && !isEmpty(player_copy[i])) {
-            await addScore(player_copy[i], increment, 'boom-resolution-good-win')
+            queueScoreAward(player_copy[i], increment, 'boom-resolution-good-win')
             ptsstr += player_copy[i] + "，"
           }
         }
         ptsstr = ptsstr.slice(0, -1)
         ptsstr += "加" + increment + "分。"
-        await sendScoreSummary(session, 'good')
         break
       case 2:
         let w = order.indexOf(white)
@@ -1263,17 +1291,16 @@ export function apply(ctx: Context, config: Config) {
       case 3:
         sumup += "白板自爆失败，场上已无卧底在场，游戏结束，好人胜利。"
         recordExplosionOutcome('good-win', true)
-        notifySession(session, "白板自爆失败，场上已无卧底在场，游戏结束，好人胜利。")
+        outcomeText = '白板自爆失败，场上已无卧底在场，游戏结束，好人胜利。'
         increment = config.scoreGoodWin
         for (let i = 0; i < player_copy.length; i++) {
           if (uc_copy.indexOf(i + 1) === -1 && i + 1 !== white_copy && !isEmpty(player_copy[i])) {
-            await addScore(player_copy[i], increment, 'boom-resolution-good-win-alternate')
+            queueScoreAward(player_copy[i], increment, 'boom-resolution-good-win-alternate')
             ptsstr += player_copy[i] + "，"
           }
         }
         ptsstr = ptsstr.slice(0, -1)
         ptsstr += "加" + increment + "分。"
-        await sendScoreSummary(session, 'good', true)
         break
       default:
         notifySession(session, "出现未知bug，游戏已结束。")
@@ -1282,7 +1309,10 @@ export function apply(ctx: Context, config: Config) {
   else {
     return ("不识别的语句，请主持人发送“是”或“否”。")
   }
-  end_game(boom_state >= 1 && boom_state <= 3 ? { kind: 'completed', reason: 'self-explosion', winner: str_ann === '否' ? 'good' : boom_state === 1 ? 'undercover' : 'white' } : { kind: 'aborted', reason: 'system-error' })
+  if (outcomeText) await completeGame(session, {
+    kind: 'completed', reason: 'self-explosion', winner: str_ann === '否' ? 'good' : boom_state === 1 ? 'undercover' : 'white',
+  }, { before: { text: outcomeText, label: '自爆裁定结算' }, whiteSelfExplosionFailed: str_ann === '否' && boom_state === 3 })
+  else end_game({ kind: 'aborted', reason: 'system-error' })
   return
   }
   const beginBoomAdjudication = (session: Session, state: number) => {
@@ -1406,8 +1436,8 @@ export function apply(ctx: Context, config: Config) {
   }, (nickname, error) => {
     ctx.logger.error("玩家 %s 的积分写入失败：%s", nickname, safeErrorSummary(error))
   })
-  const addScore = (nickname: string, amount: number, reason: string): Promise<boolean> => {
-    return scoreService.add({
+  const queueScoreAward = (nickname: string, amount: number, reason: string): void => {
+    scoreAwards.push({
       enabled: score_enabled,
       nickname,
       amount,
@@ -1420,22 +1450,51 @@ export function apply(ctx: Context, config: Config) {
       businessId: gameInstanceId,
     })
   }
-  const sendScoreSummary = async (
+  const completeGame = (
     session: Session,
-    winner: HistoryCamp | 'none',
-    whiteSelfExplosionFailed = false,
-    guildId = gameRoute.guildId,
+    ending: CompletedEnding,
+    options: { before?: TerminalNotice; after?: TerminalNotice; whiteSelfExplosionFailed?: boolean } = {},
   ): Promise<void> => {
+    if (terminalSettlement || game_off) return Promise.resolve()
     // Final active account, not an eliminated/recruited predecessor or the
     // old white seat. No-winner games already have their own award rule.
-    if (!whiteConsolationHandled && (winner === 'good' || winner === 'undercover')
-      && flag_white && order.includes(white) && !whiteSelfExplosionFailed) {
-      whiteConsolationHandled = true
+    if ((ending.winner === 'good' || ending.winner === 'undercover')
+      && flag_white && order.includes(white) && !options.whiteSelfExplosionFailed) {
       const nickname = player_name[order.indexOf(white)]
-      await addScore(nickname, 1, 'white-survival-consolation')
+      queueScoreAward(nickname, 1, 'white-survival-consolation')
       ptsstr += nickname + "仍在场，获得1分安慰积分。"
     }
-    notifyGroup(session, ptsstr + scoreService.failureNotice(), "积分结算通知", guildId)
+    const awards = scoreAwards.splice(0)
+    const scoreText = ptsstr
+    const guildId = gameRoute.guildId
+    const endedAt = Date.now()
+    return new Promise<void>(resolve => {
+      let timer: ReturnType<typeof setTimeout>
+      const settlement: TerminalSettlement = {
+        endedAt, deadline: endedAt + TERMINAL_SETTLEMENT_MS,
+        finish: () => {
+          if (terminalSettlement !== settlement) return
+          clearTimeout(timer)
+          const acknowledged = new Set(scoreService.results.map(receipt => receipt.input.idempotencyKey))
+          const scoreUnconfirmed = awards.some(award => award.enabled && award.amount !== 0 && !acknowledged.has(award.idempotencyKey))
+          const text = scoreUnconfirmed ? '对局结果已确定；部分积分写入未确认，请管理员核对流水后处理。'
+            : scoreText + scoreService.failureNotice()
+          notifyGroup(session, text, '积分结算通知', guildId)
+          if (options.after) notifyGroup(session, options.after.text, options.after.label, guildId)
+          end_game(scoreUnconfirmed ? { ...ending, scoreUnconfirmed: true } : ending, undefined, settlement)
+          resolve()
+        },
+      }
+      // Claim before any I/O. Freeze all award payloads and disarm gameplay;
+      // this independent watchdog works even if the adapter or storage hangs.
+      terminalSettlement = settlement
+      game_off = true
+      vote_off = ann_off = true
+      gameTimers.cancelAll()
+      timer = setTimeout(settlement.finish, TERMINAL_SETTLEMENT_MS)
+      const announcement = options.before && sendGroupNotice(session, options.before.text, options.before.label, guildId)
+      void Promise.allSettled([announcement, ...awards.map(award => scoreService.add(award))]).then(settlement.finish)
+    })
   }
   const resetPreDealSetup = () => {
     preDealRevision += 1
@@ -2064,6 +2123,10 @@ export function apply(ctx: Context, config: Config) {
     return seat + "号玩家" + name + (mention && userId ? String(h("at", { id: userId })) : "")
   }
   const deerProgressPrivate = (): boolean => modeInteraction.mode === 'deer' && white_copy > 0
+  const rejectUnapprovedDeerSpeech = (session: Session, reason: string): string | void => {
+    if (!deerProgressPrivate()) return reason
+    notifyPrivate(session, session.userId, reason, '鹿模式发言资格私聊提示')
+  }
   const deerProgressText = (mention = true): string => {
     const progress = modeInteraction.deerProgress()
     if (progress.waitingPlayer.length === 0 && progress.pendingHost.length === 0) {
@@ -3076,7 +3139,14 @@ export function apply(ctx: Context, config: Config) {
       if (deerRevisions.makeup(seat)) modeTasks.push(`待补发言：发送“${seat}＋发言内容”。`)
     }
     if (unfinishedVoteFor(session.userId)) modeTasks.push('待投票：请按当前投票提示完成投票。')
-    if (seat && !ann_off && (!add_flag || add_indices.includes(index)) && isEmpty(add_flag ? add_ann[add_indices.indexOf(index)] : ann[index])) modeTasks.push(modeInteraction.mode === 'turtle' ? `待提问：在群内发送“${seat}＋问题”。` : `待发言：在群内发送“${seat}＋发言内容”。`)
+    if (seat && modeInteraction.mode === 'turtle') {
+      const turn = modeInteraction.turtleTurnForSeat(seat)
+      if (turn?.status === 'pending-host') modeTasks.push('你的问题正在等待主持人回答。')
+      else if (turn?.status === 'waiting-question' && !ann_off) modeTasks.push(`待提问：在群内发送“${seat}＋问题”。`)
+    } else if (seat && !ann_off && (!add_flag || add_indices.includes(index))
+      && isEmpty(add_flag ? add_ann[add_indices.indexOf(index)] : ann[index])) {
+      modeTasks.push(`待发言：在群内发送“${seat}＋发言内容”。`)
+    }
     const content = [skillFirstNotice(session.userId), ...actions.map(recoveredActionText), ...modeTasks].filter(Boolean).join('\n\n') || '你当前没有等待处理的游戏操作。'
     if (!session.guildId) return content
     const results = [await messages.state('待办补取提示', () => session.bot.sendPrivateMessage(session.userId, content))]
@@ -3260,6 +3330,10 @@ export function apply(ctx: Context, config: Config) {
   ctx.guild().middleware(async (session: Session, next) => {
     let str_start = session.content.replace(/\s/g, "")
     const startRequested = str_start === "卧底" || str_start === "卧底，启动！"
+    if (terminalSettlement && startRequested) {
+      if (!gameRoute.matchesBot(session.platform, session.selfId)) return next()
+      return '本局已确定胜负，正在结算；请结算后再开局。'
+    }
     if (!game_off) {
       if (!startRequested) return next()
       // A plugin instance may receive events from several bot connections.
@@ -3278,22 +3352,11 @@ export function apply(ctx: Context, config: Config) {
       }
     }
     if (startRequested) {
-      //if(str_start===h("at", { id: session.selfId }) + "卧底"){
-      // A new game is the default media-retention boundary for this bot.  Wait
-      // for the previous archive attempt first so a queued snapshot cannot
-      // reintroduce media after the cleanup pass.  Cleanup is best-effort and
-      // never prevents a new game from starting.
-      if (mediaRetention.mode !== 'permanent') {
-        await Promise.allSettled([...pendingHistoryWrites])
-        await historyPersistence.retry().catch(error => ctx.logger.warn('历史媒体清理前的待重试存档未完成：%s', safeErrorSummary(error)))
-        await historyStore.pruneMediaForBot(session.platform, session.selfId, Date.now())
-          .catch(error => ctx.logger.warn('历史多媒体清理未完成：%s', safeErrorSummary(error)))
-      }
       const isSandbox = session.platform.startsWith("sandbox:")
       score_enabled = (config.enablePersistentScoring ?? true) && !isSandbox
       gameRoute.bind(session.platform, session.guildId, session.bot)
       publicTimeline.clear()
-      gameTimers.advanceEpoch()
+      const startingEpoch = gameTimers.advanceEpoch()
       preDealRevision += 1
       modeInteraction.reset("classic")
       hostSupport.reset(); hostParticipantKeys.clear(); assistantIdentityKeys.clear(); gameTimers.cancel(hostRecruitmentTimer)
@@ -3304,6 +3367,13 @@ export function apply(ctx: Context, config: Config) {
       cancelTurtleTimers()
       game_off = false
       wait_off = false
+      lobbyPreparing = true
+      // The store fences expired media synchronously. Neither the old
+      // archive/retry nor the cleanup must hold the new lobby indefinitely.
+      const mediaCleanup = mediaRetention.mode === 'permanent' ? undefined
+        : historyStore.pruneMediaForBot(session.platform, session.selfId)
+          .catch(error => ctx.logger.warn('历史多媒体清理未完成：%s', safeErrorSummary(error)))
+      void historyPersistence.retry().catch(error => ctx.logger.warn('历史待重试存档未完成：%s', safeErrorSummary(error)))
       add_player = config.allowLateJoinByDefault ?? true
       flag_white = false
       flag_white_perm = false
@@ -3383,17 +3453,21 @@ export function apply(ctx: Context, config: Config) {
       waiver = 0
       hostid = session.userId
       try {
-        hostname = await ensurePlayerNickname(session)
-        if (!await occupyPlayer(session.userId, hostname, session.platform)) return
+        const name = await withinBudget(ensurePlayerNickname(session), 4000)
+        if (game_off || startingEpoch !== gameTimers.epoch) return
+        hostname = name
+        if (!await withinBudget(occupyPlayer(session.userId, hostname, session.platform), 4000)) return
       } catch (error) {
+        if (game_off || startingEpoch !== gameTimers.epoch) return
         end_game({ kind: 'aborted', reason: 'system-error' })
         ctx.logger.warn('主持人账号初始化失败：%s', safeErrorSummary(error))
         return '账号服务暂不可用，本局未开始，请稍后重试。'
       }
+      if (mediaCleanup) await withinBudget(mediaCleanup, 1000).catch(() => undefined)
+      if (game_off || startingEpoch !== gameTimers.epoch) return
       annstr = "本轮发言结果：\n"
       vstr = "本轮投票结果：\n"
       scoreService.reset()
-      whiteConsolationHandled = false
       ptsstr = score_enabled ? "本局计分结算：" : "沙盒测试局不写入积分，模拟结算："
       heros = []
       heroState = createGameHeroState()
@@ -3404,6 +3478,7 @@ export function apply(ctx: Context, config: Config) {
       quan = []
       shield = []
       vote_num = []
+      lobbyPreparing = false
       timer_uc = setGameTimeout(()=>{
         const guildId = gameRoute.guildId
         end_game({ kind: 'aborted', reason: 'setup-timeout' })
@@ -3447,7 +3522,7 @@ export function apply(ctx: Context, config: Config) {
     }
   }
   const shouldQueueGatheringInput = (session: Session): boolean => {
-    if (game_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return false
+    if (game_off || lobbyPreparing || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return false
     if (wait_off && !flag_start) return false
     const content = session.content.replace(/\s/g, "")
     const selectedMode = parseGameModeSelection(session.content)
@@ -4088,7 +4163,9 @@ export function apply(ctx: Context, config: Config) {
   const end_game = (
     ending: HistoryEnding = { kind: 'aborted', reason: 'system-error' },
     historyOutcome?: string,
+    owner?: TerminalSettlement,
   )=>{
+    if (terminalSettlement !== owner) return
     weiInquiryWindow = null
     if (ending.kind === 'aborted' && (voteFactStage === 'open' || voteFactStage === 'counting')) {
       if (voteFactStage === 'open') rebuildPollFromBallots()
@@ -4103,14 +4180,28 @@ export function apply(ctx: Context, config: Config) {
       try {
         if (historyCaptureFailed) throw new Error('本局采集不完整')
         if (ending.kind === 'aborted' && historyOutcome && recorder.hasPhase()) recorder.outcome(historyOutcome)
-        const snapshot = recorder.finish(ending, Date.now(), scoreService.results, config.scoreSystemKey)
+        const snapshot = recorder.finish(ending, owner?.endedAt ?? Date.now(), scoreService.results, config.scoreSystemKey)
+        const key = archiveRouteKey(snapshot.platform, snapshot.selfId, snapshot.guildId)
+        const hint: ArchiveHint | undefined = archiveDisposition(snapshot, historyOptions) === 'completed'
+          ? { gameId: snapshot.gameId, status: '正在归档' } : undefined
+        if (hint) {
+          recentArchiveHints.delete(key)
+          recentArchiveHints.set(key, hint)
+          if (recentArchiveHints.size > 32) recentArchiveHints.delete(recentArchiveHints.keys().next().value!)
+        }
         const write = historyPersistence.save(snapshot, historyOptions).then(result => {
-          if (result.kind === 'failed' || result.kind === 'queued') notifyBotGroup(
-            bot,
-            guild,
-            result.kind === 'queued' ? '对局历史暂未写入数据库，已保存本地待重试；游戏结束不受影响。' : '对局历史保存失败，请管理员检查日志；游戏结束不受影响。',
-            '对局历史保存状态通知',
-          )
+          if (hint && recentArchiveHints.get(key) === hint) {
+            if (result.kind === 'queued') hint.status = '归档待重试'
+            else if (result.kind === 'failed') hint.status = '归档未确认'
+            else recentArchiveHints.delete(key)
+          }
+          if (bot && guild && (result.kind === 'failed' || result.kind === 'queued')) {
+            // Old archive receipts can arrive after another game in this
+            // group has started. Deliver to the captured route, not its live timeline.
+            const text = result.kind === 'queued' ? '已结束对局的历史暂未写入数据库，已保存本地待重试。'
+              : '已结束对局的历史保存失败，请管理员检查日志。'
+            messages.bestEffort('对局历史保存状态通知', () => bot.sendMessage(guild, text))
+          }
         }).finally(() => pendingHistoryWrites.delete(write))
         pendingHistoryWrites.add(write)
       } catch (error) {
@@ -4161,6 +4252,9 @@ export function apply(ctx: Context, config: Config) {
     formerSeatByName.clear()
     boom_pending = false
     flag_just_vote = false
+    terminalSettlement = undefined
+    lobbyPreparing = false
+    scoreAwards.length = 0
     scoreService.reset()
     whiteSurvivalSettlementPending = false
     profileIdByNickname.clear()
@@ -4171,7 +4265,11 @@ export function apply(ctx: Context, config: Config) {
     gameRoute.clear()
     publicTimeline.clear()
   }
-  ctx.on("dispose", async () => { end_game({ kind: 'aborted', reason: 'restart' }); await Promise.allSettled([...pendingHistoryWrites]) })
+  ctx.on("dispose", async () => {
+    if (terminalSettlement) terminalSettlement.finish()
+    else if (!game_off) end_game({ kind: 'aborted', reason: 'restart' })
+    await withinBudget(Promise.allSettled([...pendingHistoryWrites]), 2000).catch(() => undefined)
+  })
   const canSettleWhiteSurvival = (settled: boolean): boolean => settled
     && !(white === heros[HERO.YUAN_CHONG_HUAN]
       && yuanChongHuanModule.retaliationTarget(heroState) !== null)
@@ -4180,6 +4278,7 @@ export function apply(ctx: Context, config: Config) {
     whiteSurvivalSettled = false,
     beforeGameEnd?: () => void,
   ): Promise<ResolutionControl> => {
+    if (game_off) return endResolution()
     const victory = classifyEliminationVictory({
       activePlayerCount: player.length,
       activeUndercoverCount: uc.length,
@@ -4189,47 +4288,44 @@ export function apply(ctx: Context, config: Config) {
     })
     if (victory !== null) beforeGameEnd?.()
     if (victory === "good") {
-      await sendGroupNotice(session, "游戏结束，好人胜利。", "好人胜利通知")
       sumup += "游戏结束，好人胜利。"
       if (round > uc_copy.length + (white_copy === 0 ? 0 : 1) || player_copy.length - player.length - kickout.length > uc_copy.length + (white_copy === 0 ? 0 : 1)) { increment = config.scoreGoodWin }
       else { increment = config.scoreGoodWinSpeedrun }
       for (let i = 0; i < player_copy.length; i++) {
         if (uc_copy.indexOf(i + 1) === -1 && i + 1 !== white_copy && !isEmpty(player_copy[i])) {
-          await addScore(player_copy[i], increment, 'elimination-good-win')
+          queueScoreAward(player_copy[i], increment, 'elimination-good-win')
           ptsstr += player_copy[i] + "，"
         }
       }
       ptsstr = ptsstr.slice(0, -1)
       ptsstr += "加" + increment + "分。"
-      await sendScoreSummary(session, 'good')
-      end_game({ kind: 'completed', reason: 'elimination', winner: 'good' })
+      await completeGame(session, { kind: 'completed', reason: 'elimination', winner: 'good' },
+        { before: { text: '游戏结束，好人胜利。', label: '好人胜利通知' } })
       return endResolution()
     }
     else if (victory === "white") {
       const winningWhiteSeat = white
-      await sendGroupNotice(session, "游戏结束，白板胜利。", "白板胜利通知")
       sumup += "游戏结束，白板胜利。"
       increment = config.scoreWhiteWin
-      await addScore(player_copy[winningWhiteSeat - 1], increment, 'elimination-white-win')
+      queueScoreAward(player_copy[winningWhiteSeat - 1], increment, 'elimination-white-win')
       ptsstr += player_copy[winningWhiteSeat - 1] + "加" + increment + "分。"
-      await sendScoreSummary(session, 'white')
-      end_game({ kind: 'completed', reason: 'white-survival', winner: 'white' })
+      await completeGame(session, { kind: 'completed', reason: 'white-survival', winner: 'white' },
+        { before: { text: '游戏结束，白板胜利。', label: '白板胜利通知' } })
       return endResolution()
     }
     else if (victory === "undercover") {
-      await sendGroupNotice(session, "游戏结束，卧底胜利。", "卧底胜利通知")
       sumup += "游戏结束，卧底胜利。"
       increment = config.scoreUndercoverWin
       for (let i = 0; i < player_copy.length; i++) {
         if (uc_copy.indexOf(i + 1) !== -1 && !isEmpty(player_copy[i])) {
-          await addScore(player_copy[i], increment, 'elimination-undercover-win')
+          queueScoreAward(player_copy[i], increment, 'elimination-undercover-win')
           ptsstr += player_copy[i] + "，"
         }
       }
       ptsstr = ptsstr.slice(0, -1)
       ptsstr += "加" + increment + "分。"
-      await sendScoreSummary(session, 'undercover')
-      end_game({ kind: 'completed', reason: 'elimination', winner: 'undercover' })
+      await completeGame(session, { kind: 'completed', reason: 'elimination', winner: 'undercover' },
+        { before: { text: '游戏结束，卧底胜利。', label: '卧底胜利通知' } })
       return endResolution()
     }
     return continueResolution()
@@ -4355,21 +4451,14 @@ export function apply(ctx: Context, config: Config) {
     nv_out.push(yuanSeat)
     splice_player(yuanSeat, false, false)
     boom_pending = false
-    await sendGroupNotice(session, yuanEliminationText, "袁崇焕反噬通知")
+    notifyGroup(session, yuanEliminationText, '袁崇焕反噬通知')
     return true
   }
   const player_out_long = async (session, outplayer, extra, is_kickout, is_check_white, orderedNotice?: { text: string; label: string }) => {
-    const epoch = gameTimers.epoch
     splice_player(outplayer, is_kickout, is_check_white)
     boom_pending = false
-    if (orderedNotice) {
-      await sendGroupNotice(session, orderedNotice.text, orderedNotice.label)
-      if (game_off || gameTimers.epoch !== epoch) return
-    }
+    if (orderedNotice) notifyGroup(session, orderedNotice.text, orderedNotice.label)
     await check_game_end(session, outplayer, extra, whiteSurvivalSettlementPending, is_kickout ? 'kick' : 'skill')
-  }
-  const player_out = async (session, outplayer, is_kickout, is_check_white) => {
-    await player_out_long(session, outplayer, (session, outplayer) => {}, is_kickout, is_check_white)
   }
   const players_out = async (session, outplayers, extra, is_kickout, is_check_white) => {
     for (let i=0; i<outplayers.length; i++) {
@@ -5009,9 +5098,11 @@ export function apply(ctx: Context, config: Config) {
     notifyGroup(session, content, "张献忠技能提示")
   }
 
-  const deferZhangDeparture = (session: Session, elimination: EliminationContext, resume: ZhangBeforeDeparture['resume']): boolean => {
+  const deferZhangDeparture = (session: Session, elimination: EliminationContext, resume: ZhangBeforeDeparture['resume'],
+    onDeferred?: () => void): boolean => {
     if (elimination.targetSeat !== heros[HERO.ZHANG_XIAN_ZHONG] || heroState.zhangXianZhong.level !== 3) return false
     vote_off = true
+    onDeferred?.()
     const source = elimination.source === 'vote' ? '投票' : elimination.source === 'execution' ? '处决' : '权计'
     recordSkill(HERO.ZHANG_XIAN_ZHONG, `因${source}即将出局，发动“殒阵”三级，先结算带人`)
     beginZhangXianZhongTarget(session, { elimination, resume })
@@ -5088,8 +5179,7 @@ export function apply(ctx: Context, config: Config) {
             vote[round - 1].splice(targetIndex, 1)
           }
         }
-        await sendGroupNotice(session, carry.notice, '殒阵带人出局通知')
-        if (!isCurrent()) return
+        notifyGroup(session, carry.notice, '殒阵带人出局通知')
         // A white Zhang awaiting departure has not survived this vote. Keep
         // the independent forced endgame for fewer than three players intact.
         const control = await resolveEliminationVictory(session, white !== elimination.targetSeat && whiteSurvivalSettlementPending,
@@ -5099,7 +5189,7 @@ export function apply(ctx: Context, config: Config) {
         if (post === 'shi-ke-fa') promptShiKeFaGift(session, target)
         if (post === 'zhu-you-xiao') beginZhuYouXiaoHeirTarget(session, target)
       }
-      else if (carry) await sendGroupNotice(session, carry.notice, '殒阵带人保护通知')
+      else if (carry) notifyGroup(session, carry.notice, '殒阵带人保护通知')
       if (!isCurrent() || !order.includes(elimination.targetSeat)) return
       zhangXianZhongModule.finishTargetSelection(heroState)
       await before.resume(session, carriedOvertimeCandidate)
@@ -5179,7 +5269,8 @@ export function apply(ctx: Context, config: Config) {
     })
   }
   const isRosterChangeBlocked = () => {
-    if (boom_pending || zhangSelection?.beforeDeparture || pendingAction.isRosterChangeBlocked()) return true
+    if (boom_pending || zhangSelection?.beforeDeparture || pendingAction.isRosterChangeBlocked()
+      || voteSettlement.isRunning(currentVoteSettlementKey())) return true
     if (modeInteraction.mode === "turtle" && modeInteraction.turtleHasPendingHost()) return true
     return false
   }
@@ -5755,7 +5846,8 @@ export function apply(ctx: Context, config: Config) {
         : { ownerSeat: zhuYouXiaoVotes.current.ownerSeat, ballotEffects: currentBallotEffects },
     })
   }
-  const reconcileVoteAfterRosterChange = async (session, notice: string, snapshot: VoteRosterSnapshot) => {
+  let voteRosterRevision = 0
+  const rebaseVoteRoster = (session: Session, snapshot: VoteRosterSnapshot) => {
     const voterIds = add_flag
       ? player.filter((_, index) => add_indices.indexOf(index) === -1)
       : player.slice()
@@ -5767,12 +5859,6 @@ export function apply(ctx: Context, config: Config) {
       validTargetsBySeat: getVotableTargets,
     })
     const ballots = retained.ballots
-    for (const voterId of retained.autoWaivedVoterIds) {
-      const ownerIndex = player.indexOf(voterId)
-      const ownerSeat = ownerIndex === -1 ? null : order[ownerIndex]
-      const reporter = ownerSeat === null ? null : zhuYouXiaoAutoVoteReporter(ownerSeat, add_flag)
-      notifyPrivate(session, reporter?.userId ?? voterId, "玩家变动后你已没有可投票的对象，已为你自动弃票。", "名单变化自动弃票通知")
-    }
     if (add_flag) {
       add_voter = voterIds
       add_vote[round - 1] = ballots
@@ -5780,10 +5866,25 @@ export function apply(ctx: Context, config: Config) {
     else {
       vote[round - 1] = ballots
     }
+    for (const voterId of retained.autoWaivedVoterIds) {
+      const index = voterIds.indexOf(voterId), ownerSeat = order[player.indexOf(voterId)]
+      // Resolve an unfinished proxy against the *rebased* ballot, then
+      // record the automatic waiver. The original arrays no longer align.
+      ballots[index] = undefined
+      const reporter = zhuYouXiaoAutoVoteReporter(ownerSeat, add_flag)
+      ballots[index] = 0
+      notifyPrivate(session, reporter.userId, "玩家变动后你已没有可投票的对象，已为你自动弃票。", "名单变化自动弃票通知")
+    }
     rebuildPollFromBallots()
 
     flag = false
-    if (await finishVoteIfReady(session, notice) || !isReceivingRegularVotes()) return
+    return { key: currentVoteSettlementKey(), revision: ++voteRosterRevision, voterIds, ballots,
+      invalidatedVoterIds: retained.invalidatedVoterIds }
+  }
+  const announceVoteRosterChange = async (session: Session, notice: string, change: ReturnType<typeof rebaseVoteRoster>) => {
+    const isCurrent = () => change.key === currentVoteSettlementKey() && change.revision === voteRosterRevision && isReceivingRegularVotes()
+    if (!isCurrent() || await finishVoteIfReady(session, notice) || !isCurrent()) return
+    const { voterIds, ballots, invalidatedVoterIds } = change
 
     notifyGroup(session, notice + "，其余有效投票继续保留。尚未投票或原投票失效的玩家请继续投票。", "名单变化继续投票通知")
     for (let i = 0; i < voterIds.length; i++) {
@@ -5792,7 +5893,7 @@ export function apply(ctx: Context, config: Config) {
       if (!isEmpty(ballots[i]) || vote_num[voterOrder - 1] === 0 || voterOrder === heros[HERO.MAO_WEN_LONG]) continue
       const targets = getVotableTargets(voterOrder)
       const canVote = targets.map(targetOrder => targetOrder + "号" + player_copy[targetOrder - 1]).join("，")
-      const prefix = retained.invalidatedVoterIds.has(voterIds[i]) ? "你原先投票的对象已不在有效候选中。" : "玩家名单刚刚发生变化。"
+      const prefix = invalidatedVoterIds.has(voterIds[i]) ? "你原先投票的对象已不在有效候选中。" : "玩家名单刚刚发生变化。"
       const reporter = zhuYouXiaoVoteReporter(voterOrder, add_flag)
       notifyPrivate(session, reporter.userId, prefix + "当前可投票的玩家为：" + canVote + "。请继续投票。", "名单变化投票对象通知")
     }
@@ -6213,6 +6314,16 @@ export function apply(ctx: Context, config: Config) {
     }
     linDanHanModule.beginVoteWindow(heroState)
   }
+  const settleVoteWithoutOrdinaryObligations = (session: Session) => {
+    if (voteResolutionStatus() !== 'complete') return
+    const key = currentVoteSettlementKey()
+    void finishVoteIfReady(session).catch(error => {
+      if (game_off || key !== currentVoteSettlementKey()) return
+      ctx.logger.warn('无须普通投票的阶段结算失败：%s', safeErrorSummary(error))
+      notifyGroup(session, '系统异常，本局已终止。', '投票结算异常')
+      end_game({ kind: 'aborted', reason: 'system-error' })
+    })
+  }
   const end_ann = (session) => {
     if (game_off || ann_off || boom_pending) return
     if (zhangXianZhongModule.isAwaitingTarget(heroState)) return
@@ -6250,11 +6361,12 @@ export function apply(ctx: Context, config: Config) {
         }, timeout_for_vote);
         notifyGroup(session, "本次投票阶段限时：" + formatConfiguredDuration(config.voteTimeout), "投票限时通知")
       }
+      settleVoteWithoutOrdinaryObligations(session)
     }
     return
   }
   const endOvertimeAnn = (session: Session) => {
-    if (zhangXianZhongModule.isAwaitingTarget(heroState)) return
+    if (game_off || ann_off || zhangXianZhongModule.isAwaitingTarget(heroState)) return
     if (modeInteraction.mode === "turtle") {
       rebuildTurtleAnnouncementProjection()
       flag = modeInteraction.turtleAllComplete()
@@ -6289,6 +6401,7 @@ export function apply(ctx: Context, config: Config) {
         }, timeout_for_vote);
         notifyGroup(session, "本次投票阶段限时：" + formatConfiguredDuration(config.voteTimeout), "加时投票限时通知")
       }
+      settleVoteWithoutOrdinaryObligations(session)
     }
   }
   const players_timeout_outcast = async (session, outcast) => {
@@ -6524,7 +6637,7 @@ export function apply(ctx: Context, config: Config) {
     if (!task || task.userId !== session.userId) return next()
     const text = session.content.trimStart()
     if (!text.startsWith(String(seat)) || !text.slice(String(seat).length).trim()) return next()
-    if (deerSeatNeedsSelection(seat)) return '你需要先通过选词审核，才能补发言。'
+    if (deerSeatNeedsSelection(seat)) return rejectUnapprovedDeerSpeech(session, '你需要先通过选词审核，才能补发言。')
     const version = modeInteraction.deerSelectionForSeat(seat)?.approvedVersion
     if (version !== task.version || !deerRevisions.complete(seat, session.userId, version)) return next()
     gameTimers.cancel(deerMakeupTimers.get(seat)); deerMakeupTimers.delete(seat)
@@ -6545,7 +6658,7 @@ export function apply(ctx: Context, config: Config) {
     if (deerSpeakerIndex !== -1 && deerSeatNeedsSelection(order[deerSpeakerIndex])) {
       const ownSeat = String(order[deerSpeakerIndex])
       if (session.content.trimStart().startsWith(ownSeat)) {
-        return ("你需要先私聊提交选人并通过主持人审核，才能发言。")
+        return rejectUnapprovedDeerSpeech(session, '你需要先私聊提交选人并通过主持人审核，才能发言。')
       }
       return next()
     }
@@ -6566,6 +6679,7 @@ export function apply(ctx: Context, config: Config) {
           if (round <= uc_num && player_copy.length - player.length - kickout.length < uc_num) return ("未到轮次，无法自爆。")
           if (boom_pending) return ("已有玩家自爆了哦，无法再次自爆。")
           boomname = resolvePlayerNickname(session)
+          let outcomeText = ''
           recordSelfExplosion(n, str_ann)
           sumup += n + "号玩家" + boomname + "自爆，发言为：" + str_ann + "\n"
           if (uc.indexOf(n) === -1) {
@@ -6581,27 +6695,25 @@ export function apply(ctx: Context, config: Config) {
               else {
                 sumup += "白板自爆成功，游戏结束，白板胜利"
                 recordExplosionOutcome('white-win')
-                notifySession(session, "白板自爆成功，游戏结束，白板胜利")
+                outcomeText = '白板自爆成功，游戏结束，白板胜利'
                 increment = config.scoreWhiteBoomWin
-                await addScore(boomname, increment, 'adjudicated-white-boom-win')
+                queueScoreAward(boomname, increment, 'adjudicated-white-boom-win')
                 ptsstr += boomname + "加" + increment + "分。"
-                await sendScoreSummary(session, 'white')
               }
             }
             else {
               increment = config.scoreGoodBoomNoWin
               recordExplosionOutcome('no-winner')
               sumup += "游戏结束，好人自爆，无人胜利。非好人阵营均加" + increment + "分。"
-              notifySession(session, "游戏结束，好人自爆，无人胜利。非好人阵营均加" + increment + "分。")
+              outcomeText = "游戏结束，好人自爆，无人胜利。非好人阵营均加" + increment + "分。"
               for (let i = 0; i < player_copy.length; i++) {
                 if ((uc_copy.indexOf(i + 1) !== -1 || i + 1 === white_copy) && !isEmpty(player_copy[i])) {
-                  await addScore(player_copy[i], increment, 'adjudicated-good-boom-no-winner')
+                  queueScoreAward(player_copy[i], increment, 'adjudicated-good-boom-no-winner')
                   ptsstr += player_copy[i] + "，"
                 }
               }
               ptsstr = ptsstr.slice(0, -1)
               ptsstr += "加" + increment + "分。"
-              await sendScoreSummary(session, 'none')
             }
           }
           else {
@@ -6609,21 +6721,20 @@ export function apply(ctx: Context, config: Config) {
               beginBoomAdjudication(session, 1)
             }
             else {
-              notifySession(session, "卧底自爆成功，卧底胜利")
+              outcomeText = '卧底自爆成功，卧底胜利'
               sumup += "卧底自爆成功，卧底胜利"
               recordExplosionOutcome('undercover-win')
               increment = config.scoreUndercoverWin
               for (let i = 0; i < player_copy.length; i++) {
                 if (uc_copy.indexOf(i + 1) !== -1 && !isEmpty(player_copy[i])) {
-                  await addScore(player_copy[i], increment, 'adjudicated-undercover-boom-win')
+                  queueScoreAward(player_copy[i], increment, 'adjudicated-undercover-boom-win')
                   ptsstr += player_copy[i] + "，"
                 }
               }
               ptsstr = ptsstr.slice(0, -1)
               ptsstr += "加" + increment + "分。"
-              await addScore(boomname, config.scoreUndercoverBoomBonus, 'adjudicated-undercover-boom-bonus')
+              queueScoreAward(boomname, config.scoreUndercoverBoomBonus, 'adjudicated-undercover-boom-bonus')
               ptsstr += boomname + "自爆获胜，额外加" + config.scoreUndercoverBoomBonus + "分。"
-              await sendScoreSummary(session, 'undercover')
             }
           }
           if (boom_pending) {
@@ -6631,7 +6742,8 @@ export function apply(ctx: Context, config: Config) {
             notifySession(session, "有玩家自爆，但bot未能匹配到对应词条，请主持人在" + Math.max(10, Number(config.boomAdjudicationTimeout ?? 300) || 300) / 60 + "分钟内判断自爆是否成功。（在群里发送“是”或“否”）")
           }
           else {
-            end_game({ kind: 'completed', reason: n === white || uc.includes(n) ? 'self-explosion' : 'rule-no-winner', winner: n === white ? 'white' : uc.includes(n) ? 'undercover' : 'none' })
+            await completeGame(session, { kind: 'completed', reason: n === white || uc.includes(n) ? 'self-explosion' : 'rule-no-winner', winner: n === white ? 'white' : uc.includes(n) ? 'undercover' : 'none' },
+              { before: { text: outcomeText, label: '加时自爆结算' } })
           }
           return
         }
@@ -6655,6 +6767,7 @@ export function apply(ctx: Context, config: Config) {
         if (round <= uc_num && player_copy.length - player.length - kickout.length < uc_num) return ("未到轮次，无法自爆。")
         if (boom_pending) return ("已有玩家自爆了哦，无法再次自爆。")
         boomname = resolvePlayerNickname(session)
+        let outcomeText = ''
         recordSelfExplosion(n, str_ann)
         sumup += "第" + round + "轮" + n + "号玩家" + boomname + "自爆，发言为：" + str_ann + "\n"
         if (uc.indexOf(n) === -1) {
@@ -6670,27 +6783,25 @@ export function apply(ctx: Context, config: Config) {
             else {
               sumup += "白板自爆成功，游戏结束，白板胜利"
               recordExplosionOutcome('white-win')
-              notifySession(session, "白板自爆成功，游戏结束，白板胜利")
+              outcomeText = '白板自爆成功，游戏结束，白板胜利'
               increment = config.scoreWhiteBoomWin
-              await addScore(boomname, increment, 'direct-white-boom-win')
+              queueScoreAward(boomname, increment, 'direct-white-boom-win')
               ptsstr += boomname + "加" + increment + "分。"
-              await sendScoreSummary(session, 'white')
             }
           }
           else {
             increment = config.scoreGoodBoomNoWin
             recordExplosionOutcome('no-winner')
             sumup += "游戏结束，好人自爆，无人胜利。非好人阵营均加" + increment + "分。"
-            notifySession(session, "游戏结束，好人自爆，无人胜利。非好人阵营均加" + increment + "分。")
+            outcomeText = "游戏结束，好人自爆，无人胜利。非好人阵营均加" + increment + "分。"
             for (let i = 0; i < player_copy.length; i++) {
               if ((uc_copy.indexOf(i + 1) !== -1 || i + 1 === white_copy) && !isEmpty(player_copy[i])) {
-                await addScore(player_copy[i], increment, 'direct-good-boom-no-winner')
+                queueScoreAward(player_copy[i], increment, 'direct-good-boom-no-winner')
                 ptsstr += player_copy[i] + "，"
               }
             }
             ptsstr = ptsstr.slice(0, -1)
             ptsstr += "加" + increment + "分。"
-            await sendScoreSummary(session, 'none')
           }
         }
         else {
@@ -6700,26 +6811,26 @@ export function apply(ctx: Context, config: Config) {
           else {
             sumup += "卧底自爆成功，游戏结束，卧底胜利"
             recordExplosionOutcome('undercover-win')
-            notifySession(session, "卧底自爆成功，游戏结束，卧底胜利")
+            outcomeText = '卧底自爆成功，游戏结束，卧底胜利'
             increment = config.scoreUndercoverWin
             for (let i = 0; i < player_copy.length; i++) {
               if (uc_copy.indexOf(i + 1) !== -1 && !isEmpty(player_copy[i])) {
-                await addScore(player_copy[i], increment, 'direct-undercover-boom-win')
+                queueScoreAward(player_copy[i], increment, 'direct-undercover-boom-win')
                 ptsstr += player_copy[i] + "，"
               }
             }
             ptsstr = ptsstr.slice(0, -1)
             ptsstr += "加" + increment + "分。"
-            await addScore(boomname, config.scoreUndercoverBoomBonus, 'direct-undercover-boom-bonus')
+            queueScoreAward(boomname, config.scoreUndercoverBoomBonus, 'direct-undercover-boom-bonus')
             ptsstr += boomname + "自爆获胜，额外加" + config.scoreUndercoverBoomBonus + "分。"
-            await sendScoreSummary(session, 'undercover')
           }
         }
         if (boom_pending) {
           notifySession(session, "有玩家自爆，但bot未能匹配到对应词条，请主持人在" + Math.max(10, Number(config.boomAdjudicationTimeout ?? 300) || 300) / 60 + "分钟内判断自爆是否成功。（在群里发送“是”或“否”）")
         }
         else {
-          end_game({ kind: 'completed', reason: n === white || uc.includes(n) ? 'self-explosion' : 'rule-no-winner', winner: n === white ? 'white' : uc.includes(n) ? 'undercover' : 'none' })
+          await completeGame(session, { kind: 'completed', reason: n === white || uc.includes(n) ? 'self-explosion' : 'rule-no-winner', winner: n === white ? 'white' : uc.includes(n) ? 'undercover' : 'none' },
+            { before: { text: outcomeText, label: '自爆结算' } })
         }
         return
       }
@@ -6739,7 +6850,7 @@ export function apply(ctx: Context, config: Config) {
     if (index < 0 || !speechBackfillSeats.has(seat) || speechBackfillUsers.get(seat) !== session.userId) return next()
     const content = session.content.trimStart()
     if (!content.startsWith(String(seat)) || !content.slice(String(seat).length).trim()) return next()
-    if (deerSeatNeedsSelection(seat)) return "你需要先私聊提交选词并通过主持人审核，才能补发言。"
+    if (deerSeatNeedsSelection(seat)) return rejectUnapprovedDeerSpeech(session, '你需要先私聊提交选词并通过主持人审核，才能补发言。')
     recordSpeech(session, seat, content)
     speechBackfillSeats.delete(seat)
     speechBackfillUsers.delete(seat)
@@ -6812,15 +6923,14 @@ export function apply(ctx: Context, config: Config) {
         else { increment = config.scoreGoodWinSpeedrun }
         for (let i = 0; i < player_copy.length; i++) {
           if (uc_copy.indexOf(i + 1) === -1 && i + 1 !== white_copy && !isEmpty(player_copy[i])) {
-            await addScore(player_copy[i], increment, 'vote-good-win')
+            queueScoreAward(player_copy[i], increment, 'vote-good-win')
             ptsstr += player_copy[i] + "，"
           }
         }
         ptsstr = ptsstr.slice(0, -1)
         ptsstr += "加" + increment + "分。"
-        await sendScoreSummary(session, 'good')
-        notifyGroup(session, "游戏结束，好人胜利。", "白板招安后好人胜利通知")
-        end_game({ kind: 'completed', reason: 'recruitment', winner: 'good' })
+        await completeGame(session, { kind: 'completed', reason: 'recruitment', winner: 'good' },
+          { after: { text: '游戏结束，好人胜利。', label: '白板招安后好人胜利通知' } })
       }
       return
     }
@@ -6839,15 +6949,14 @@ export function apply(ctx: Context, config: Config) {
         increment = config.scoreUndercoverWin
         for (let i = 0; i < player_copy.length; i++) {
           if (uc_copy.indexOf(i + 1) !== -1 && !isEmpty(player_copy[i])) {
-            await addScore(player_copy[i], increment, 'vote-undercover-win')
+            queueScoreAward(player_copy[i], increment, 'vote-undercover-win')
             ptsstr += player_copy[i] + "，"
           }
         }
         ptsstr = ptsstr.slice(0, -1)
         ptsstr += "加" + increment + "分。"
-        await sendScoreSummary(session, 'undercover')
-        notifyGroup(session, "游戏结束，卧底胜利。", "白板招安后卧底胜利通知")
-        end_game({ kind: 'completed', reason: 'recruitment', winner: 'undercover' })
+        await completeGame(session, { kind: 'completed', reason: 'recruitment', winner: 'undercover' },
+          { after: { text: '游戏结束，卧底胜利。', label: '白板招安后卧底胜利通知' } })
       }
       return
     }
@@ -6885,16 +6994,15 @@ export function apply(ctx: Context, config: Config) {
         increment = config.scoreUndercoverWin
         for (let i = 0; i < player_copy.length; i++) {
           if (uc_copy.indexOf(i + 1) !== -1 && !isEmpty(player_copy[i])) {
-            await addScore(player_copy[i], increment, 'overtime-undercover-win')
+            queueScoreAward(player_copy[i], increment, 'overtime-undercover-win')
             ptsstr += player_copy[i] + "，"
           }
         }
         ptsstr = ptsstr.slice(0, -1)
         ptsstr += "加" + increment + "分。"
-        await sendScoreSummary(session, 'undercover')
         stalemate.reset()
-        notifyGroup(session, "连续两轮平安夜且满足僵局条件，游戏结束，卧底胜利。", "僵局卧底胜利通知")
-        end_game({ kind: 'completed', reason: 'stalemate', winner: 'undercover' })
+        await completeGame(session, { kind: 'completed', reason: 'stalemate', winner: 'undercover' },
+          { after: { text: '连续两轮平安夜且满足僵局条件，游戏结束，卧底胜利。', label: '僵局卧底胜利通知' } })
         return
       }
       else {
@@ -6914,11 +7022,10 @@ export function apply(ctx: Context, config: Config) {
       sumup += "游戏结束，白板胜利。"
       capture(r => r.outcome("游戏结束，白板胜利。"))
       increment = config.scoreWhiteWin
-      await addScore(player_copy[white - 1], increment, 'vote-white-win')
+      queueScoreAward(player_copy[white - 1], increment, 'vote-white-win')
       ptsstr += player_copy[white - 1] + "加" + increment + "分。"
-      await sendScoreSummary(session, 'white')
-      notifyGroup(session, "游戏结束，白板胜利。", "白板苟赢通知")
-      end_game({ kind: 'completed', reason: 'white-survival', winner: 'white' })
+      await completeGame(session, { kind: 'completed', reason: 'white-survival', winner: 'white' },
+        { after: { text: '游戏结束，白板胜利。', label: '白板苟赢通知' } })
       return
     }
     else {
@@ -7102,13 +7209,11 @@ export function apply(ctx: Context, config: Config) {
             resumedAfterZhang,
           )
           removeVoteEliminationTarget(current.elimination)
-          if (resumedAfterZhang) {
-            await sendGroupNotice(current.session, notice, '投票出局通知')
-            if (game_off || gameTimers.epoch !== elimination.gameEpoch) return endResolution()
-          }
+          if (resumedAfterZhang) notifyGroup(current.session, notice, '投票出局通知')
           return continueResolution()
         },
         [ResolutionCursor.CheckVictory]: (current) => {
+          if (game_off || gameTimers.epoch !== elimination.gameEpoch) return endResolution()
           // Zhang can still take the white player with him. Only the white
           // survival result waits for that choice; other victory checks keep
           // their established order, including the fewer-than-three rule.
@@ -7317,13 +7422,12 @@ export function apply(ctx: Context, config: Config) {
         sumup += "白板未参与加时，游戏结束，白板胜利。"
         capture(r => r.outcome("白板未参与加时，游戏结束，白板胜利。"))
         increment = config.scoreWhiteWin
-        await addScore(player_copy[white - 1], increment, 'overtime-white-win')
+        queueScoreAward(player_copy[white - 1], increment, 'overtime-white-win')
         ptsstr += player_copy[white - 1] + "加" + increment + "分。"
-        await sendScoreSummary(session, 'white')
-        notifyGroup(session, "白板未参与加时，游戏结束，白板胜利。", "白板未参与加时胜利通知")
-        end_game({ kind: 'completed', reason: 'white-survival', winner: 'white' })
         annstr = "本轮发言结果：\n"
         vstr = "本轮投票结果：\n"
+        await completeGame(session, { kind: 'completed', reason: 'white-survival', winner: 'white' },
+          { after: { text: '白板未参与加时，游戏结束，白板胜利。', label: '白板未参与加时胜利通知' } })
         return endResolution()
       }
       else {
@@ -7751,11 +7855,12 @@ export function apply(ctx: Context, config: Config) {
     const out_index = order.indexOf(outcast)
     if (out_index === -1) return "missing"
     if (isRosterChangeBlocked()) return "blocked"
+    const epoch = gameTimers.epoch
     const guildId = gameRoute.guildId
     const out_player = player[out_index]
     const out_name = player_name[out_index]
     const voteSnapshot = !vote_off ? captureVoteRoster() : null
-    // `player_out()` clears a live delegated ballot when its delegate leaves.
+    // `splice_player()` clears a live delegated ballot when its delegate leaves.
     // The roster snapshot is intentionally captured before that mutation so
     // ordinary ballots can be retained across the seat removal, but replaying
     // it must not resurrect the proxy ballot that was just invalidated. Keep
@@ -7784,11 +7889,29 @@ export function apply(ctx: Context, config: Config) {
         : cause === 'makeup-timeout' ? '补发言超时，被自动踢出' : "主动退出游戏"
     sumup += outcast + "号玩家" + out_name + reason + "。\n"
     historyDepartureReasons.set(outcast, cause === 'host' ? 'kick' : cause === 'selection-timeout' || cause === 'makeup-timeout' ? 'timeout' : 'self-exit')
-    await player_out(session, outcast, true, true)
-    if (modeInteraction.mode === "deer") syncDeerHostReviewClock(session, false)
     const publicReason = cause === 'selection-timeout' && deerProgressPrivate() ? '被自动踢出' : reason
-    await sendGroupNotice(session, outcast + "号玩家" + out_name + publicReason + "。", "玩家离场通知", guildId)
-    if (game_off) return "removed"
+    const endsOvertimeVote = !!reconciliationSnapshot && add_flag && add_indices.includes(out_index)
+    splice_player(outcast, true, true)
+    boom_pending = false
+    let voteChange: ReturnType<typeof rebaseVoteRoster> | undefined
+    if (endsOvertimeVote) {
+      // This vote is being cancelled, not settled with a shifted candidate list.
+      vote_off = true
+      voteFactStage = 'none'
+      weiInquiryWindow = null
+      clearVoteOpportunity()
+    } else if (reconciliationSnapshot) {
+      if (add_flag) add_indices = add_indices.map(index => index > out_index ? index - 1 : index)
+      voteChange = rebaseVoteRoster(session, reconciliationSnapshot)
+    }
+    notifyGroup(session, outcast + "号玩家" + out_name + publicReason + "。", "玩家离场通知", guildId)
+    const control = await resolveEliminationVictory(session, whiteSurvivalSettlementPending)
+    if (control.kind === 'game-end' || game_off || epoch !== gameTimers.epoch) return "removed"
+    if (modeInteraction.mode === "deer") syncDeerHostReviewClock(session, false)
+    if (voteChange) {
+      await announceVoteRosterChange(session, outcast + "号玩家已被踢出", voteChange)
+      return "removed"
+    }
     if (!ann_off) {
       if (add_flag) {
         if (add_indices.indexOf(out_index) !== -1) {
@@ -7825,15 +7948,7 @@ export function apply(ctx: Context, config: Config) {
         end_ann(session)
       }
     }
-    else if (!vote_off) {
-      if (add_flag) {
-        if (add_indices.indexOf(out_index) === -1) {
-          for (let i = 0; i < add_indices.length; i++) {
-            if (out_index < add_indices[i]) add_indices[i] -= 1
-          }
-          await reconcileVoteAfterRosterChange(session, outcast + "号玩家已被踢出", reconciliationSnapshot!)
-        }
-        else {
+    else if (endsOvertimeVote) {
           gameTimers.cancel(timer_htj)
           gameTimers.cancel(timer_zxz)
           gameTimers.cancel(timer_mwl)
@@ -7867,11 +7982,6 @@ export function apply(ctx: Context, config: Config) {
           vstr = "本轮投票结果：\n"
           notifyGroup(session, "踢出正在进行加时的玩家，结束加时，不再另外出人，游戏继续，开始第" + round + "轮发言。", "投票加时离场后续通知", guildId)
           return "removed"
-        }
-      }
-      else {
-        await reconcileVoteAfterRosterChange(session, outcast + "号玩家已被踢出", reconciliationSnapshot!)
-      }
     }
     else {
       if (add_flag) {
@@ -7911,8 +8021,16 @@ export function apply(ctx: Context, config: Config) {
     return "removed"
   }
   ctx.guild().middleware(async (session: Session<"authority">, next) => {//踢人
-    if (game_off || !gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
+    if (!gameRoute.matchesSession(session.platform, session.guildId, session.selfId)) return next()
     let str_host = session.content.replace(/\s/g, "")
+    if (terminalSettlement) {
+      if (!(session.user.authority >= 2 || isGameHost(session.userId))
+        || !['停止卧底', '中止卧底', '终止卧底', '结束卧底'].includes(str_host)) return next()
+      if (Date.now() < terminalSettlement.deadline) return '本局已确定胜负，正在结算，不能改为中止。'
+      terminalSettlement.finish()
+      return '已释放本局结算占用，原胜负不变。'
+    }
+    if (game_off) return next()
     if (session.user.authority >= 2 && (str_host === "停止卧底" || str_host === "中止卧底" || str_host === "终止卧底" || str_host === "结束卧底")) {
       if (isGameHost(session.userId)) {
         const outcome = "卧底被主持人终止。"
@@ -8044,6 +8162,10 @@ export function apply(ctx: Context, config: Config) {
         return (failedName + "选择的座位已不可用，补位申请自动取消。")
       }
       gameTimers.cancel(timer_replace)
+      const replacementEpoch = gameTimers.epoch
+      const replacementPhase = currentVoteSettlementKey()
+      const replacementRound = round
+      const replacementOvertime = add_flag
       const voteSnapshot = !vote_off ? captureVoteRoster() : null
       let j = 0
       while (order[j] < replacementSeat) {
@@ -8053,6 +8175,7 @@ export function apply(ctx: Context, config: Config) {
       hostSupport.recordParticipant(applicant.userId); hostParticipantKeys.add(personKey(applicant.nickname))
       player_name.splice(j, 0, applicant.nickname)
       order.splice(j, 0, replacementSeat)
+      if (add_flag) add_indices = add_indices.map(index => index >= j ? index + 1 : index)
       stalemate.reset()
       player_copy[replacementSeat - 1] = applicant.nickname
       player_id_copy[replacementSeat - 1] = applicant.userId
@@ -8070,12 +8193,42 @@ export function apply(ctx: Context, config: Config) {
         if (isEmpty(uc) && flag_white && (!add_flag || add_indices.some(index => order[index] === white))) white_only = true
       }
       if (modeInteraction.mode === "deer") modeInteraction.syncDeerRoster(currentModeRoster(), white)
+      // Commit the roster and its matching ballot/announcement vectors before
+      // any topic/card delivery. Other voters and timers can run meanwhile.
+      const voteChange = voteSnapshot ? rebaseVoteRoster(session, voteSnapshot) : undefined
+      if (!voteChange) {
+        if (add_flag) {
+          const voterIndex = j - add_indices.filter(index => index < j).length
+          add_voter.splice(voterIndex, 0, applicant.userId)
+          if (ann_off) add_vote[round - 1].splice(voterIndex, 0, -1)
+          else add_vote[round - 1] = Array(add_voter.length)
+        } else if (ann_off) {
+          vote[round - 1].splice(j, 0, -1)
+        } else {
+          ann.splice(j, 0, '')
+          vote[round - 1] = Array(player.length)
+        }
+        if (ann_off) poll.splice(j, 0, 0)
+        else poll = Array(player.length).fill(0)
+      }
+      capture(r => {
+        r.join(replacementSeat, historyIdentity(applicant.userId, applicant.nickname), historyCamp(replacementSeat),
+          heros.includes(replacementSeat) ? heros.indexOf(replacementSeat) : null, Date.now())
+        if (!add_flag) r.allowSpeakers([replacementSeat])
+        if (modeInteraction.mode === 'deer') r.choice(replacementSeat, modeInteraction.deerApprovedCandidate(replacementSeat) ?? null)
+      })
+      resetReplacementRequest()
+      const stillHere = () => !game_off && replacementEpoch === gameTimers.epoch
+        && player[order.indexOf(replacementSeat)] === applicant.userId
+      const needsBackfill = !add_flag && ann_off && !vote_off && !speechHistory.bySeat(replacementSeat)
+        .some(record => record.round === round && !record.overtime)
       if (modeInteraction.mode === 'deer') {
         const selection = modeInteraction.deerSelectionForSeat(replacementSeat)
         if (selection && deerRevisions.restore(replacementSeat, selection.identityKey ?? selection.userId,
           selection.userId, selection.approvedVersion ?? selection.version, Date.now())) {
           const review = deerRevisions.review(replacementSeat)
           if (review) await armDeerSpeechReview(session, review)
+          if (!stillHere()) return
           const makeup = deerRevisions.makeup(replacementSeat)
           if (makeup) {
             makeup.round = round
@@ -8085,17 +8238,10 @@ export function apply(ctx: Context, config: Config) {
           }
         }
       }
-      capture(r => {
-        r.join(replacementSeat, historyIdentity(applicant.userId, applicant.nickname), historyCamp(replacementSeat),
-          heros.includes(replacementSeat) ? heros.indexOf(replacementSeat) : null, Date.now())
-        if (!add_flag) r.allowSpeakers([replacementSeat])
-        if (modeInteraction.mode === 'deer') r.choice(replacementSeat, modeInteraction.deerApprovedCandidate(replacementSeat) ?? null)
-      })
-      const needsBackfill = !add_flag && ann_off && !vote_off && !speechHistory.bySeat(replacementSeat)
-        .some(record => record.round === round && !record.overtime)
       const replacementFailures: DealItem[] = []
       try {
-        await sendTopicAssignment(session, player[j], replacementSeat, modeInteraction.mode === "deer")
+        await sendTopicAssignment(session, applicant.userId, replacementSeat, modeInteraction.mode === "deer")
+        if (!stillHere()) return
         if (modeInteraction.mode === 'deer' && modeInteraction.deerSelectionForSeat(replacementSeat)?.status === 'pending-host') {
           syncDeerHostReviewClock(session, false)
           await sendDeerSelectionRequest(session, replacementSeat)
@@ -8105,12 +8251,16 @@ export function apply(ctx: Context, config: Config) {
         replacementFailures.push("题面")
         ctx.logger.warn("补位%d号玩家题面私聊发送失败：%s", replacementSeat, safeErrorSummary(error))
       }
+      if (!stillHere()) return
       if (heros.indexOf(replacementSeat) !== -1) {
         try {
+          const hero = heros.indexOf(replacementSeat)
+          const image = await heroCards.image(hero)
+          if (!stillHere()) return
           await sendPrivateWithDealTimeout(
             session,
-            player[j],
-            "你本局抽到的武将为：" + hero_name[heros.indexOf(replacementSeat)] + await heroCards.image(heros.indexOf(replacementSeat)),
+            applicant.userId,
+            "你本局抽到的武将为：" + hero_name[hero] + image,
           )
         }
         catch (error) {
@@ -8118,6 +8268,7 @@ export function apply(ctx: Context, config: Config) {
           ctx.logger.warn("补位%d号玩家武将牌私聊发送失败：%s", replacementSeat, safeErrorSummary(error))
         }
       }
+      if (!stillHere()) return
       if (replacementFailures.length > 0) {
         await sendPrivateNotice(
           session,
@@ -8126,48 +8277,10 @@ export function apply(ctx: Context, config: Config) {
           "补位发牌结果通知",
         )
       }
-      if (vote_off) {
-        if (ann_off) {
-          let subs = 0
-          if (add_flag) {
-            for (let i = 0; i < add_indices.length; i++) {
-              if (add_indices[i] >= j) add_indices[i] += 1
-              else subs += 1
-            }
-            add_voter.splice(j - subs, 0, applicant.userId)
-            add_vote[round - 1].splice(j - subs, 0, -1)
-          }
-          else {
-            vote[round - 1].splice(j, 0, -1)
-          }
-          poll.splice(j, 0, 0)
-        }
-        else {
-          let subs = 0
-          if (add_flag) {
-            for (let i = 0; i < add_indices.length; i++) {
-              if (add_indices[i] >= j) add_indices[i] += 1
-              else subs += 1
-            }
-            //add_vote[round - 1].splice(j-subs,0,null)
-            add_voter.splice(j - subs, 0, applicant.userId)
-            add_vote[round - 1] = Array(add_voter.length)
-          }
-          else {
-            ann.splice(j, 0, "")
-            vote[round - 1] = Array(player.length)
-          }
-          poll = Array(player.length).fill(0)
-        }
-      }
-      else {
-        if (add_flag) {
-          for (let i = 0; i < add_indices.length; i++) {
-            if (add_indices[i] >= j) add_indices[i] += 1
-          }
-        }
-        await reconcileVoteAfterRosterChange(session, applicant.nickname + "成为第" + replacementSeat + "号玩家", voteSnapshot!)
-      }
+      if (!stillHere()) return
+      if (voteChange) await announceVoteRosterChange(session, applicant.nickname + "成为第" + replacementSeat + "号玩家", voteChange)
+      if (!stillHere() || replacementPhase !== currentVoteSettlementKey() || round !== replacementRound
+        || add_flag !== replacementOvertime) return
       if (modeInteraction.mode === "turtle" && vote_off && !ann_off) {
         const eligibleSeats = turtleEligibleSeats()
         modeInteraction.syncTurtleRoundRoster(
@@ -8208,7 +8321,6 @@ export function apply(ctx: Context, config: Config) {
       if (modeInteraction.mode === "deer" && replacementSeat === white_copy && vote_off && !ann_off) {
         armDeerSpeechClock(session, replacementSeat)
       }
-      resetReplacementRequest()
       return
     }
     else return next()
@@ -8516,7 +8628,7 @@ export function apply(ctx: Context, config: Config) {
       return "你不属于本次加时的发言玩家，不能发动处决。"
     }
     if (modeInteraction.mode === "deer" && deerSeatNeedsSelection(actorSeat)) {
-      return "你需要先完成鹿模式选人并通过主持人审核，才能发动处决。"
+      return rejectUnapprovedDeerSpeech(session, '你需要先完成鹿模式选人并通过主持人审核，才能发动处决。')
     }
     // if (round <= uc_num && player_copy.length - player.length - kickout.length < uc_num) {
     //   return
@@ -8748,7 +8860,8 @@ export function apply(ctx: Context, config: Config) {
       }
       const elimination = snapshotEliminationContext({ gameEpoch: gameTimers.epoch, round, source: 'hero',
         targetSeat: outcast, activeSeats: order, chainDepth: 0, causedByHero: 'wu-san-gui' })
-      if (deferZhangDeparture(session, elimination, current => commitAuthority(current, true))) return
+      if (deferZhangDeparture(session, elimination, current => commitAuthority(current, true),
+        () => recordSkill(HERO.WU_SAN_GUI, '选定权计目标', [outcast]))) return
       await commitAuthority(session)
     }
   })

@@ -1,4 +1,5 @@
 import { h, type Session } from 'koishi'
+import { hasMessageReceipt } from './message-delivery'
 
 interface Clip { x: number; y: number; width: number; height: number }
 export interface ReportBrowserPage {
@@ -152,11 +153,11 @@ export class ReportImages {
       clearTimeout(timer)
       for (const bytes of images) {
         const ids = await session.send(h.image(Buffer.from(bytes), 'image/png'))
-        if (!ids?.length) throw new Error('report image was not delivered')
+        if (!hasMessageReceipt(ids)) throw new Error('report image was not delivered')
       }
       if (parts.attachments.length) {
         const ids = await session.send(h('template', {}, ...parts.attachments))
-        if (!ids?.length) throw new Error('report attachments were not delivered')
+        if (!hasMessageReceipt(ids)) throw new Error('report attachments were not delivered')
       }
       return true
     } catch (error) { this.onFailure(error); return false }

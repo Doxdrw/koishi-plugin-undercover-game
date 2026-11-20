@@ -8,7 +8,7 @@ import { App } from 'koishi'
 import SQLiteDriver from '@koishijs/plugin-database-sqlite'
 import { archiveDisposition, captureHistory, type HistorySnapshot } from '../src/game/history-snapshot'
 import { HistoryStore, registerHistoryModels } from '../src/game/history-store'
-import { FileHistoryRetryQueue, HistoryPersistence } from '../src/game/history-retry'
+import { FileHistoryRetryQueue, HistoryPersistence, type HistoryRetryQueue } from '../src/game/history-retry'
 import { createHistoryDeletionConsumer } from '../src/game/history-deletion-consumer'
 import { registerSubscriptionModel } from '../src/game/subscription-service'
 
@@ -188,6 +188,43 @@ it('spools a failed archive to private files then restart-retries without duplic
   assert.deepEqual(await running.retry(), { saved: 0, failed: 0 })
   assert.equal((await app.database.get('undercover_history_game', {})).length, 1)
   assert.deepEqual(warnings, ['database-save-failed'])
+})
+
+it('spools after the archive wait budget without overlapping an unacknowledged write', async () => {
+  const { app, store } = await fixture()
+  // Only the database attempt in this test stalls. Real file latency is
+  // covered by the independent spool test and must not race a 25 ms timer.
+  const snapshots = new Map<string, HistorySnapshot>()
+  const queue: HistoryRetryQueue = {
+    put: async input => { snapshots.set(input.gameId, structuredClone(input)) },
+    names: async () => [...snapshots.keys()],
+    read: async name => snapshots.get(name)!,
+    remove: async name => { snapshots.delete(name) },
+  }
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  let pending: Promise<unknown> | undefined
+  let calls = 0
+  const service = new HistoryPersistence({ save: (input, options) => {
+    if (++calls !== 1) return store.save(input, options)
+    const old = held.then(() => store.save(input, options))
+    pending = old
+    return old
+  } }, queue, () => {}, 25)
+  try {
+    assert.deepEqual(await service.save(snapshot()), { kind: 'queued' })
+    assert.deepEqual(await service.save(snapshot()), { kind: 'queued' })
+    assert.equal(calls, 1)
+    assert.equal((await queue.names()).length, 2)
+    release()
+    await pending
+    const healthy = new HistoryPersistence(store, queue, () => {})
+    assert.deepEqual(await healthy.retry(), { saved: 2, failed: 0 })
+    assert.equal((await app.database.get('undercover_history_game', {})).length, 2)
+  } finally {
+    release()
+    await pending
+  }
 })
 
 it('reports dual storage failure safely and does not queue excluded sandbox or invalid snapshots', async () => {

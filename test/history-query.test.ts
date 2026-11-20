@@ -68,6 +68,100 @@ it('never reads deer choices or exposes internal account identifiers in normal r
   assert.equal((await queries.list(group)).total, 1)
 })
 
+it('bounds AI history by the real group, completed games and the requested stored phase', async () => {
+  const { app, store } = await fixture()
+  const older = await store.save(input(0))
+  const newest = input(10)
+  newest.phases[0].speeches[0].text = '甲"乙\\丙😀'.repeat(240) + '<img src="https://asset.example/a?secret"/>' + '末尾'
+  newest.phases[0].ballots = [{ voterTenureId: 'a', targetSeat: null, weight: 2, status: 'abstain' }]
+  newest.phases[0].anonymousVotes = [{ seat: 1, count: 2 }]
+  newest.ending = { kind: 'completed', reason: 'rule-no-winner', winner: 'none' }
+  const saved = await store.save(newest)
+  const aborted = input(20)
+  aborted.ending = { kind: 'aborted', reason: 'host-stop' }
+  const stopped = await store.save(aborted)
+  const foreign = { ...input(50), guildId: 'elsewhere' }
+  await store.save(foreign)
+  assert.ok(saved.kind === 'saved' && older.kind === 'saved' && stopped.kind === 'saved')
+  const got: Array<{ table: string; filter: object; modifier?: { limit?: number } }> = []
+  const db = new Proxy(app.database, { get(target, name) {
+    if (name === 'get') return (table, filter, modifier) => {
+      got.push({ table, filter, modifier })
+      return (target.get as any)(table, filter, modifier)
+    }
+    const value = Reflect.get(target, name); return typeof value === 'function' ? value.bind(target) : value
+  } })
+  const queries = new HistoryQueries(db)
+  const budget = { pageSize: 1, maxChars: 500 }
+  const read = async (params = {}, viewer = group) => {
+    const output = await queries.readForAi(viewer, params, budget)
+    assert.ok(output.length <= 500)
+    assert.doesNotMatch(output, /secret-account-id|asset\.example|绝不能搜到|<img/)
+    return JSON.parse(output)
+  }
+  assert.equal((await read()).game.id, saved.id)
+  assert.equal((await read()).game.result, '无人胜利')
+  const awaiting = JSON.parse(await queries.readForAi(group, {}, budget, { gameId: 'unavailable-game', status: '正在归档' }))
+  assert.equal(awaiting.game.id, saved.id)
+  assert.match(awaiting.note, /最近结束.*正在归档.*最近已归档/)
+  assert.doesNotMatch(JSON.stringify(awaiting), /unavailable-game/)
+  assert.equal((await read({ id: stopped.id })).game, undefined)
+  assert.equal((await read({}, { ...group, isDirect: true })).game, undefined)
+  assert.equal((await read({ id: saved.id }, { ...group, selfId: 'different-bot' })).game, undefined)
+  assert.equal((await read({ id: saved.id }, { ...group, guildId: 'elsewhere' })).game, undefined)
+  const expired = new HistoryQueries(app.database, undefined, undefined, undefined, 1)
+  assert.equal(JSON.parse(await expired.readForAi(group, { id: saved.id })).game, undefined)
+  assert.deepEqual(JSON.parse(await expired.readForAi(group, { view: 'list' })).items, [])
+  const list = await read({ view: 'list', limit: 10 })
+  assert.deepEqual(list.items.map(r => r.id), [saved.id])
+  assert.deepEqual((await read({ view: 'list', page: list.nextPage })).items.map(r => r.id), [older.id])
+  assert.equal((await read({ view: 'phases', id: saved.id })).items[0].sequence, 1)
+  const votes = await read({ view: 'phase', id: saved.id, sequence: 1, section: 'votes' })
+  assert.match(votes.items[0], /弃权（2票）/)
+  assert.match((await read({ view: 'phase', id: saved.id, sequence: 1, section: 'votes', page: votes.nextPage })).items[0], /2票无来源/)
+  const lines: string[] = []
+  for (let page = 1; page;) {
+    const response = await read({ view: 'phase', id: saved.id, sequence: 1, section: 'speech', page })
+    lines.push(...response.items)
+    page = response.nextPage
+  }
+  assert.equal(lines.join(''), '1号玩家清风：' + '甲"乙\\丙😀'.repeat(240) + '[媒体]末尾')
+  assert.ok(got.some(call => call.table === 'undercover_history_game' && call.modifier?.limit === 2))
+  assert.ok(got.filter(call => call.table === 'undercover_history_phase').every(call =>
+    'sequence' in call.filter || (call.modifier?.limit ?? Infinity) <= 2))
+  assert.ok(!got.some(call => call.table === 'undercover_history_choice'))
+})
+
+it('opens only acknowledged deer publications and fails closed on hide, redaction or stale receipts', async () => {
+  const { app, store, queries } = await fixture()
+  const game = input()
+  game.deerChoices[0].hidden = false
+  const saved = await store.save(game)
+  assert.ok(saved.kind === 'saved')
+  const controls = new DeerHistoryControls(app.database)
+  const host = { ...group, userId: 'host' }, owner = { ...group, userId: 'player' }
+  const read = async () => JSON.parse(await queries.readForAi(group, { view: 'choices', id: saved.id })).items
+  assert.deepEqual(await read(), [])
+  const stale = await controls.changeView(host, 'reveal', saved.id)
+  assert.match(stale.text, /绝不能搜到的私密选人/)
+  assert.deepEqual(await read(), [], 'rendering the text alone cannot publish it to AI')
+  await controls.change(owner, 'hide', saved.id)
+  const pending = await controls.changeView(owner, 'reveal', saved.id)
+  await stale.confirm?.()
+  assert.deepEqual(await read(), [])
+  await pending.confirm?.()
+  assert.match((await read())[0], /清风.*绝不能搜到的私密选人/)
+  await controls.change(owner, 'hide', saved.id)
+  assert.deepEqual(await read(), [])
+  await pending.confirm?.()
+  assert.deepEqual(await read(), [])
+  const beforeDelete = await controls.changeView(owner, 'reveal', saved.id)
+  await store.erase(game.gameId, await store.deletionFingerprint(game.gameId))
+  await beforeDelete.confirm?.()
+  const after = JSON.parse(await queries.readForAi(group, { view: 'choices', id: saved.id }))
+  assert.equal(after.game, undefined)
+})
+
 it('renders stored short-form Wei rewards with their target and cause', async () => {
   const { store, queries } = await fixture()
   const snapshot = input()

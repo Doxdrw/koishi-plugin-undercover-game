@@ -61,6 +61,8 @@ npm install koishi-plugin-undercover-game
 | `history.winrateMinimumGames` | 胜率榜最低参赛局数，默认 5；个人查询不设门槛 |
 | `reportImages.enabled` | 总结／复盘和选词公布优先发送图片，默认开启；Puppeteer 服务可选 |
 | `aiTools.enabled` | 提供 ChatLuna 只读规则与当前群状态工具，默认关闭 |
+| `aiTools.history.enabled` | 允许 ChatLuna 按需读取本群已归档的完成局，独立开关，默认关闭 |
+| `aiTools.history.pageSize` / `aiTools.history.maxChars` | AI 历史的每页条数和单次返回字符上限，默认 5 条／2,500 字符 |
 
 时限、通知、白板、积分分值和卡面限制也可以在配置页面调整；实际数值以当前配置为准。
 

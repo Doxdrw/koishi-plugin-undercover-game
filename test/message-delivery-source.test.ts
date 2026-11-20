@@ -4,7 +4,7 @@ import { resolve } from "node:path"
 import { describe, it } from "node:test"
 import ts from "typescript"
 
-const DELIVERY_METHODS = new Set(["state", "bestEffort", "required"])
+const DELIVERY_METHODS = new Set(["state", "bestEffort", "required", "outcome"])
 const RAW_SEND_METHODS = new Set(["sendMessage", "sendPrivateMessage"])
 
 interface DeliveryViolation {
@@ -88,6 +88,7 @@ describe("message delivery source gate", () => {
       function returned() { return session.bot.sendMessage('g', 'x') }
       function caught() { void session.bot.sendPrivateMessage('u', 'x').catch(report) }
       function wrapped() { messages.bestEffort('label', () => session.bot.sendMessage('g', 'x')) }
+      function observed() { return messages.outcome('label', () => session.bot.sendMessage('g', 'x')) }
     `
     assert.deepEqual(inspectSource("safe.ts", sample), [])
   })

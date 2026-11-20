@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { it } from 'node:test'
 import { createRuleCatalog } from '../src/game/rule-catalog'
 import { projectPublicGameState, PublicGameTimelineStore, publicMessageText } from '../src/game/public-game-state'
-import { installChatLunaGameTools } from '../src/game/chatluna-game-tools'
+import { installChatLunaGameTools, installChatLunaHistoryTool } from '../src/game/chatluna-game-tools'
 
 const guide = readFileSync(new URL('../GAME_GUIDE.md', import.meta.url), 'utf8')
 const session = { platform: 'qq', selfId: 'bot', guildId: 'group', userId: 'user', isDirect: false }
@@ -72,6 +72,20 @@ it('projects a bounded public timeline without media markup or hidden fields', (
 
 it('redacts public face and media nodes to safe placeholders', () => {
   assert.equal(publicMessageText('公开内容<face id="123"/><img src="data:image/png;base64,secret"/>'), '公开内容[表情][媒体]')
+})
+
+it('distinguishes uncertain notice receipts and never updates the next game’s recycled event number', () => {
+  const store = new PublicGameTimelineStore()
+  const old = store.record({ round: 1, phase: 'voting', overtime: false, text: '旧局公告', delivery: '发送未确认' })
+  assert.equal(store.snapshot()[0].delivery, '发送未确认')
+  store.clear()
+  const current = store.record({ round: 1, phase: 'speech', overtime: false, text: '新局公告', delivery: '发送未确认' })
+  store.confirm(old)
+  assert.equal(store.snapshot()[0].delivery, '发送未确认')
+  store.confirm(current)
+  assert.equal(store.snapshot()[0].delivery, '已获接口回执')
+  store.record({ round: 1, phase: 'speech', overtime: false, text: '玩家公开发言' })
+  assert.equal(store.snapshot()[1].delivery, undefined)
 })
 
 function host(filter: (session: any) => boolean = () => true) {
@@ -160,6 +174,32 @@ it('reports public state read failures without exposing internal errors', async 
   const result = await h.tools.get('undercover_status').createTool({}).func({}, undefined, { configurable: { session } })
   assert.match(result, /读取失败/)
   assert.doesNotMatch(result, /secret-canary/)
+})
+
+it('registers opt-in history separately and uses only the real group invocation', async () => {
+  const hostApp = host(s => s.platform === 'qq')
+  const config = { configurable: { session } }
+  const seen: unknown[] = []
+  const read = async (caller, input) => { seen.push([caller.guildId, input]); return 'history result' }
+  installChatLunaHistoryTool(hostApp.ctx as any, false, read, hostApp.load as any)
+  assert.equal(hostApp.tools.size, 0)
+  installChatLunaGameTools(hostApp.ctx as any, true, () => undefined, hostApp.load as any)
+  installChatLunaHistoryTool(hostApp.ctx as any, true, read, hostApp.load as any)
+  const definition = hostApp.tools.get('undercover_history')
+  const tool = definition.createTool({})
+  assert.equal(definition.authorization(session), true)
+  assert.equal(definition.authorization({ ...session, isDirect: true }), false)
+  assert.match(await tool.func({ guildId: 'other' }, undefined, config), /参数/)
+  assert.match(await tool.func({ view: 'phase', sequence: -1 }, undefined, config), /参数/)
+  assert.match(await tool.func({}, undefined, { configurable: { session: { ...session, isDirect: true } } }), /仅可在当前群/)
+  assert.equal(await tool.func({ id: 2, view: 'phases' }, undefined, config), 'history result')
+  assert.deepEqual(seen, [['group', { id: 2, view: 'phases' }]])
+  hostApp.children[1].dispose()
+  assert.deepEqual([...hostApp.tools.keys()], ['undercover_rules', 'undercover_status'])
+  hostApp.tools.set('undercover_history', { id: 'another-provider' })
+  installChatLunaHistoryTool(hostApp.ctx as any, true, read, hostApp.load as any)
+  assert.equal(hostApp.tools.get('undercover_history').id, 'another-provider')
+  assert.equal(hostApp.warnings.length, 1)
 })
 
 it('rolls back partial registration and contains cleanup errors', () => {

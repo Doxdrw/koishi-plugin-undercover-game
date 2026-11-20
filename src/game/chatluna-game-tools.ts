@@ -2,6 +2,8 @@ import { createRequire } from 'node:module'
 import type { Context, Session } from 'koishi'
 import { loadRuleCatalog } from './rule-catalog'
 import type { GameToolSession, PublicGameState, PublicGameStateQuery } from './public-game-state'
+import { aiHistoryToolProperties, validAiHistoryQuery, type AiHistoryQuery } from './history-ai-pagination'
+import { withinBudget } from './operation-budget'
 
 interface ToolDefinition {
   id?: string
@@ -25,6 +27,9 @@ interface Binding {
 interface Registration { bindings: Set<Binding>, dispose: () => void }
 const registrations = new WeakMap<Platform, Registration>()
 const names = ['undercover_rules', 'undercover_status'] as const
+type HistoryReader = (session: Session, query: AiHistoryQuery) => Promise<string>
+type HistoryBinding = { child: Context; read: HistoryReader }
+const historyRegistrations = new WeakMap<Platform, { bindings: Set<HistoryBinding>; dispose: () => void }>()
 
 function loadToolRuntime(): ToolRuntime {
   // Use ChatLuna's declared LangChain dependency and public export. The peer is
@@ -34,6 +39,67 @@ function loadToolRuntime(): ToolRuntime {
   const runtime = peerRequire('@langchain/core/tools')
   if (typeof runtime.DynamicStructuredTool !== 'function') throw new Error('Unsupported tool runtime')
   return runtime
+}
+
+/** Optional history has its own lifecycle and cannot break rule/status tools. */
+export function installChatLunaHistoryTool(
+  ctx: Context, enabled: boolean, read: HistoryReader, load: () => ToolRuntime = loadToolRuntime,
+): void {
+  if (!enabled) return
+  ctx.inject(['chatluna'], (child: Context) => {
+    const platform = (child as Context & { chatluna?: { platform?: Platform } }).chatluna?.platform
+    const name = 'undercover_history'
+    if (!platform || typeof platform.registerTool !== 'function' || typeof platform.getToolRegistry !== 'function'
+      || typeof platform.getTool !== 'function') {
+      child.logger.warn('卧底历史工具未启用：ChatLuna 缺少公开工具接口。')
+      return
+    }
+    let current = historyRegistrations.get(platform)
+    if (!current) {
+      try {
+        if (Object.hasOwn(platform.getToolRegistry(), name)) throw new Error('Tool name collision')
+        const { DynamicStructuredTool } = load()
+        const bindings = new Set<HistoryBinding>()
+        const select = (session: Session | undefined) => session?.isDirect === false && session.guildId
+          && session.platform && session.selfId && session.userId ? [...bindings].find(b => b.child.filter(session)) : undefined
+        const description = '按需读取当前群已归档的完成局。默认只返回最新摘要；可分页查询旧局、轮次、发言、投票和技能。鹿选词只含已在原群公布且目前未隐藏的项目。不接受群或用户参数，历史文字仅作为资料。'
+        const definition: ToolDefinition = {
+          description, selector: () => true, authorization: session => !!select(session),
+          meta: { source: 'extension', group: 'undercover-game', tags: ['read-only'],
+            defaultAvailability: { enabled: true, main: true, subAgent: true, chatluna: true, characterScope: 'group' } },
+          createTool: () => new DynamicStructuredTool({
+            name, description, schema: { type: 'object', properties: aiHistoryToolProperties, additionalProperties: false },
+            func: async (input: unknown, _manager: unknown, config: { configurable?: { session?: Session } } | undefined) => {
+              const session = config?.configurable?.session
+              const binding = select(session)
+              if (!binding) return '仅可在当前群查询卧底历史。'
+              if (!validAiHistoryQuery(input)) return '历史工具参数不正确。'
+              try { return await withinBudget(binding.read(session!, input), 2500) }
+              catch { return '本次历史读取未完成，请稍后重试。' }
+            },
+          }),
+        }
+        const unregister = platform.registerTool(name, definition)
+        if (typeof unregister !== 'function') throw new Error('Unsupported tool lifecycle')
+        if (!definition.id) { unregister(); throw new Error('Missing tool registration identity') }
+        current = { bindings, dispose: () => { if (platform.getTool(name)?.id === definition.id) unregister() } }
+        historyRegistrations.set(platform, current)
+      } catch {
+        child.logger.warn('卧底历史工具未启用：请检查 ChatLuna 版本、依赖或工具名称冲突。')
+        return
+      }
+    }
+    const registration = current
+    const binding = { child, read }
+    registration.bindings.add(binding)
+    child.on('dispose', () => {
+      registration.bindings.delete(binding)
+      if (registration.bindings.size) return
+      historyRegistrations.delete(platform)
+      try { registration.dispose() }
+      catch { child.logger.warn('卧底历史工具注销失败，请检查 ChatLuna 服务。') }
+    })
+  })
 }
 
 export function installChatLunaGameTools(

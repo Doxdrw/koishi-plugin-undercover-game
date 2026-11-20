@@ -1,12 +1,14 @@
 import { GameUserError } from './errors'
+import { randomUUID } from 'node:crypto'
+import { deerChoiceDigest, readDeerPublications, type DeerPublicationMark, type DeerPublicationMetadata } from './history-deer-publication'
 import { projectHistoryParticipants } from './history-participants'
 import { $, type Context } from 'koishi'
 import type { HistorySnapshot, HistoryIdentity } from './history-snapshot'
 import type { HistoryViewer } from './history-query'
 import type { ReportTable } from './report-images'
 
-export interface DeerPublication { text: string; table?: ReportTable }
-type Header = Omit<HistorySnapshot, 'phases' | 'deerChoices'>
+export interface DeerPublication { text: string; table?: ReportTable; confirm?: () => Promise<void> }
+type Header = Omit<HistorySnapshot, 'phases' | 'deerChoices'> & DeerPublicationMetadata
 
 /** Staged original-group disclosure boundary; no dependence on the active game. */
 export class DeerHistoryControls {
@@ -62,6 +64,10 @@ export class DeerHistoryControls {
       if (operation === 'reveal' && !isHost && !own.length) throw new GameUserError('只有该局主持人或参赛玩家可以公布选人。')
       if (operation === 'hide') {
         for (const tenureId of own) await db.set('undercover_history_choice', { gameId: row.gameId, tenureId }, { hidden: true })
+        if (header.deerPublications) {
+          header.deerPublications = readDeerPublications(header).filter(mark => !own.includes(mark.tenureId))
+          await db.set('undercover_history_game', { gameId: row.gameId }, { payload: JSON.stringify(header) })
+        }
         return { text: `已隐藏对局#${row.id}中你的选人；仅影响主持人之后的公布，不能撤回已发送内容。` }
       }
       // Host publication never unhides anyone; participant self-publication does.
@@ -71,13 +77,15 @@ export class DeerHistoryControls {
       const selected = new Map(choices.map(c => [c.tenureId, c]))
       const lines = []
       const tableRows: string[][] = []
+      const shown = new Map<string, string>()
       const roster = await projectHistoryParticipants(header.participants, this.canonical)
       for (const [isFormer, rows] of [[false, roster.current], [true, roster.former]] as const) {
         const section: string[] = []
         for (const p of rows) {
           // Missing/hidden rows are not listed or named in the response.
           const choice = selected.get(p.tenureId)
-          if (!choice) continue
+          if (!choice || p.identity.erased) continue
+          shown.set(p.tenureId, deerChoiceDigest(choice))
           const camp = p.initialCamp === 'white' ? '白板' : p.initialCamp === 'undercover' ? '卧底' : '好人'
           const rule = p.initialCamp === 'white' ? '仅易混' : p.initialCamp === 'undercover' ? header.topics!.undercover : header.topics!.good
           section.push(`${p.seat}号 ${p.identity.nickname}${p.replacedTenureId ? '（补位）' : ''}｜${camp}｜规则：${rule}｜选人：${p.initialCamp === 'white' ? '无需选人' : choice.choice ?? '未通过'}`)
@@ -85,10 +93,50 @@ export class DeerHistoryControls {
         }
         if (section.length) lines.push(...(isFormer ? ['被替换的玩家：'] : []), ...section)
       }
+      // Only acknowledge rows rendered in this particular publication. A
+      // concurrent hide removes the generation, invalidating old receipts.
+      let confirm: DeerPublication['confirm']
+      if (row.disposition === 'completed' && shown.size) {
+        const marks = new Map(readDeerPublications(header).map(mark => [mark.tenureId, mark]))
+        const expected: DeerPublicationMark[] = []
+        for (const [tenureId, digest] of shown) {
+          const currentMark = marks.get(tenureId)
+          if (currentMark?.digest === digest && currentMark.confirmed) continue
+          const mark = currentMark?.digest === digest ? currentMark : { tenureId, digest, confirmed: false, version: randomUUID() }
+          marks.set(tenureId, mark)
+          expected.push(mark)
+        }
+        if (expected.length) {
+          header.deerPublications = [...marks.values()]
+          await db.set('undercover_history_game', { gameId: row.gameId }, { payload: JSON.stringify(header) })
+          confirm = () => this.confirmPublication(copy, row.id, row.gameId, expected)
+        }
+      }
       return { text: lines.length ? `鹿模式选人公布 #${row.id}${row.disposition !== 'completed' ? '（中止局）' : ''}，易混：${header.topics!.publicText}\n` + lines.join('\n')
         : `对局#${row.id}当前没有可公布的选人。`,
+        confirm,
         ...(lines.length ? { table: { caption: `对局#${row.id}${row.disposition !== 'completed' ? '（中止局）' : ''}，易混：${header.topics!.publicText}`, headers: ['玩家', '身份', '选词规则', '选词'], rows: tableRows } } : {}) }
       })
     })
+  }
+  private confirmPublication(viewer: HistoryViewer, id: number, gameId: string, expected: readonly DeerPublicationMark[]): Promise<void> {
+    return this.serial(() => this.database.transact(async db => {
+      const scope = this.scope(viewer)
+      const [row] = await db.get('undercover_history_game', { ...scope, id, gameId, disposition: 'completed' })
+      if (!row) return
+      const header = JSON.parse(row.payload) as Header
+      const marks = readDeerPublications(header)
+      const selected = new Map((await db.get('undercover_history_choice', { gameId, hidden: false,
+        tenureId: { $in: expected.map(mark => mark.tenureId) } })).map(choice => [choice.tenureId, choice]))
+      let changed = false
+      for (const mark of marks) {
+        if (mark.confirmed || !expected.some(item => item.tenureId === mark.tenureId && item.version === mark.version)) continue
+        const choice = selected.get(mark.tenureId)
+        if (!choice || deerChoiceDigest(choice) !== mark.digest
+          || !header.participants.some(p => p.tenureId === mark.tenureId && !p.identity.erased)) continue
+        mark.confirmed = true; changed = true
+      }
+      if (changed) await db.set('undercover_history_game', { gameId }, { payload: JSON.stringify(header) })
+    }))
   }
 }
