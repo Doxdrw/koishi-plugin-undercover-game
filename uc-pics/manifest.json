@@ -10,7 +10,7 @@
       "heroKey": "zhang-xian-zhong",
       "heroName": "张献忠",
       "fileName": "张献忠卡面.png",
-      "sha256": "b1589d2afd751e8814b4c09a52575bf65200edcd48bf92e7280266f1c1679f01"
+      "sha256": "71aa2d8c06cf330030b63510888ea430da1123b0f8fd0cdc033eb24498c71c46"
     },
     {
       "heroId": 1,
@@ -24,7 +24,7 @@
       "heroKey": "zhu-you-jian",
       "heroName": "朱由检",
       "fileName": "朱由检卡面.png",
-      "sha256": "f8faf45bf39df45b1bc69756282ca57da3a18c93f04b07139b00de078b90d721"
+      "sha256": "c6c0cedd1a2b1208aef17320d7a17a52667793beebf5e190e11ab2b791a5187d"
     },
     {
       "heroId": 3,
@@ -66,7 +66,7 @@
       "heroKey": "mao-wen-long",
       "heroName": "毛文龙",
       "fileName": "毛文龙卡面.png",
-      "sha256": "91bd7e5b229738bbcb55f4079d5233de9c2c7064930b33d3875d67f2157b9ab8"
+      "sha256": "d0d38a20164c401fb4cb97f3393e3e26b69aa5c4fbab77acf83763830c93ce11"
     },
     {
       "heroId": 9,
