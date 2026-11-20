@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -2566,6 +2567,9 @@ describe('Report images', { concurrency: false }, () => {
       await submitAndApproveDeerSeat(game, 2, '关羽')
       await game.sendGroup('host', '停止卧底')
       await game.sendGroup('host', '选人记录')
+      const [stored] = await game.app.database.get('undercover_history_game', { id: 1 })
+      assert.equal(JSON.parse(stored.payload).ruleVersion,
+        JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version)
       await game.sendGroup('alice', '隐藏选人 1')
       await game.sendGroup('host', '公布选人 1')
       assert.match(browser.html.join('\n'), /关羽/)
@@ -2577,6 +2581,37 @@ describe('Report images', { concurrency: false }, () => {
       assert.match(latestGroupOutput(game), /关羽/)
       assert.doesNotMatch(latestGroupOutput(game), /刘备/)
     }, { history: { enabled: true, sandbox: true, retentionDays: 0 } }, { configureApp: app => app.provide('puppeteer', browser.browser, true) })
+  })
+
+  for (const archived of [true, false]) it(`discards a rendered deer publication if its visibility changed in flight (archive=${archived})`, async () => {
+    const { browser, html } = browserFixture()
+    const createPage = browser.page
+    let entered!: () => void, release!: () => void
+    const rendering = new Promise<void>(resolve => { entered = resolve })
+    const resume = new Promise<void>(resolve => { release = resolve })
+    browser.page = async () => {
+      const page = await createPage()
+      const screenshot = page.screenshot
+      page.screenshot = async options => { entered(); await resume; return screenshot(options) }
+      return page
+    }
+    await withGame(async game => {
+      await startCustomDeerGame(game)
+      await submitAndApproveDeerSeat(game, 1, '刘备')
+      await submitAndApproveDeerSeat(game, 2, '关羽')
+      await game.sendGroup('host', '停止卧底')
+      if (archived) await game.sendGroup('host', '选人记录')
+      const before = game.transcript.length
+      const publish = game.sendGroup('host', archived ? '公布选人 1' : '公布选人')
+      try {
+        await rendering
+        assert.match(html.join('\n'), /刘备/, 'the first image already includes the old choice')
+        await game.sendGroup('alice', archived ? '隐藏选人 1' : '隐藏选人')
+      } finally { release(); await publish }
+      const sent = game.transcript.slice(before).filter(row => row.direction === 'out' && row.scope === 'group').map(row => row.content).join('\n')
+      assert.doesNotMatch(sent, /data:image\/png|刘备/, 'stale image and stale text must not be sent')
+      assert.match(sent, /鹿模式选人公布[\s\S]*关羽/, 'the current visible choices are published as text')
+    }, { history: { enabled: archived, sandbox: archived, retentionDays: 0 } }, { configureApp: app => app.provide('puppeteer', browser, true) })
   })
 })
 
@@ -2964,6 +2999,29 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       assert.match(await getChoices(), /Alice：冷静地看/)
       await game.sendGroup('alice', '隐藏选人 ' + saved.id)
       assert.doesNotMatch(await getChoices(), /冷静地看/)
+      const before = game.transcript.length
+      game.bot.sendMessage = async (channel, content, referrer, options) =>
+        String(content).includes('data:image/png;base64,') ? [] : send(channel, content, referrer, options)
+      await game.sendGroup('alice', '公布选人 ' + saved.id)
+      assert.match(latestGroupOutput(game), /选人公布发送未确认/)
+      assert.ok(!game.transcript.slice(before).some(row => row.direction === 'out' && row.content.includes('冷静地看')),
+        'a missing receipt must not cause duplicate text disclosure')
+      assert.doesNotMatch(await getChoices(), /冷静地看/, 'no receipt is not proof of publication')
+      let entered!: () => void, receipt!: (ids: string[]) => void
+      const sending = new Promise<void>(resolve => { entered = resolve })
+      game.bot.sendMessage = async (channel, content, referrer, options) => {
+        if (!String(content).includes('data:image/png;base64,')) return send(channel, content, referrer, options)
+        entered()
+        return new Promise(resolve => { receipt = resolve })
+      }
+      const unconfirmed = game.sendGroup('alice', '公布选人 ' + saved.id)
+      await sending
+      await advanceUntilSettled(unconfirmed, 10)
+      assert.match(latestGroupOutput(game), /选人公布发送未确认/)
+      receipt(['delayed-test-receipt'])
+      await new Promise<void>(resolve => setImmediate(resolve))
+      assert.doesNotMatch(await getChoices(), /冷静地看/, 'a receipt after the delivery budget cannot publish to AI')
+      game.bot.sendMessage = send
       await game.sendGroup('alice', '公布选人 ' + saved.id)
       assert.match(latestGroupOutput(game), /data:image\/png;base64,/)
       assert.match(await getChoices(), /Alice：冷静地看/)
@@ -2972,7 +3030,7 @@ describe("isolated multi-user game scenarios", { concurrency: false }, () => {
       await game.sendGroup('alice', '公布选人 ' + saved.id)
       assert.match(latestGroupOutput(game), /鹿模式选人公布[\s\S]*冷静地看/)
       assert.match(await getChoices(), /Alice：冷静地看/)
-    }, {}, { configureApp: app => app.provide('puppeteer', browser.browser, true) })
+    }, { reportImages: { enabled: true, timeout: 1 } }, { configureApp: app => app.provide('puppeteer', browser.browser, true) })
   })
 
   it('finishes, archives, and clears a game when all final group notices fail', async () => {

@@ -5,9 +5,15 @@ import { projectHistoryParticipants } from './history-participants'
 import { $, type Context } from 'koishi'
 import type { HistorySnapshot, HistoryIdentity } from './history-snapshot'
 import type { HistoryViewer } from './history-query'
-import type { ReportTable } from './report-images'
+import type { ReportDispatch, ReportTable } from './report-images'
 
-export interface DeerPublication { text: string; table?: ReportTable; confirm?: () => Promise<void> }
+export interface DeerPublication {
+  text: string
+  table?: ReportTable
+  dispatch?: ReportDispatch
+  refresh?: () => Promise<DeerPublication>
+  confirm?: () => Promise<void>
+}
 type Header = Omit<HistorySnapshot, 'phases' | 'deerChoices'> & DeerPublicationMetadata
 
 /** Staged original-group disclosure boundary; no dependence on the active game. */
@@ -25,11 +31,13 @@ export class DeerHistoryControls {
     if (viewer.platform === identity.platform && viewer.userId === identity.userId) return true
     return current !== undefined && identity.personId !== undefined && await this.canonical(identity.personId) === current
   }
-  private async find(database: Context['database'], viewer: HistoryViewer, id?: number) {
+  private async find(database: Context['database'], viewer: HistoryViewer, id?: number, gameId?: string) {
     const scope = this.scope(viewer)
     if (id !== undefined && (!Number.isSafeInteger(id) || id < 1)) throw new GameUserError('对局编号须为正整数。')
     const row = (await database.get('undercover_history_game', { ...scope,
-      disposition: { $in: ['completed', 'aborted', 'deer-aborted'] }, ...(id === undefined ? {} : { id }) }, { sort: { endedAt: 'desc', id: 'desc' }, limit: 1 }))[0]
+      disposition: { $in: ['completed', 'aborted', 'deer-aborted'] },
+      ...(gameId === undefined ? {} : { gameId }), ...(id === undefined ? {} : { id }) },
+    { sort: { endedAt: 'desc', id: 'desc' }, limit: 1 }))[0]
     if (!row) throw new GameUserError('本群没有对应的已结束鹿模式选人记录。')
     const header = JSON.parse(row.payload) as Header
     if (!header.topics || header.mode !== 'deer') throw new GameUserError('鹿模式题面记录不完整。')
@@ -50,30 +58,34 @@ export class DeerHistoryControls {
     return (await this.changeView(viewer, operation, id)).text
   }
   changeView(viewer: HistoryViewer, operation: 'hide' | 'reveal', id?: number): Promise<DeerPublication> {
-    const copy = { ...viewer }
-    return this.serial(async () => {
+    return this.prepareView({ ...viewer }, operation, id)
+  }
+  private prepareView(copy: HistoryViewer, operation: 'hide' | 'reveal' | 'refresh', id?: number, gameId?: string): Promise<DeerPublication> {
+    return this.serial(() => {
       this.scope(copy)
       if (id !== undefined && (!Number.isSafeInteger(id) || id < 1)) throw new GameUserError('对局编号须为正整数。')
       return this.database.transact(async db => {
-      const { row, header } = await this.find(db, copy, id)
+      const { row, header } = await this.find(db, copy, id, gameId)
       const current = await this.currentPerson(copy.platform, copy.userId)
       const isHost = await this.matches(copy, header.host, current)
       const own = []
       for (const p of header.participants) if (await this.matches(copy, p.identity, current)) own.push(p.tenureId)
       if (operation === 'hide' && !own.length) throw new GameUserError('只有该局实际参赛玩家可以隐藏自己的选人。')
-      if (operation === 'reveal' && !isHost && !own.length) throw new GameUserError('只有该局主持人或参赛玩家可以公布选人。')
+      if (operation !== 'hide' && !isHost && !own.length) throw new GameUserError('只有该局主持人或参赛玩家可以公布选人。')
       if (operation === 'hide') {
         for (const tenureId of own) await db.set('undercover_history_choice', { gameId: row.gameId, tenureId }, { hidden: true })
         if (header.deerPublications) {
           header.deerPublications = readDeerPublications(header).filter(mark => !own.includes(mark.tenureId))
           await db.set('undercover_history_game', { gameId: row.gameId }, { payload: JSON.stringify(header) })
         }
-        return { text: `已隐藏对局#${row.id}中你的选人；仅影响主持人之后的公布，不能撤回已发送内容。` }
+        return { text: `已隐藏对局#${row.id}中你的选人；之后的公布不会包含它，不能撤回已发送内容。` }
       }
-      // Host publication never unhides anyone; participant self-publication does.
-      if (!isHost) for (const tenureId of own) await db.set('undercover_history_choice', { gameId: row.gameId, tenureId }, { hidden: false })
-      const choices = await db.get('undercover_history_choice', { gameId: row.gameId,
-        ...(isHost ? { hidden: false } : { tenureId: { $in: own } }) })
+      // Only a new, explicit participant publication unhides their choices.
+      if (!isHost && operation === 'reveal') {
+        for (const tenureId of own) await db.set('undercover_history_choice', { gameId: row.gameId, tenureId }, { hidden: false })
+      }
+      const choices = await db.get('undercover_history_choice', { gameId: row.gameId, hidden: false,
+        ...(isHost ? {} : { tenureId: { $in: own } }) })
       const selected = new Map(choices.map(c => [c.tenureId, c]))
       const lines = []
       const tableRows: string[][] = []
@@ -112,12 +124,32 @@ export class DeerHistoryControls {
           confirm = () => this.confirmPublication(copy, row.id, row.gameId, expected)
         }
       }
-      return { text: lines.length ? `鹿模式选人公布 #${row.id}${row.disposition !== 'completed' ? '（中止局）' : ''}，易混：${header.topics!.publicText}\n` + lines.join('\n')
-        : `对局#${row.id}当前没有可公布的选人。`,
+      if (!lines.length) return { text: `对局#${row.id}当前没有可公布的选人。` }
+      return {
+        text: `鹿模式选人公布 #${row.id}${row.disposition !== 'completed' ? '（中止局）' : ''}，易混：${header.topics!.publicText}\n` + lines.join('\n'),
         confirm,
-        ...(lines.length ? { table: { caption: `对局#${row.id}${row.disposition !== 'completed' ? '（中止局）' : ''}，易混：${header.topics!.publicText}`, headers: ['玩家', '身份', '选词规则', '选词'], rows: tableRows } } : {}) }
+        table: { caption: `对局#${row.id}${row.disposition !== 'completed' ? '（中止局）' : ''}，易混：${header.topics!.publicText}`, headers: ['玩家', '身份', '选词规则', '选词'], rows: tableRows },
+        dispatch: this.publicationDispatch(copy, row.id, row.gameId, shown, JSON.stringify(header.topics)),
+        refresh: () => this.prepareView(copy, 'refresh', row.id, row.gameId),
+      }
       })
     })
+  }
+  private publicationDispatch(viewer: HistoryViewer, id: number, gameId: string,
+    shown: ReadonlyMap<string, string>, topics: string): ReportDispatch {
+    return handoff => this.serial(() => this.database.transact(async db => {
+      const [row] = await db.get('undercover_history_game', { ...this.scope(viewer), id, gameId })
+      if (!row) return
+      const header = JSON.parse(row.payload) as Header
+      if (JSON.stringify(header.topics) !== topics) return
+      const selected = await db.get('undercover_history_choice', { gameId, hidden: false, tenureId: { $in: [...shown.keys()] } })
+      const visible = new Set(header.participants.filter(p => !p.identity.erased).map(p => p.tenureId))
+      if (selected.length !== shown.size || selected.some(choice => !visible.has(choice.tenureId)
+        || deerChoiceDigest(choice) !== shown.get(choice.tenureId))) return
+      // Start the send at the same boundary as the visibility read; wait for
+      // delivery outside the serialized history operation.
+      handoff()
+    }))
   }
   private confirmPublication(viewer: HistoryViewer, id: number, gameId: string, expected: readonly DeerPublicationMark[]): Promise<void> {
     return this.serial(() => this.database.transact(async db => {

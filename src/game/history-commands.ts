@@ -4,13 +4,19 @@ import { GameUserError, safeErrorSummary } from './errors'
 import { HistoryQueries, historyTextPages, historyContentPages, type HistoryViewer } from './history-query'
 import type { DeerHistoryControls, DeerPublication } from './history-deer'
 import type { HistoryStore } from './history-store'
-import type { ReportImages } from './report-images'
-import { hasMessageReceipt } from './message-delivery'
+import { deliverReport, type ReportImages } from './report-images'
 import { withinBudget } from './operation-budget'
 
 const viewer = (s: Session): HistoryViewer => ({ platform: s.platform, selfId: s.selfId, userId: s.userId,
   guildId: s.guildId, isDirect: s.isDirect })
 const scopeKey = (s: Session) => JSON.stringify([s.platform, s.selfId, s.channelId, s.userId])
+// Session.send catches adapter errors and turns them into empty receipts. Keep
+// its route and send hooks, but let report delivery distinguish the outcomes.
+const reportSender = (session: Session): Pick<Session, 'send'> => ({
+  send(content) {
+    return session.bot.sendMessage(session.channelId, h.normalize(content), session.event.referrer, { session })
+  },
+})
 const date = (value?: string) => {
   if (value === undefined) return undefined
   if (!/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2}))?$/.test(value)) throw new GameUserError('日期请用 YYYY-MM-DD 或带时区的 ISO 时间。')
@@ -32,6 +38,7 @@ export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, d
       return h.text(error instanceof GameUserError ? error.message : '历史操作未完成，请管理员检查日志。').toString()
     }
   }
+  const reportUnconfirmed = '本次复盘发送未确认，未自动重发；若未收到，可再次查询。'
   ctx.command('历史对局 [page:posint]', '查询本群已完成对局；--aborted 查看进入第一阶段后中止的对局；私聊仅本人参与对局')
     .option('keyword', '-k <keyword:string> 题面、昵称或公开发言关键词')
     .option('mode', '-m <mode:string> classic/deer/turtle')
@@ -83,34 +90,36 @@ export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, d
       const structured = historyContentPages(h('template', {}, h.text(result.introduction + '\n\n'),
         ...result.phases.flatMap(p => [p.content ?? h.text(p.text), h.text('\n\n')])))
       if (page > structured.length) return `当前只有${structured.length}页。`
-      if (!options.text && await images?.send(session, `对局 #${result.id} 复盘`, structured[page - 1])) {
+      const sender = reportSender(session)
+      const image = !options.text && await images?.send(sender, `对局 #${result.id} 复盘`, structured[page - 1])
+      if (image === 'sent') {
         return page < structured.length ? `下一页：复盘 ${result.id}${options.round ? ' --round ' + options.round : ''}${options.phase ? ' --phase ' + options.phase : ''} --page ${page + 1}` : undefined
       }
-      try {
-        await sendHistoryMessage(structured[page - 1])
+      if (image === 'unconfirmed') return reportUnconfirmed
+      const sendFragment = (content: h.Fragment) => deliverReport(sender, content, 4000,
+        error => ctx.logger.warn('复盘消息投递未完成：%s', safeErrorSummary(error)))
+      const delivery = await sendFragment(structured[page - 1])
+      if (delivery === 'sent') {
         return structured.length > page ? `下一页：复盘 ${result.id}`
           + (options.round ? ' --round ' + options.round : '')
           + (options.phase ? ' --phase ' + options.phase : '')
           + ` --page ${page + 1}` : undefined
       }
-      catch (error) {
-        ctx.logger.warn('复盘媒体消息发送失败，已回退为文本：%s', safeErrorSummary(error))
-        if (page > pages.length) return `当前只有${pages.length}页。`
-        const fallback = pages[page - 1] + (page < pages.length ? `\n后续：复盘 ${result.id}`
-          + (options.round ? ' --round ' + options.round : '')
-          + (options.phase ? ' --phase ' + options.phase : '')
-          + ` --page ${page + 1}。` : '')
-        try { await sendHistoryMessage(h.text(fallback)); return undefined }
-        catch (fallbackError) {
-          ctx.logger.warn('复盘文本回退发送失败：%s', safeErrorSummary(fallbackError))
-          return fallback
-        }
-      }
+      if (delivery === 'unconfirmed') return reportUnconfirmed
+      if (page > pages.length) return `当前只有${pages.length}页。`
+      const fallback = pages[page - 1] + (page < pages.length ? `\n后续：复盘 ${result.id}`
+        + (options.round ? ' --round ' + options.round : '')
+        + (options.phase ? ' --phase ' + options.phase : '')
+        + ` --page ${page + 1}。` : '')
+      const text = await sendFragment(h.text(fallback))
+      return text === 'sent' ? undefined : text === 'unconfirmed' ? reportUnconfirmed : fallback
     }
     if (page > pages.length) return `当前只有${pages.length}页。`
-    if (!options.text && await images?.send(session, `对局 #${result.id} 复盘`, h.text(pages[page - 1]))) {
+    const image = !options.text && await images?.send(reportSender(session), `对局 #${result.id} 复盘`, h.text(pages[page - 1]))
+    if (image === 'sent') {
       return page < pages.length ? `下一页：复盘 ${result.id}${options.round ? ' --round ' + options.round : ''}${options.phase ? ' --phase ' + options.phase : ''} --page ${page + 1}` : undefined
     }
+    if (image === 'unconfirmed') return reportUnconfirmed
     return pages[page - 1] + `\n第${page}/${pages.length}页` + (page < pages.length ? `；下一页：复盘 ${result.id}${options.round ? ' --round ' + options.round : ''}${options.phase ? ' --phase ' + options.phase : ''} --page ${page + 1}` : '')
   }
   for (const name of ['复盘', '回放']) {
@@ -134,30 +143,28 @@ export function registerHistoryCommands(ctx: Context, queries: HistoryQueries, d
       .option('text', '-t 本次仅使用文字，不渲染图片')
       .action(({ session, options }, id) => safe(async () => {
         const ephemeral = id === undefined ? await ephemeralDeer?.(session, op) : undefined
-        const view = typeof ephemeral === 'string' ? { text: ephemeral } : ephemeral
-          ?? (deer.changeView ? await deer.changeView(viewer(session), op, id) : { text: await deer.change(viewer(session), op, id) })
-        if (op === 'reveal' && view.text.startsWith('鹿模式选人公布')) {
-          const confirm = async () => {
-            if (!view.confirm) return
-            await withinBudget(view.confirm(), 2000).catch(error =>
-              ctx.logger.warn('鹿选词公布记录未确认：%s', safeErrorSummary(error)))
-          }
-          if (!options.text && await images?.send(session, '鹿模式选词公布', h.text(view.text), view.table)) {
-            await confirm()
-            return
-          }
-          if (view.confirm) {
-            // Explicit send supplies the receipt; a command return string
-            // is sent later by Koishi, outside this publication boundary.
-            try {
-              if (hasMessageReceipt(await withinBudget(session.send(h.text(view.text)), 4000))) await confirm()
-            } catch (error) {
-              ctx.logger.warn('鹿选词公布发送未确认：%s', safeErrorSummary(error))
-            }
-            return
-          }
+        let view = typeof ephemeral === 'string' ? { text: ephemeral } : ephemeral ?? await deer.changeView(viewer(session), op, id)
+        if (op !== 'reveal' || !view.dispatch) return view.text
+        const sender = reportSender(session)
+        const sendText = (publication: DeerPublication) => deliverReport(sender, h.text(publication.text), 4000,
+          error => ctx.logger.warn('鹿选词公布投递未完成：%s', safeErrorSummary(error)), publication.dispatch)
+        let outcome = options.text ? 'fallback'
+          : await images?.send(sender, '鹿模式选词公布', h.text(view.text), view.table, view.dispatch) ?? 'fallback'
+        if (outcome === 'fallback') outcome = await sendText(view)
+        if (outcome === 'stale' && view.refresh) {
+          // Rebuild only once, on the same game, without reversing any hide.
+          view = await withinBudget(view.refresh(), 2000)
+          if (!view.dispatch) return view.text
+          outcome = await sendText(view)
         }
-        return view.text
+        if (outcome === 'sent') {
+          if (view.confirm) await withinBudget(view.confirm(), 2000).catch(error =>
+            ctx.logger.warn('鹿选词公布记录未确认：%s', safeErrorSummary(error)))
+          return
+        }
+        if (outcome === 'unconfirmed') return '选人公布发送未确认，未自动重发；若未收到，可再次执行。'
+        if (outcome === 'stale') return '未能确认当前选词的可见范围，未公布，请重试。'
+        return '选人公布发送失败，请稍后重试。'
       }))
   ctx.command('历史清理 [id:posint]', 'authority 5：预览删除当前群指定对局', { authority: 5 }).userFields(['authority'])
     .action(({ session }, id) => safe(async () => {

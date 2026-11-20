@@ -474,11 +474,14 @@ export class HistoryQueries {
       ...(this.retentionDays > 0 ? { endedAt: { $gte: Date.now() - this.retentionDays * 86400000 } } : {}) }
     const { pageSize, maxChars } = aiHistoryLimits(options)
     const { view = 'overview', id, page = 1, section, sequence } = input
+    if (view !== 'list' && page > 1 && id === undefined) return error('继续翻页时，请传入上一页返回的对局编号（game.id）。')
     const limit = Math.min(pageSize, input.limit ?? pageSize)
     // The list/directory contain only short fixed-shape rows. A conservative
     // width bound keeps DB pages stable even at the smallest configured budget.
     const rowLimit = Math.min(limit, Math.max(1, Math.floor((maxChars - 240) / 145)))
     const sort = { endedAt: 'desc', id: 'desc' } as const
+    const archiveNote = (gameId?: string) => pending && pending.gameId !== gameId
+      ? { note: `最近结束的对局${pending.status}，返回的是最近已归档的对局。` } : {}
     const archivedGame = (row: HistoryGameRow, header: Header) => ({
       id: row.id, mode: header.mode, endedAt: row.endedAt,
       result: this.summary(row, header).result, reason: endingReasons[header.ending.reason],
@@ -489,7 +492,9 @@ export class HistoryQueries {
     }
     if (view === 'list') {
       const rows = await this.database.get('undercover_history_game', scope, { sort, limit: rowLimit + 1, offset: (page - 1) * rowLimit })
-      return boundedRows({ view }, rows.map(row => archivedGame(row, JSON.parse(row.payload))))
+      const note = page === 1 && pending && !rows.length ? { note: `最近结束的对局${pending.status}，暂无可读归档。` }
+        : page === 1 ? archiveNote(rows[0]?.gameId) : {}
+      return boundedRows({ view, ...note }, rows.map(row => archivedGame(row, JSON.parse(row.payload))))
     }
     const read = async (db: Context['database']) => {
       const [row] = await db.get('undercover_history_game', { ...scope, ...(id === undefined ? {} : { id }) }, { sort, limit: 1 })
@@ -497,11 +502,10 @@ export class HistoryQueries {
       const header = JSON.parse(row.payload) as Header
       if (header.ending.kind !== 'completed') return error('没有可访问的完成局记录。')
       const game = archivedGame(row, header)
-      const base = { view, game }
+      const base = { view, game, ...(id === undefined ? archiveNote(row.gameId) : {}) }
       const text = (lines: readonly string[], extra: object = {}) => aiHistoryTextPage({ ...base, ...extra }, lines, page, limit, maxChars)
       if (view === 'overview') {
-        if (!section) return JSON.stringify({ ...base, ...(id === undefined && pending && pending.gameId !== row.gameId
-          ? { note: `最近结束的对局${pending.status}，返回最近已归档对局。` } : {}) })
+        if (!section) return JSON.stringify(base)
         const { topicLines, playerLines, formerLines, awardLines, settlementNotes } = await this.overviewLines(header)
         return text(section === 'topics' ? topicLines : section === 'players'
           ? [`主持人：${header.host.nickname}`, ...playerLines, ...formerLines.map(line => `被替换的玩家：${line}`)]
@@ -517,7 +521,7 @@ export class HistoryQueries {
       }
       if (view === 'phase') {
         const [item] = await db.get('undercover_history_phase', { gameId: row.gameId, sequence })
-        if (!item) return error('本局没有该阶段。')
+        if (!item) return JSON.stringify({ ...base, message: '这场已归档的对局没有该阶段。' })
         const phase = JSON.parse(item.payload) as HistoryPhase
         const lines = this.phaseLines(header, phase)
         const speech = () => this.orderedSpeeches(header, phase).flatMap(entry => {

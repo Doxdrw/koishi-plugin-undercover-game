@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { it } from 'node:test'
 import { h } from 'koishi'
-import { ReportImages, reportHtml, reportImagePages, reportParts, reportTableHtml, type ReportBrowserPage } from '../src/game/report-images'
+import { deliverReport, ReportImages, reportHtml, reportImagePages, reportParts, reportTableHtml, type ReportBrowserPage } from '../src/game/report-images'
+import { withinBudget } from '../src/game/operation-budget'
 
 function fixture(fail?: 'render' | 'send' | 'size') {
   const html: string[] = [], messages: string[] = [], settings: unknown[] = []
@@ -44,7 +45,7 @@ it('paginates a tall table using measured layout without splitting cell boundari
   test.page.$ = async () => ({ boundingBox: async () => ({ x: 0, y: 0, width: 960,
     height: (current.match(/<td>/g) ?? []).length > 8 ? 2400 : 1000 }) })
   const rows = Array.from({ length: 5 }, (_, i) => [`${i + 1}号 Alice`, '好人', `规则${i}\n第二行｜仍是规则`, `选词${i}`])
-  assert.equal(await test.images.send(test.session, '选词', h.text('完整文字'), { caption: '易混：主题', headers: ['玩家', '身份', '规则', '选词'], rows }), true)
+  assert.equal(await test.images.send(test.session, '选词', h.text('完整文字'), { caption: '易混：主题', headers: ['玩家', '身份', '规则', '选词'], rows }), 'sent')
   const pages = rendered.slice(-test.messages.length)
   assert.equal(test.messages.length, 3)
   for (let i = 0; i < rows.length; i++) assert.equal(pages.filter(html => html.includes(`选词${i}</td>`)).length, 1)
@@ -58,7 +59,7 @@ it('splits an oversized data row into labeled continuations without inserting or
   test.page.setContent = async html => { current = html; rendered.push(html) }
   test.page.$ = async () => ({ boundingBox: async () => ({ x: 0, y: 0, width: 960,
     height: [...current.matchAll(/<td>(.*?)<\/td>/gs)].some(cell => cell[1].length > 300) ? 2400 : 1000 }) })
-  assert.equal(await test.images.send(test.session, '选词', h.text(value), { headers: ['玩家', '身份', '规则', '选词'], rows: [['1号 Alice', '好人', value, '词条']] }), true)
+  assert.equal(await test.images.send(test.session, '选词', h.text(value), { headers: ['玩家', '身份', '规则', '选词'], rows: [['1号 Alice', '好人', value, '词条']] }), 'sent')
   const pages = rendered.slice(-test.messages.length)
   assert.equal(test.messages.length, 2)
   assert.equal(pages.flatMap(html => [...html.matchAll(/<td>(.*?)<\/td>/gs)].filter((_, i) => i % 4 === 2).map(cell => cell[1])).join(''), value)
@@ -79,7 +80,7 @@ it('retains face and media as original attachments rather than browser HTML', as
   assert.match(parts.text, /公开发言\[表情14\]\[图片\]/)
   assert.equal(parts.attachments.length, 2)
   const test = fixture()
-  assert.equal(await test.images.send(test.session, '复盘', content), true)
+  assert.equal(await test.images.send(test.session, '复盘', content), 'sent')
   assert.equal(test.messages.length, 2)
   assert.match(test.messages[1], /face id="14"/)
   assert.match(test.messages[1], /example.com/)
@@ -90,23 +91,23 @@ it('retains face and media as original attachments rather than browser HTML', as
 
 for (const fail of ['render', 'send', 'size'] as const) it(`returns control to the complete text fallback after ${fail} failure`, async () => {
   const test = fixture(fail)
-  assert.equal(await test.images.send(test.session, '复盘', h.text('完整原文')), false)
+  assert.equal(await test.images.send(test.session, '复盘', h.text('完整原文')), 'fallback')
   assert.equal(test.errors.length, 1)
   assert.equal(test.closed(), true)
 })
 
 it('does not require a browser and does not queue overlapping renders', async () => {
   const disabled = new ReportImages(() => { throw new Error('disabled output must not access the service') }, { enabled: false, timeoutMs: 100 }, () => {})
-  assert.equal(await disabled.send({ send: async () => ['id'] } as any, '复盘', h.text('文字')), false)
+  assert.equal(await disabled.send({ send: async () => ['id'] } as any, '复盘', h.text('文字')), 'fallback')
   const noBrowser = new ReportImages(() => undefined, { enabled: true, timeoutMs: 100 }, () => {})
-  assert.equal(await noBrowser.send({ send: async () => ['id'] } as any, '复盘', h.text('文字')), false)
+  assert.equal(await noBrowser.send({ send: async () => ['id'] } as any, '复盘', h.text('文字')), 'fallback')
   let release!: () => void
   const test = fixture(), page = test.page, set = page.setContent.bind(page)
   page.setContent = async value => { await new Promise<void>(resolve => { release = resolve }); return set(value, { timeout: 1000, waitUntil: 'load' }) }
   const first = test.images.send(test.session, '复盘', h.text('第一份'))
   for (let i = 0; i < 10 && !release; i++) await new Promise<void>(resolve => setImmediate(resolve))
-  assert.equal(await test.images.send(test.session, '复盘', h.text('第二份')), false)
-  release(); assert.equal(await first, true)
+  assert.equal(await test.images.send(test.session, '复盘', h.text('第二份')), 'fallback')
+  release(); assert.equal(await first, 'sent')
 })
 
 it('times out and closes the page instead of leaving a stuck render', async () => {
@@ -115,6 +116,57 @@ it('times out and closes the page instead of leaving a stuck render', async () =
   page.setContent = async () => new Promise<void>(() => {})
   page.close = async () => { closed = true }
   const images = new ReportImages(() => ({ page: async () => page }), { enabled: true, timeoutMs: 20 }, () => {})
-  assert.equal(await images.send({ send: async () => ['id'] } as any, '复盘', h.text('文字')), false)
+  assert.equal(await images.send({ send: async () => ['id'] } as any, '复盘', h.text('文字')), 'fallback')
   assert.equal(closed, true)
+})
+
+it('stops waiting for a missing image-send receipt, ignores late receipts, and releases the renderer', async () => {
+  const { page } = fixture()
+  const failures: unknown[] = []
+  let closes = 0
+  page.close = () => {
+    if (++closes === 1) return new Promise(() => {})
+    return Promise.resolve()
+  }
+  const images = new ReportImages(() => ({ page: async () => page }), { enabled: true, timeoutMs: 25 }, error => failures.push(error))
+  let late!: (ids: string[]) => void
+  let sends = 0
+  const content = h('template', {}, h.text('图文复盘'), h('face', { id: '14' }))
+  assert.equal(await withinBudget(images.send({ send: () => {
+    sends++
+    return new Promise(resolve => { late = resolve })
+  } }, '复盘', content), 500), 'unconfirmed')
+  assert.equal(closes, 1)
+  assert.ok(failures.length >= 1)
+  assert.equal(await images.send({ send: async () => ['other-id'] }, '下一份', h.text('后续可以渲染')), 'sent')
+  late(['late-image-id'])
+  await new Promise<void>(resolve => setImmediate(resolve))
+  assert.equal(sends, 1, 'an old receipt must not resume delivery of media attachments')
+})
+
+it('distinguishes an empty receipt from a rejected report send', async () => {
+  const { images } = fixture()
+  assert.equal(await images.send({ send: async () => [] }, '复盘', h.text('图片回执未知')), 'unconfirmed')
+  assert.equal(await images.send({ send: async () => { throw new Error('adapter refused') } }, '复盘', h.text('明确失败')), 'fallback')
+})
+
+it('checks visibility again before subsequent report pages', async () => {
+  const { images, messages, session } = fixture()
+  let checks = 0
+  const text = Array.from({ length: 85 }, (_, index) => `第${index + 1}行`).join('\n')
+  assert.equal(await images.send(session, '选词', h.text(text), undefined,
+    handoff => { if (++checks === 1) handoff() }), 'stale')
+  assert.equal(checks, 2)
+  assert.equal(messages.length, 1)
+})
+
+it('does not hand off guarded content if the visibility check comes back after its deadline', async () => {
+  let ready!: () => void, sends = 0
+  const hold = new Promise<void>(resolve => { ready = resolve })
+  const outcome = await deliverReport({ send: async () => { sends++; return ['late'] } }, h.text('选词'), 20,
+    () => {}, async handoff => { await hold; handoff() })
+  assert.equal(outcome, 'stale')
+  ready()
+  await new Promise<void>(resolve => setImmediate(resolve))
+  assert.equal(sends, 0)
 })

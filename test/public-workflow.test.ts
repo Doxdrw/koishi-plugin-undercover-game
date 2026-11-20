@@ -14,6 +14,7 @@ it('exports a dependency lock matching the public package', () => {
   assert.equal(lock.lockfileVersion, 3)
   assert.equal(lock.name, pkg.name)
   assert.equal(lock.version, pkg.version)
+  assert.equal(lock.packages[''].version, pkg.version)
   for (const field of ['devDependencies', 'peerDependencies', 'engines']) {
     assert.deepEqual(lock.packages[''][field], pkg[field], field)
   }

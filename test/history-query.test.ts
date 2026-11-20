@@ -162,6 +162,56 @@ it('opens only acknowledged deer publications and fails closed on hide, redactio
   assert.equal(after.game, undefined)
 })
 
+it('labels every implicit archived result while a newer completed game is still unavailable', async () => {
+  const { store, queries } = await fixture()
+  const saved = await store.save(input())
+  assert.ok(saved.kind === 'saved')
+  const pending = { gameId: 'not-archived-yet', status: '归档待重试' as const }
+  const read = async (query: Parameters<typeof queries.readForAi>[1], viewer = group) => {
+    const text = await queries.readForAi(viewer, query, { pageSize: 1, maxChars: 500 }, pending)
+    assert.ok(text.length <= 500)
+    assert.doesNotMatch(text, /not-archived-yet/)
+    return JSON.parse(text)
+  }
+  for (const query of [
+    { view: 'overview', section: 'players' }, { view: 'overview', section: 'topics' },
+    { view: 'overview', section: 'settlement' }, { view: 'phases' }, { view: 'choices' },
+    { view: 'phase', sequence: 1, section: 'votes' }, { view: 'phase', sequence: 1, section: 'speech' },
+    { view: 'phase', sequence: 1, section: 'events' }, { view: 'phase', sequence: 2 },
+  ] as const) {
+    const result = await read(query)
+    assert.equal(result.game.id, saved.id)
+    assert.match(result.note, /最近结束.*归档待重试.*最近已归档/)
+  }
+  assert.match((await read({ view: 'list' })).note, /归档待重试/)
+  assert.equal((await read({ view: 'overview', id: saved.id, section: 'players' })).note, undefined)
+  const unavailable = await read({ view: 'phases' }, { ...group, guildId: 'no-archive' })
+  assert.equal(unavailable.game, undefined)
+  assert.match(unavailable.message, /归档待重试.*暂无/)
+})
+
+it('continues a history text page only with the same explicit game ID', async () => {
+  const { store, queries } = await fixture()
+  const first = input()
+  first.topics!.good = '原局好人规则'
+  const saved = await store.save(first)
+  assert.ok(saved.kind === 'saved')
+  const budget = { pageSize: 1, maxChars: 500 }
+  const read = async (query: Parameters<typeof queries.readForAi>[1]) => JSON.parse(await queries.readForAi(group, query, budget))
+  const one = await read({ section: 'topics' })
+  assert.equal(one.game.id, saved.id)
+  assert.equal(one.nextPage, 2)
+  const later = input(10)
+  later.topics!.good = '新局好人规则'
+  await store.save(later)
+  const unpinned = await read({ section: 'topics', page: one.nextPage })
+  assert.match(unpinned.message, /对局编号/)
+  assert.equal(unpinned.game, undefined)
+  const two = await read({ section: 'topics', page: one.nextPage, id: one.game.id })
+  assert.equal(two.game.id, saved.id)
+  assert.match(two.items[0], /原局好人规则/)
+})
+
 it('renders stored short-form Wei rewards with their target and cause', async () => {
   const { store, queries } = await fixture()
   const snapshot = input()

@@ -25,12 +25,12 @@ import { HistoryRecorder } from './game/history-recorder'
 import { HistoryStore, registerHistoryModels, type HistoryMediaRetention } from './game/history-store'
 import { HistoryPersistence, FileHistoryRetryQueue } from './game/history-retry'
 import { HistoryQueries, historyTextPages } from './game/history-query'
-import { DeerHistoryControls } from './game/history-deer'
+import { DeerHistoryControls, type DeerPublication } from './game/history-deer'
 import { registerHistoryCommands } from './game/history-commands'
 import { registerWinrateCommands } from './game/winrate-commands'
 import { ReportImages, type ReportBrowser } from './game/report-images'
 import { createHistoryDeletionConsumer } from './game/history-deletion-consumer'
-import { archiveDisposition, type HistoryEnding, type HistoryCamp, type HistorySpeechSegment } from './game/history-snapshot'
+import type { HistoryEnding, HistoryCamp, HistorySpeechSegment } from './game/history-snapshot'
 import { defaultAiHistoryLimits, type ArchiveHint } from './game/history-ai-pagination'
 import { DiagnosticLog, GameDiagnostics, type DiagnosticConfig } from './game/diagnostics'
 import { removeRosterSeat } from './game/roster-service'
@@ -357,8 +357,8 @@ export const Config: Schema<Config> = Schema.intersect([
   }).description("武将卡面"),
   Schema.object({
     reportImages: Schema.object({
-      enabled: Schema.boolean().default(true).description('优先将总结、复盘和选词公布渲染为图片；需可选 puppeteer 服务，缺少服务或失败时发送完整文字。'),
-      timeout: Schema.natural().min(1).default(15).description('单次图片渲染总时限（秒）；长内容自动拆为多张。'),
+      enabled: Schema.boolean().default(true).description('优先将总结、复盘和选词公布渲染为图片；需可选 puppeteer 服务，缺少服务或明确失败时回退文字。'),
+      timeout: Schema.natural().min(1).default(15).description('图片渲染与整批投递分别使用的等待时限（秒）；长内容自动拆为多张。'),
     }),
   }).description('总结与选词图片'),
   Schema.object({
@@ -438,7 +438,7 @@ export function apply(ctx: Context, config: Config) {
   const recentArchiveHints = new Map<string, ArchiveHint>()
   const reportImages = new ReportImages(() => ctx.get('puppeteer') as ReportBrowser | undefined,
     { enabled: config.reportImages?.enabled ?? true, timeoutMs: Math.max(1, config.reportImages?.timeout ?? 15) * 1000 },
-    error => ctx.logger.warn('图片输出未完成，使用文字回退：%s', safeErrorSummary(error)))
+    error => ctx.logger.warn('图片输出未完成：%s', safeErrorSummary(error)))
   const deerHiddenChoices = new Set<string>()
   const deerHiddenKey = (seat: number, userId: string) => JSON.stringify([seat, profileIdByNickname.get(player_copy?.[seat - 1]) ?? userId])
   registerHistoryCommands(ctx, historyQueries, deerHistory, historyStore, async () => {
@@ -465,9 +465,9 @@ export function apply(ctx: Context, config: Config) {
       if (op === 'hide') {
         if (!own) return '只有上一把鹿模式的玩家可以隐藏自己的选人。'
         own.hidden = true
-        return '已隐藏你的上局鹿模式选人；这只影响主持人之后的批量公布，无法撤回已经发送的消息。'
+        return '已隐藏你的上局鹿模式选人；之后的公布不会包含它，无法撤回已经发送的消息。'
       }
-      if (session.userId === snapshot.hostId) return deerRevealView(snapshot, snapshot.rows.filter(r => !r.hidden))
+      if (session.userId === snapshot.hostId) return deerRevealView(snapshot, snapshot.rows)
       if (!own) return '只有上一把鹿模式的主持人或玩家可以公布选人。'
       own.hidden = false
       return deerRevealView(snapshot, [own])
@@ -637,7 +637,7 @@ export function apply(ctx: Context, config: Config) {
     rules.enabledSpecialModes = JSON.stringify(config.enabledSpecialModes ?? [])
     historyRecorder = new HistoryRecorder({ gameId: gameInstanceId, startedAt: gameStartedAt, mode: modeInteraction.mode,
       platform: gameRoute.platform, selfId: gameRoute.bot!.selfId, guildId: gameRoute.guildId,
-      sandbox: gameRoute.platform.startsWith('sandbox'), host: historyIdentity(hostid, hostname), ruleVersion: '0.4.0', rules })
+      sandbox: gameRoute.platform.startsWith('sandbox'), host: historyIdentity(hostid, hostname), ruleVersion: '0.5.0', rules })
     capture(r => {
       r.topics(modeInteraction.mode === 'deer' ? { publicText: instr3, good: item1, undercover: item2 }
         : modeInteraction.mode === 'turtle' ? { publicText: item1, good: item2, undercover: instr1 }
@@ -1960,10 +1960,20 @@ export function apply(ctx: Context, config: Config) {
     }
     return result.trimEnd()
   }
-  const deerRevealView = (snapshot: DeerRevealSnapshot, rows: readonly DeerRevealRow[]) => ({
-    text: formatDeerRevealRows(snapshot, rows),
-    table: { caption: '易混：' + snapshot.commonTerm, headers: ['玩家', '身份', '选词规则', '选词'], rows: rows.map(row => [`${row.seat}号 ${row.nickname}`, row.role, row.rule, row.choice]) },
-  })
+  const deerRevealView = (snapshot: DeerRevealSnapshot, allowed: readonly DeerRevealRow[]): DeerPublication => {
+    if (lastDeerReveal !== snapshot) return { text: '上局选人记录已更新，请重新执行公布选人。' }
+    const rows = allowed.filter(row => !row.hidden)
+    const text = formatDeerRevealRows(snapshot, rows)
+    if (!rows.length) return { text }
+    return {
+      text,
+      table: { caption: '易混：' + snapshot.commonTerm, headers: ['玩家', '身份', '选词规则', '选词'], rows: rows.map(row => [`${row.seat}号 ${row.nickname}`, row.role, row.rule, row.choice]) },
+      dispatch: handoff => {
+        if (lastDeerReveal === snapshot && rows.every(row => !row.hidden)) handoff()
+      },
+      refresh: async () => deerRevealView(snapshot, allowed),
+    }
+  }
   const findLastDeerRow = async (session: Session, snapshot: DeerRevealSnapshot): Promise<DeerRevealRow | undefined> => {
     if (ctx.xpPoints?.getManagedIdentity) {
       const identity = await ctx.xpPoints.getManagedIdentity(session.platform, session.userId)
@@ -4177,18 +4187,20 @@ export function apply(ctx: Context, config: Config) {
       const recorder = historyRecorder
       historyRecorder = undefined
       const bot = gameRoute.bot, guild = gameRoute.guildId
+      const key = archiveRouteKey(gameRoute.platform, bot?.selfId ?? '', guild)
+      // A capture or snapshot error also leaves the most recent completed
+      // game unavailable. Do not let a prior archive masquerade as that game.
+      const hint: ArchiveHint | undefined = ending.kind === 'completed'
+        ? { gameId: gameInstanceId, status: '正在归档' } : undefined
+      if (hint) {
+        recentArchiveHints.delete(key)
+        recentArchiveHints.set(key, hint)
+        if (recentArchiveHints.size > 32) recentArchiveHints.delete(recentArchiveHints.keys().next().value!)
+      }
       try {
         if (historyCaptureFailed) throw new Error('本局采集不完整')
         if (ending.kind === 'aborted' && historyOutcome && recorder.hasPhase()) recorder.outcome(historyOutcome)
         const snapshot = recorder.finish(ending, owner?.endedAt ?? Date.now(), scoreService.results, config.scoreSystemKey)
-        const key = archiveRouteKey(snapshot.platform, snapshot.selfId, snapshot.guildId)
-        const hint: ArchiveHint | undefined = archiveDisposition(snapshot, historyOptions) === 'completed'
-          ? { gameId: snapshot.gameId, status: '正在归档' } : undefined
-        if (hint) {
-          recentArchiveHints.delete(key)
-          recentArchiveHints.set(key, hint)
-          if (recentArchiveHints.size > 32) recentArchiveHints.delete(recentArchiveHints.keys().next().value!)
-        }
         const write = historyPersistence.save(snapshot, historyOptions).then(result => {
           if (hint && recentArchiveHints.get(key) === hint) {
             if (result.kind === 'queued') hint.status = '归档待重试'
@@ -4205,6 +4217,7 @@ export function apply(ctx: Context, config: Config) {
         }).finally(() => pendingHistoryWrites.delete(write))
         pendingHistoryWrites.add(write)
       } catch (error) {
+        if (hint) hint.status = '归档未确认'
         ctx.logger.error('对局历史快照失败：%s', safeErrorSummary(error))
         notifyBotGroup(bot, guild, '本局历史采集不完整，未报告保存成功；请管理员检查日志。', '对局历史采集失败通知')
       }

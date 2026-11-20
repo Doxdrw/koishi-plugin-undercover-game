@@ -1,5 +1,36 @@
 import { h, type Session } from 'koishi'
 import { hasMessageReceipt } from './message-delivery'
+import { withinBudget } from './operation-budget'
+
+export type ReportDelivery = 'sent' | 'fallback' | 'unconfirmed' | 'stale'
+
+/** A publication guard hands the content off while its visibility check is
+ * still in effect, but never holds that guard open waiting for the adapter. */
+export type ReportDispatch = (handoff: () => void) => void | Promise<void>
+
+export async function deliverReport(
+  session: Pick<Session, 'send'>, content: h.Fragment, timeoutMs: number,
+  onFailure: (error: unknown) => void, dispatch?: ReportDispatch,
+): Promise<ReportDelivery> {
+  let open = true, delivery: Promise<ReportDelivery> | undefined
+  const deadline = Date.now() + timeoutMs
+  const send = async () => { return session.send(content) }
+  const handoff = () => {
+    if (!open || delivery || Date.now() >= deadline) return
+    delivery = send().then(ids => hasMessageReceipt(ids) ? 'sent' : 'unconfirmed',
+      error => { onFailure(error); return 'fallback' })
+  }
+  const work = async (): Promise<ReportDelivery> => {
+    if (dispatch) await dispatch(handoff)
+    else handoff()
+    return delivery ?? 'stale'
+  }
+  try { return await withinBudget(work(), timeoutMs) }
+  catch (error) {
+    onFailure(error)
+    return delivery ? 'unconfirmed' : 'stale'
+  } finally { open = false }
+}
 
 interface Clip { x: number; y: number; width: number; height: number }
 export interface ReportBrowserPage {
@@ -96,19 +127,27 @@ export class ReportImages {
   constructor(private readonly browser: () => ReportBrowser | undefined, private readonly options: { enabled: boolean; timeoutMs: number },
     private readonly onFailure: (error: unknown) => void) {}
 
-  async send(session: Pick<Session, 'send'>, title: string, content: h.Fragment, table?: ReportTable): Promise<boolean> {
-    if (!this.options.enabled || this.busy) return false
+  async send(session: Pick<Session, 'send'>, title: string, content: h.Fragment, table?: ReportTable,
+    dispatch?: ReportDispatch): Promise<ReportDelivery> {
+    if (!this.options.enabled || this.busy) return 'fallback'
     this.busy = true
-    let page: ReportBrowserPage | undefined, timer: ReturnType<typeof setTimeout> | undefined, expired = false
+    let page: ReportBrowserPage | undefined, expired = false, closing = false
+    const close = () => {
+      if (closing || !page) return
+      closing = true
+      const opened = page
+      // Non-cancellable browser I/O may outlive this report, but not its slot.
+      void withinBudget(Promise.resolve().then(() => opened.close()), Math.min(1000, this.options.timeoutMs)).catch(this.onFailure)
+    }
     try {
       const browser = this.browser()
-      if (!browser) return false
+      if (!browser) return 'fallback'
       const parts = reportParts(content)
-      if (parts.attachments.length > 16) return false
+      if (parts.attachments.length > 16) return 'fallback'
       if (parts.text.length > 30_000) throw new Error('report content exceeds image budget')
       const operation = (async () => {
         page = await browser.page()
-        if (expired) { await page.close(); throw new Error('report image timeout') }
+        if (expired) { close(); throw new Error('report image timeout') }
         await page.setJavaScriptEnabled(false)
         await page.setRequestInterception(true)
         page.on('request', request => { void request.abort().catch(() => undefined) })
@@ -147,23 +186,22 @@ export class ReportImages {
         }
         return images
       })()
-      const images = await Promise.race([operation, new Promise<never>((_, reject) => {
-        timer = setTimeout(() => { expired = true; reject(new Error('report image timeout')) }, this.options.timeoutMs)
-      })])
-      clearTimeout(timer)
-      for (const bytes of images) {
-        const ids = await session.send(h.image(Buffer.from(bytes), 'image/png'))
-        if (!hasMessageReceipt(ids)) throw new Error('report image was not delivered')
+      const images = await withinBudget(operation, this.options.timeoutMs)
+      close()
+      const fragments = images.map(bytes => h.image(Buffer.from(bytes), 'image/png'))
+      if (parts.attachments.length) fragments.push(h('template', {}, ...parts.attachments))
+      const deadline = Date.now() + this.options.timeoutMs
+      for (const fragment of fragments) {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) return 'unconfirmed'
+        const outcome = await deliverReport(session, fragment, remaining, this.onFailure, dispatch)
+        if (outcome !== 'sent') return outcome
       }
-      if (parts.attachments.length) {
-        const ids = await session.send(h('template', {}, ...parts.attachments))
-        if (!hasMessageReceipt(ids)) throw new Error('report attachments were not delivered')
-      }
-      return true
-    } catch (error) { this.onFailure(error); return false }
+      return 'sent'
+    } catch (error) { this.onFailure(error); return 'fallback' }
     finally {
-      clearTimeout(timer)
-      if (page) void page.close().catch(this.onFailure)
+      expired = true
+      close()
       this.busy = false
     }
   }

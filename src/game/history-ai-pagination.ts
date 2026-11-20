@@ -16,7 +16,7 @@ export const defaultAiHistoryLimits = { pageSize: 5, maxChars: 2500 }
 export type ArchiveHint = { gameId: string; status: '正在归档' | '归档待重试' | '归档未确认' }
 export const aiHistoryToolProperties = {
   view: { type: 'string', enum: views, description: '默认 overview：最近已归档对局的摘要；list：查较早编号；phases：查阶段编号；phase：查一个阶段；choices：查已在原群公布的鹿选词' },
-  id: { type: 'integer', minimum: 1, description: '对局编号；不填取本群最新已归档的完成局' },
+  id: { type: 'integer', minimum: 1, description: '对局编号；首屏不填取本群最新归档。继续翻页须带同一 game.id，list 除外。' },
   sequence: { type: 'integer', minimum: 1, description: 'phase 需要的阶段编号；通过 phases 获得' },
   section: { type: 'string', enum: [...overviewSections, ...phaseSections], description: 'overview 可选 players、topics、settlement；phase 可选 speech、votes、events' },
   page: { type: 'integer', minimum: 1, maximum: 1000000 },
